@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from intaris.api.deps import SessionContext, get_session_context
+from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +100,9 @@ def _compute_stats(
             cur.execute(
                 "SELECT COUNT(*) FROM audit_log "
                 "WHERE user_id = ? AND decision = 'escalate' "
-                f"AND user_decision IS NULL{audit_agent_cond}",
-                (ctx.user_id, *audit_agent_params),
+                "AND user_decision IS NULL "
+                f"AND (outcome_override IS NULL OR outcome_override != ?){audit_agent_cond}",
+                (ctx.user_id, UNATTENDED_JUDGE_REVIEW, *audit_agent_params),
             )
             pending_approvals = cur.fetchone()[0]
 
@@ -417,6 +419,23 @@ async def config(
 
         return {
             "version": __version__,
+            "evaluator": {
+                "backend": "jev" if cfg.jev.enabled else "llm",
+                "model": cfg.jev.model if cfg.jev.enabled else cfg.llm.model,
+                "timeout_ms": (
+                    cfg.jev.timeout_ms if cfg.jev.enabled else cfg.llm.timeout_ms
+                ),
+                "minimum_confidence": (
+                    cfg.jev.minimum_confidence if cfg.jev.enabled else None
+                ),
+                "decision_question": (
+                    cfg.jev.decision_question if cfg.jev.enabled else None
+                ),
+                "approval_risk_confidence": (
+                    cfg.jev.approval_risk_confidence if cfg.jev.enabled else None
+                ),
+                "diagnostics": cfg.jev.diagnostics if cfg.jev.enabled else False,
+            },
             "llm": {
                 "model": cfg.llm.model,
                 "base_url": llm_base_url_display,

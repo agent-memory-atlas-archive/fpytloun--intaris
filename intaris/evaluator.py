@@ -27,7 +27,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from intaris.audit import AuditStore
 from intaris.classifier import (
@@ -40,9 +40,11 @@ from intaris.classifier import (
 from intaris.config import AnalysisConfig
 from intaris.db import Database
 from intaris.decision import (
+    UNATTENDED_JUDGE_REVIEW,
     Decision,
     EvaluationResult,
     apply_decision_matrix,
+    cap_outcome,
     clamp_outcome,
     make_fast_decision,
 )
@@ -57,6 +59,9 @@ from intaris.prompts import (
 from intaris.redactor import redact
 from intaris.sanitize import ANTI_INJECTION_PREAMBLE
 from intaris.session import SessionStore
+
+if TYPE_CHECKING:
+    from intaris.jev import JevClient
 
 # Escalation retry: reuse approval if same tool+args approved within this window.
 _ESCALATION_RETRY_TTL_MINUTES = 10
@@ -126,6 +131,7 @@ def _apply_authoritative_user_precedent(
         risk=evaluation.risk,
         reasoning=reasoning,
         decision="approve",
+        metadata=evaluation.metadata,
     )
 
 
@@ -253,8 +259,10 @@ class Evaluator:
         db: Database | None = None,
         analysis_config: AnalysisConfig | None = None,
         alignment_barrier: Any | None = None,
+        jev: JevClient | None = None,
     ):
         self._llm = llm
+        self._jev = jev
         self._sessions = session_store
         self._audit = audit_store
         self._db = db
@@ -284,6 +292,7 @@ class Evaluator:
         tool_preferences: dict[str, str] | None = None,
         minimum_outcome: str | None = None,
         approval_call_id: str | None = None,
+        judge_unattended: bool = False,
     ) -> dict[str, Any]:
         """Evaluate a tool call for safety and intention alignment.
 
@@ -324,6 +333,14 @@ class Evaluator:
 
         # Get session for intention and policy (verifies ownership)
         session = self._sessions.get(session_id, user_id=user_id)
+        maximum_outcome = (session.get("policy") or {}).get("maximum_outcome")
+        unattended = (session.get("policy") or {}).get(
+            "interaction_mode"
+        ) == "none" or ((context or {}).get("interaction_mode") == "none")
+        hard_bounds = {
+            "maximum_outcome": maximum_outcome,
+            "minimum_outcome": minimum_outcome,
+        }
 
         # Check session status — deny evaluation for inactive sessions
         session_status = session.get("status", "active")
@@ -365,6 +382,8 @@ class Evaluator:
                 risk="low",
                 reasoning=reasoning,
                 latency_ms=latency_ms,
+                **hard_bounds,
+                outcome_override="hard_stop.session_lifecycle",
             )
             try:
                 self._sessions.increment_counter(session_id, "deny", user_id=user_id)
@@ -373,6 +392,16 @@ class Evaluator:
             return {
                 "call_id": call_id,
                 "decision": "deny",
+                **(
+                    {
+                        "raw_decision": "deny",
+                        "effective_decision": "deny",
+                        "maximum_outcome": maximum_outcome,
+                        "outcome_override": "hard_stop.session_lifecycle",
+                    }
+                    if maximum_outcome is not None
+                    else {}
+                ),
                 "minimum_outcome": minimum_outcome,
                 "reasoning": reasoning,
                 "risk": "low",
@@ -399,6 +428,9 @@ class Evaluator:
                 user_id, session_id
             )
             if misalignment_reason:
+                alignment_decision = (
+                    "deny" if unattended else clamp_outcome("escalate", minimum_outcome)
+                )
                 latency_ms = int((time.monotonic() - start_time) * 1000)
                 args_redacted = _args_redacted_with_context(
                     redact(args), redact(context) if context else None
@@ -413,24 +445,43 @@ class Evaluator:
                     args_redacted=args_redacted,
                     classification="write",
                     evaluation_path="alignment",
-                    decision=clamp_outcome("escalate", minimum_outcome),
+                    decision=alignment_decision,
                     risk="high",
                     reasoning=misalignment_reason,
                     latency_ms=latency_ms,
                     args_hash=args_hash,
                     intention=session.get("intention"),
+                    **hard_bounds,
+                    raw_decision="escalate",
+                    outcome_override=(
+                        "task.interaction_mode" if unattended else "hard_stop.alignment"
+                    ),
                 )
                 try:
                     self._sessions.increment_counter(
                         session_id,
-                        clamp_outcome("escalate", minimum_outcome),
+                        alignment_decision,
                         user_id=user_id,
                     )
                 except ValueError:
                     pass
                 return {
                     "call_id": call_id,
-                    "decision": clamp_outcome("escalate", minimum_outcome),
+                    "decision": alignment_decision,
+                    **(
+                        {
+                            "raw_decision": "escalate",
+                            "effective_decision": alignment_decision,
+                            "maximum_outcome": maximum_outcome,
+                            "outcome_override": (
+                                "task.interaction_mode"
+                                if unattended
+                                else "hard_stop.alignment"
+                            ),
+                        }
+                        if maximum_outcome is not None
+                        else {}
+                    ),
                     "minimum_outcome": minimum_outcome,
                     "reasoning": misalignment_reason,
                     "risk": "high",
@@ -535,6 +586,8 @@ class Evaluator:
                         risk="low",
                         reasoning=cascade_reasoning,
                         latency_ms=latency_ms,
+                        **hard_bounds,
+                        outcome_override="hard_stop.parent_lifecycle",
                     )
                     try:
                         self._sessions.increment_counter(
@@ -545,6 +598,16 @@ class Evaluator:
                     return {
                         "call_id": call_id,
                         "decision": "deny",
+                        **(
+                            {
+                                "raw_decision": "deny",
+                                "effective_decision": "deny",
+                                "maximum_outcome": maximum_outcome,
+                                "outcome_override": "hard_stop.parent_lifecycle",
+                            }
+                            if maximum_outcome is not None
+                            else {}
+                        ),
                         "minimum_outcome": minimum_outcome,
                         "reasoning": cascade_reasoning,
                         "risk": "low",
@@ -648,7 +711,7 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                 )
-                if minimum_outcome is None
+                if minimum_outcome is None and not unattended
                 else None
             )
             if retry_decision is not None:
@@ -667,7 +730,7 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                 )
-                if minimum_outcome is None
+                if minimum_outcome is None and not unattended
                 else None
             )
             if retry_decision is not None:
@@ -687,7 +750,7 @@ class Evaluator:
                     tool=tool,
                     args_hash=args_hash,
                 )
-                if minimum_outcome is None
+                if minimum_outcome is None and not unattended
                 else None
             )
             if retry_decision is not None:
@@ -702,6 +765,11 @@ class Evaluator:
                     context=redact(context) if context else None,
                     parent_intention=parent_intention,
                 )
+
+        raw_decision = decision.decision
+        decision.decision = cap_outcome(raw_decision, maximum_outcome)
+        policy_overrode = decision.decision != raw_decision
+        outcome_override = "session_policy.maximum_outcome" if policy_overrode else None
 
         if minimum_outcome is not None:
             approved = False
@@ -724,21 +792,53 @@ class Evaluator:
                 if not approved:
                     decision.decision = "deny"
                     decision.reasoning = "Approval does not match this evaluation."
-            if (
-                approved
-                and minimum_outcome == "escalate"
-                and decision.decision != "deny"
-            ):
+                    outcome_override = "invalid_approval"
+            if approved and minimum_outcome == "escalate" and raw_decision != "deny":
                 decision.decision = "approve"
                 decision.reasoning = f"User approved call {approval_call_id}."
+                outcome_override = "human_approval"
             else:
-                decision.decision = clamp_outcome(decision.decision, minimum_outcome)
+                if approved and raw_decision == "deny":
+                    decision.decision = "deny"
+                    outcome_override = "request.minimum_outcome"
+                bounded = clamp_outcome(decision.decision, minimum_outcome)
+                if bounded != decision.decision:
+                    outcome_override = "request.minimum_outcome"
+                decision.decision = bounded
+
+        if (
+            unattended
+            and judge_unattended
+            and minimum_outcome is None
+            and raw_decision in {"deny", "escalate"}
+            and maximum_outcome != "deny"
+        ):
+            # This API-only outcome is non-executable until Judge resolves it.
+            # Snapshot the task constraint for Judge even if policy changes.
+            decision.decision = "escalate"
+            outcome_override = UNATTENDED_JUDGE_REVIEW
+        elif unattended and (
+            raw_decision in {"deny", "escalate"} or decision.decision == "escalate"
+        ):
+            # No human approval channel exists. The task restriction wins over
+            # a permissive agent maximum (including explicit yolo mode).
+            if decision.decision != "deny":
+                decision.decision = "deny"
+                outcome_override = "task.interaction_mode"
+            decision.reasoning = (
+                f"{decision.reasoning} Escalation is disabled for this unattended task."
+            )
 
         # Learn from LLM approvals: cache path prefixes for path-reclassified
         # calls so subsequent reads to the same directory are fast-pathed.
         # User-approved escalations are handled separately via
         # learn_from_approved_escalation() called from POST /decision.
-        if path_reclassified and decision.decision == "approve" and working_directory:
+        if (
+            path_reclassified
+            and decision.decision == "approve"
+            and not policy_overrode
+            and working_directory
+        ):
             for rp in resolved_paths:
                 if not is_path_within(rp, working_directory):
                     prefix = _compute_path_prefix(rp, working_directory)
@@ -771,6 +871,10 @@ class Evaluator:
             profile_version=profile_version,
             intention=session.get("intention"),
             injection_detected=_injection_detected,
+            raw_decision=raw_decision,
+            maximum_outcome=maximum_outcome,
+            minimum_outcome=minimum_outcome,
+            outcome_override=outcome_override,
         )
 
         # Step 8: Update session counters
@@ -806,9 +910,19 @@ class Evaluator:
                     exc_info=True,
                 )
 
-        return {
+        result = {
             "call_id": call_id,
             "decision": decision.decision,
+            **(
+                {
+                    "raw_decision": raw_decision,
+                    "effective_decision": decision.decision,
+                    "maximum_outcome": maximum_outcome,
+                    "outcome_override": outcome_override,
+                }
+                if maximum_outcome is not None
+                else {}
+            ),
             "minimum_outcome": minimum_outcome,
             "reasoning": decision.reasoning,
             "risk": decision.risk,
@@ -818,6 +932,9 @@ class Evaluator:
             "classification": classification.value,
             "injection_detected": _injection_detected,
         }
+        if decision.metadata is not None:
+            result["evaluation_metadata"] = decision.metadata
+        return result
 
     def get_behavioral_context(
         self, user_id: str, agent_id: str | None = None
@@ -1014,6 +1131,12 @@ class Evaluator:
         Args:
             record: Audit record dict from the resolved escalation.
         """
+        if (
+            record.get("resolved_by") != "user"
+            and record.get("raw_decision") == "deny"
+            and record.get("maximum_outcome") in {"escalate", "approve"}
+        ):
+            return
         tool = record.get("tool", "")
         args_redacted = record.get("args_redacted")
         user_id = record.get("user_id", "")
@@ -1119,18 +1242,20 @@ class Evaluator:
             session_id, user_id=user_id, limit=5
         )
 
+        effective_policy = effective_policy_for_evaluator(session.get("policy"))
+        session_stats = {
+            "total_calls": session.get("total_calls", 0),
+            "approved_count": session.get("approved_count", 0),
+            "denied_count": session.get("denied_count", 0),
+            "escalated_count": session.get("escalated_count", 0),
+        }
         user_prompt = build_evaluation_user_prompt(
             intention=session["intention"],
-            policy=effective_policy_for_evaluator(session.get("policy")),
+            policy=effective_policy,
             recent_history=recent_history,
             recent_reasoning=recent_reasoning,
             user_decisions=user_decisions,
-            session_stats={
-                "total_calls": session.get("total_calls", 0),
-                "approved_count": session.get("approved_count", 0),
-                "denied_count": session.get("denied_count", 0),
-                "escalated_count": session.get("escalated_count", 0),
-            },
+            session_stats=session_stats,
             tool=tool,
             args=args_redacted,
             agent_id=agent_id,
@@ -1149,30 +1274,60 @@ class Evaluator:
         ]
 
         try:
-            raw = self._llm.generate(
-                messages,
-                json_schema=SAFETY_EVALUATION_SCHEMA,
-                max_tokens=1024,
-            )
-            result = parse_json_response(
-                raw,
-                expected_keys={"aligned", "risk", "reasoning", "decision"},
-            )
+            if self._jev is not None:
+                evaluation = self._jev.evaluate_tool_call(
+                    state={
+                        "intention": session["intention"],
+                        "effective_policy": effective_policy,
+                        "parent_intention": parent_intention,
+                        "recent_history": recent_history,
+                        "recent_reasoning": recent_reasoning,
+                        "user_decisions": user_decisions,
+                        "session_stats": session_stats,
+                        "tool": tool,
+                        "arguments": args_redacted,
+                        "agent_id": agent_id,
+                        "context": context,
+                    },
+                    evaluation_rules=SAFETY_EVALUATION_SYSTEM_PROMPT.format(
+                        anti_injection=ANTI_INJECTION_PREAMBLE,
+                    ),
+                )
+            else:
+                raw = self._llm.generate(
+                    messages,
+                    json_schema=SAFETY_EVALUATION_SCHEMA,
+                    max_tokens=1024,
+                )
+                result = parse_json_response(
+                    raw,
+                    expected_keys={"aligned", "risk", "reasoning", "decision"},
+                )
 
-            evaluation = EvaluationResult(
-                aligned=bool(result.get("aligned", False)),
-                risk=str(result.get("risk", "high")),
-                reasoning=str(result.get("reasoning", "No reasoning provided")),
-                decision=str(result.get("decision", "escalate")),
-            )
+                evaluation = EvaluationResult(
+                    aligned=bool(result.get("aligned", False)),
+                    risk=str(result.get("risk", "high")),
+                    reasoning=str(result.get("reasoning", "No reasoning provided")),
+                    decision=str(result.get("decision", "escalate")),
+                )
             evaluation = _apply_authoritative_user_precedent(
                 evaluation,
                 tool=tool,
                 args_redacted=args_redacted,
                 user_decisions=user_decisions,
             )
+            if self._jev is not None and evaluation.decision == "escalate":
+                return Decision(
+                    decision="escalate",
+                    risk=evaluation.risk,
+                    reasoning=evaluation.reasoning,
+                    path="llm",
+                    metadata=evaluation.metadata,
+                )
 
-            return apply_decision_matrix(evaluation)
+            decision = apply_decision_matrix(evaluation)
+            decision.metadata = evaluation.metadata
+            return decision
 
         except Exception:
             # LLM failure → propagate as exception. The API endpoint

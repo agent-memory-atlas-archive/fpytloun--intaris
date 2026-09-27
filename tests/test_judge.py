@@ -132,6 +132,238 @@ def test_judge_prompt_uses_effective_policy_view():
     assert '"/Users/fpytloun/src/lumilens/beskar/ansible/*"' not in prompt
 
 
+@pytest.mark.parametrize("mode", ["auto", "advisory"])
+def test_judge_maximum_outcome_uses_call_snapshot(
+    mode,
+    audit_store,
+    session_store,
+    mock_llm,
+    mock_metrics,
+    mock_event_bus,
+    mock_evaluator,
+):
+    from intaris.judge import JudgeReviewer, resolve_with_side_effects
+
+    # The session has since changed; the recorded bound governs this review.
+    _create_session(session_store, policy={"maximum_outcome": "deny"})
+    audit_store.insert(
+        call_id="capped-call",
+        user_id="test-user",
+        session_id="test-session",
+        agent_id=None,
+        tool="bash",
+        args_redacted={"command": "rm -rf /"},
+        classification="critical",
+        evaluation_path="critical",
+        decision="escalate",
+        raw_decision="deny",
+        maximum_outcome="escalate",
+        outcome_override="session_policy.maximum_outcome",
+        risk="critical",
+        reasoning="Critical pattern",
+        latency_ms=0,
+    )
+    mock_llm.generate.return_value = json.dumps(
+        {
+            "decision": "deny",
+            "risk": "critical",
+            "confidence": "high",
+            "reasoning": "Dangerous operation",
+        }
+    )
+    reviewer = JudgeReviewer(
+        llm=mock_llm,
+        config=JudgeConfig(mode=mode),
+        audit_store=audit_store,
+        session_store=session_store,
+        metrics=mock_metrics,
+        event_bus=mock_event_bus,
+        evaluator=mock_evaluator,
+    )
+    outcome = asyncio.run(
+        reviewer.review_for_evaluate(
+            call_id="capped-call",
+            user_id="test-user",
+            session_id="test-session",
+        )
+    )
+    assert outcome.decision == "escalate"
+    assert outcome.record["judge_decision"] == "deny"
+    assert outcome.record["effective_decision"] == "escalate"
+    assert outcome.record["user_decision"] is None
+    assert outcome.notification_event_type == "judge_deferral"
+    assert mock_metrics.judge_denials_total == 0
+    assert mock_metrics.judge_deferrals_total == 1
+    asyncio.run(
+        resolve_with_side_effects(
+            call_id="capped-call",
+            user_id="test-user",
+            user_decision="deny",
+            audit_store=audit_store,
+        )
+    )
+    record = audit_store.get_by_call_id("capped-call", user_id="test-user")
+    assert record["effective_decision"] == "deny"
+    assert record["resolved_by"] == "user"
+    assert record["raw_decision"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "risk"),
+    [
+        ("approve", "low"),
+        ("deny", "high"),
+        ("deny", "low"),
+        ("defer", "high"),
+        ("defer", "low"),
+    ],
+)
+def test_unattended_review_uses_call_snapshot_not_updated_session_policy(
+    verdict,
+    risk,
+    audit_store,
+    session_store,
+    mock_llm,
+    mock_metrics,
+    mock_event_bus,
+    mock_evaluator,
+):
+    from intaris.judge import JudgeReviewer
+
+    _create_session(
+        session_store,
+        policy={"interaction_mode": "none", "maximum_outcome": "escalate"},
+    )
+    audit_store.insert(
+        call_id="unattended-review",
+        user_id="test-user",
+        session_id="test-session",
+        agent_id="test-agent",
+        tool="bash",
+        args_redacted={"command": "git worktree add /tmp/test"},
+        classification="write",
+        evaluation_path="llm",
+        decision="escalate",
+        raw_decision="deny",
+        maximum_outcome="escalate",
+        outcome_override="task.interaction_mode:judge_review",
+        risk="medium",
+        reasoning="Escalated for Judge review",
+        latency_ms=1,
+    )
+    session_store.update_session(
+        "test-session",
+        user_id="test-user",
+        policy={
+            "interaction_mode": "explicit_gates",
+            "judge": {
+                "allowed_decisions": ["approve", "deny", "defer"],
+                "allow_human_escalation": True,
+            },
+        },
+    )
+    mock_llm.generate.return_value = json.dumps(
+        {
+            "decision": verdict,
+            "risk": risk,
+            "confidence": "high",
+            "reasoning": "Judge reviewed the operation.",
+        }
+    )
+    reviewer = JudgeReviewer(
+        llm=mock_llm,
+        config=JudgeConfig(mode="advisory"),
+        audit_store=audit_store,
+        session_store=session_store,
+        metrics=mock_metrics,
+        event_bus=mock_event_bus,
+        evaluator=mock_evaluator,
+    )
+    outcome = asyncio.run(
+        reviewer.review_for_evaluate(
+            call_id="unattended-review",
+            user_id="test-user",
+            session_id="test-session",
+        )
+    )
+    assert outcome.decision == ("approve" if verdict == "approve" else "deny")
+    assert outcome.record["effective_decision"] == outcome.decision
+    assert outcome.record["resolved_by"] == "judge"
+    assert outcome.record["outcome_override"] == "task.interaction_mode:judge_review"
+
+
+@pytest.mark.parametrize("verdict", ["deny", "defer"])
+def test_unattended_judge_does_not_upgrade_denial_using_human_precedent(
+    verdict,
+    audit_store,
+    session_store,
+    mock_llm,
+    mock_metrics,
+    mock_event_bus,
+    mock_evaluator,
+):
+    from intaris.judge import JudgeReviewer
+
+    _create_session(
+        session_store,
+        policy={"interaction_mode": "none", "maximum_outcome": "escalate"},
+    )
+    for call_id, marked in (
+        ("previous-human-approval", False),
+        ("unattended-review", True),
+    ):
+        audit_store.insert(
+            call_id=call_id,
+            user_id="test-user",
+            session_id="test-session",
+            agent_id="test-agent",
+            tool="bash",
+            args_redacted={"command": "git worktree add /tmp/test"},
+            classification="write",
+            evaluation_path="llm",
+            decision="escalate",
+            raw_decision="deny",
+            maximum_outcome="escalate",
+            outcome_override=("task.interaction_mode:judge_review" if marked else None),
+            risk="medium",
+            reasoning="Escalated for review",
+            latency_ms=1,
+        )
+    audit_store.resolve_escalation(
+        call_id="previous-human-approval",
+        user_id="test-user",
+        user_decision="approve",
+        resolved_by="user",
+    )
+    assert audit_store.get_user_decisions("test-session", user_id="test-user")
+    mock_llm.generate.return_value = json.dumps(
+        {
+            "decision": verdict,
+            "risk": "low",
+            "confidence": "high",
+            "reasoning": "Judge explicitly did not approve.",
+        }
+    )
+    reviewer = JudgeReviewer(
+        llm=mock_llm,
+        config=JudgeConfig(mode="advisory"),
+        audit_store=audit_store,
+        session_store=session_store,
+        metrics=mock_metrics,
+        event_bus=mock_event_bus,
+        evaluator=mock_evaluator,
+    )
+    outcome = asyncio.run(
+        reviewer.review_for_evaluate(
+            call_id="unattended-review",
+            user_id="test-user",
+            session_id="test-session",
+        )
+    )
+    assert outcome.decision == outcome.record["effective_decision"] == "deny"
+    assert "authoritative precedent" not in outcome.record["judge_reasoning"]
+
+
 def test_judge_resolution_policy_ignores_string_false_escalation_flag():
     from intaris.judge import _judge_resolution_policy
 

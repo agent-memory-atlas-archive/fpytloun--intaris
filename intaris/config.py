@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 logger = logging.getLogger("intaris")
 
@@ -103,6 +104,42 @@ class LLMConfig:
     # Timeout in milliseconds for LLM evaluation calls.
     # Must be well under the 5-second circuit breaker in the Executor Adapter.
     timeout_ms: int = field(default_factory=lambda: _env_int("LLM_TIMEOUT_MS", 4000))
+
+
+@dataclass
+class JevConfig:
+    """TypeSafe Jev configuration for bounded safety classifications."""
+
+    enabled: bool = field(
+        default_factory=lambda: _env("EVALUATOR_BACKEND", "llm").lower() == "jev"
+    )
+    model: str = field(default_factory=lambda: _env("JEV_MODEL", "jev-1.13.0"))
+    base_url: str = field(
+        default_factory=lambda: _env("JEV_BASE_URL", "https://api.typesafe.ai")
+    )
+    api_key: str = ""
+    timeout_ms: int = field(default_factory=lambda: _env_int("JEV_TIMEOUT_MS", 4000))
+    minimum_confidence: float = field(
+        default_factory=lambda: _env_float("JEV_MINIMUM_CONFIDENCE", 0.6)
+    )
+    decision_question: bool = field(
+        default_factory=lambda: _env_bool("JEV_DECISION_QUESTION", True)
+    )
+    diagnostics: bool = field(default_factory=lambda: _env_bool("JEV_DIAGNOSTICS"))
+    approval_risk_confidence: float | None = field(
+        default_factory=lambda: (
+            _env_float("JEV_APPROVAL_RISK_CONFIDENCE", 0.0)
+            if "JEV_APPROVAL_RISK_CONFIDENCE" in os.environ
+            else None
+        )
+    )
+
+    def __post_init__(self) -> None:
+        if self.api_key:
+            return
+        self.api_key = _env("JEV_API_KEY")
+        if not self.api_key and urlsplit(self.base_url).hostname != "openrouter.ai":
+            self.api_key = _env("TYPESAFE_API_KEY")
 
 
 @dataclass
@@ -578,6 +615,7 @@ class Config:
     """Root configuration container."""
 
     llm: LLMConfig = field(default_factory=LLMConfig)
+    jev: JevConfig = field(default_factory=JevConfig)
     llm_analysis: LLMConfig = field(default_factory=_build_analysis_llm_config)
     llm_l3_analysis: LLMConfig = field(default_factory=_build_l3_analysis_llm_config)
     llm_judge: LLMConfig = field(default_factory=_build_judge_llm_config)
@@ -635,6 +673,39 @@ class Config:
                 f"JUDGE_NOTIFY_MODE={self.judge.notify_mode} is not supported. "
                 "Use 'deny_only', 'always', or 'never'."
             )
+        evaluator_backend = _env("EVALUATOR_BACKEND", "llm").lower()
+        if evaluator_backend not in ("llm", "jev"):
+            raise ValueError(
+                f"EVALUATOR_BACKEND={evaluator_backend} is not supported. "
+                "Use 'llm' or 'jev'."
+            )
+        if self.jev.enabled and not self.jev.api_key:
+            raise ValueError(
+                "JEV_API_KEY or TYPESAFE_API_KEY is required when "
+                "EVALUATOR_BACKEND=jev."
+            )
+        if self.jev.enabled:
+            if self.jev.timeout_ms < 500:
+                raise ValueError(
+                    f"JEV_TIMEOUT_MS={self.jev.timeout_ms} is too low. "
+                    "Minimum 500ms for reliable Jev calls."
+                )
+            if not 0.0 <= self.jev.minimum_confidence <= 1.0:
+                raise ValueError("JEV_MINIMUM_CONFIDENCE must be between 0 and 1.")
+            if (
+                self.jev.approval_risk_confidence is not None
+                and not 0.0 <= self.jev.approval_risk_confidence <= 1.0
+            ):
+                raise ValueError(
+                    "JEV_APPROVAL_RISK_CONFIDENCE must be between 0 and 1."
+                )
+            if (
+                self.jev.approval_risk_confidence is not None
+                and self.jev.decision_question
+            ):
+                raise ValueError(
+                    "JEV_APPROVAL_RISK_CONFIDENCE requires JEV_DECISION_QUESTION=false."
+                )
 
         if not self.llm.api_key:
             raise ValueError(

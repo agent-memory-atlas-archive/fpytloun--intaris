@@ -118,7 +118,8 @@ def test_minimum_outcome_matrix(actual, minimum):
     assert clamp_outcome(actual, minimum) == expected
 
 
-def test_minimum_outcome_human_retry(client_no_auth):
+@pytest.mark.parametrize("maximum", [None, "approve"])
+def test_minimum_outcome_human_retry(client_no_auth, maximum):
     client = client_no_auth
     headers = {"X-User-Id": "floor-user", "X-Agent-Id": "floor-agent"}
     client.post(
@@ -127,6 +128,7 @@ def test_minimum_outcome_human_retry(client_no_auth):
         json={
             "session_id": "floor-session",
             "intention": "Read files",
+            "policy": {"maximum_outcome": maximum},
         },
     ).raise_for_status()
     body = {"session_id": "floor-session", "tool": "read", "args": {"path": "/tmp/a"}}
@@ -135,7 +137,7 @@ def test_minimum_outcome_human_retry(client_no_auth):
     assert "minimum_outcome" not in legacy
     body["minimum_outcome"] = "escalate"
     judge = SimpleNamespace(is_enabled=True, review_for_evaluate=AsyncMock())
-    client.app.state.judge_reviewer = judge
+    _set_app_state(client, "judge_reviewer", judge)
     first = client.post("/api/v1/evaluate", headers=headers, json=body).json()
     judge.review_for_evaluate.assert_not_called()
     assert first["decision"] == "escalate"
@@ -162,6 +164,829 @@ def test_minimum_outcome_human_retry(client_no_auth):
         client.post("/api/v1/evaluate", headers=headers, json=body).json()["decision"]
         == "deny"
     )
+
+
+@pytest.mark.parametrize("maximum", ["deny", "escalate", "approve"])
+@pytest.mark.parametrize("minimum", [None, "deny", "escalate", "approve"])
+@pytest.mark.parametrize("raw", ["deny", "escalate", "approve"])
+def test_maximum_outcome_api_matrix(client_no_auth, maximum, minimum, raw):
+    from intaris.decision import Decision
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "ceiling",
+            "intention": "Test enforcement",
+            "policy": {"maximum_outcome": maximum},
+        },
+    ).raise_for_status()
+    _set_app_state(client, "judge_reviewer", None)
+    bus = Mock()
+    _set_app_state(client, "event_bus", bus)
+    with patch.object(
+        _get_evaluator(),
+        "_llm_evaluate",
+        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+    ) as llm:
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={
+                "session_id": "ceiling",
+                "tool": "write",
+                "args": {"file_path": "/tmp/work"},
+                "minimum_outcome": minimum,
+            },
+        )
+    response.raise_for_status()
+    llm.assert_called_once()
+    result = response.json()
+    order = ["deny", "escalate", "approve"]
+    expected = order[max(order.index(raw), order.index(maximum))]
+    if minimum:
+        expected = order[min(order.index(expected), order.index(minimum))]
+    assert result["decision"] == result["effective_decision"] == expected
+    assert result["raw_decision"] == raw
+    record = client.get(
+        f"/api/v1/audit/{result['call_id']}",
+        headers=headers,
+    ).json()
+    assert record["raw_decision"] == raw
+    assert record["decision"] == record["effective_decision"] == expected
+    assert record["maximum_outcome"] == maximum
+    assert record["minimum_outcome"] == minimum
+    event = [
+        c.args[0]
+        for c in bus.publish.call_args_list
+        if c.args[0]["type"] == "evaluated"
+    ][-1]
+    assert event["decision"] == expected
+    assert event["raw_decision"] == raw
+    session = client.get("/api/v1/session/ceiling", headers=headers).json()
+    counter = {
+        "deny": "denied_count",
+        "approve": "approved_count",
+        "escalate": "escalated_count",
+    }[expected]
+    assert session[counter] == 1
+
+
+@pytest.mark.parametrize("maximum", [None, "escalate", "approve"])
+@pytest.mark.parametrize("raw", ["deny", "escalate", "approve"])
+@pytest.mark.parametrize("minimum", [None, "escalate"])
+def test_unattended_task_outcome_is_never_escalated_or_silently_allowed(
+    client_no_auth, maximum, raw, minimum
+):
+    from intaris.decision import Decision
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended",
+            "intention": "Unattended task",
+            "policy": {
+                "interaction_mode": "none",
+                **({"maximum_outcome": maximum} if maximum else {}),
+            },
+        },
+    ).raise_for_status()
+    _set_app_state(client, "judge_reviewer", None)
+    bus = Mock()
+    _set_app_state(client, "event_bus", bus)
+    with patch.object(
+        _get_evaluator(),
+        "_llm_evaluate",
+        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+    ):
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={
+                "session_id": "unattended",
+                "tool": "write",
+                "args": {"file_path": "/tmp/work"},
+                "minimum_outcome": minimum,
+            },
+        )
+    response.raise_for_status()
+    result = response.json()
+    expected = "approve" if raw == "approve" and minimum is None else "deny"
+    assert result["decision"] == expected
+    if maximum:
+        assert result["raw_decision"] == raw
+    record = client.get(f"/api/v1/audit/{result['call_id']}", headers=headers).json()
+    assert record["decision"] == record["effective_decision"] == expected
+    assert record["raw_decision"] == raw
+    if expected == "deny" and maximum and raw != "deny":
+        assert record["outcome_override"] == "task.interaction_mode"
+    events = [
+        c.args[0]
+        for c in bus.publish.call_args_list
+        if c.args[0]["type"] == "evaluated"
+    ]
+    assert events[-1]["decision"] == expected
+    session = client.get("/api/v1/session/unattended", headers=headers).json()
+    assert session["escalated_count"] == 0
+    assert session["approved_count" if expected == "approve" else "denied_count"] == 1
+
+
+@pytest.mark.parametrize("judge_enabled", [False, True])
+def test_unattended_alignment_barrier_denies_without_human_wait(
+    client_no_auth, judge_enabled
+):
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended-alignment",
+            "intention": "Unattended task",
+            "policy": {
+                "interaction_mode": "none",
+                "maximum_outcome": "approve",
+            },
+        },
+    ).raise_for_status()
+    _get_evaluator()._alignment_barrier = Mock(
+        is_misaligned=Mock(return_value="Conflicting intention")
+    )
+    judge = SimpleNamespace(is_enabled=True, review_for_evaluate=AsyncMock())
+    _set_app_state(client, "judge_reviewer", judge if judge_enabled else None)
+    result = client.post(
+        "/api/v1/evaluate",
+        headers=headers,
+        json={"session_id": "unattended-alignment", "tool": "read", "args": {}},
+    ).json()
+    assert result["decision"] == "deny"
+    assert result["raw_decision"] == "escalate"
+    record = client.get(f"/api/v1/audit/{result['call_id']}", headers=headers).json()
+    assert record["outcome_override"] == "task.interaction_mode"
+    assert record["decision"] == "deny"
+    judge.review_for_evaluate.assert_not_awaited()
+
+
+@pytest.mark.parametrize("maximum", [None, "escalate", "approve"])
+@pytest.mark.parametrize("raw", ["deny", "escalate"])
+@pytest.mark.parametrize(
+    ("judge_decision", "judge_risk"),
+    [
+        ("approve", "low"),
+        ("deny", "high"),
+        ("deny", "low"),
+        ("defer", "high"),
+        ("defer", "low"),
+    ],
+)
+def test_unattended_task_judge_resolves_before_final_outcome(
+    client_no_auth, maximum, raw, judge_decision, judge_risk
+):
+    from intaris.config import JudgeConfig
+    from intaris.decision import Decision
+    from intaris.judge import JudgeReviewer
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended-judge",
+            "intention": "Unattended task",
+            "policy": {
+                "interaction_mode": "none",
+                **({"maximum_outcome": maximum} if maximum is not None else {}),
+                "judge": {
+                    "allowed_decisions": ["approve", "deny", "defer"],
+                    "allow_human_escalation": True,
+                },
+            },
+        },
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    judge_llm = Mock(
+        _timeout_ms=15000,
+        generate=Mock(
+            return_value=json.dumps(
+                {
+                    "decision": judge_decision,
+                    "risk": judge_risk,
+                    "confidence": "high",
+                    "reasoning": "Judge reviewed the requested operation.",
+                }
+            )
+        ),
+    )
+    judge = JudgeReviewer(
+        llm=judge_llm,
+        config=JudgeConfig(mode="advisory"),
+        audit_store=evaluator._audit,
+        session_store=evaluator._sessions,
+        evaluator=evaluator,
+    )
+    _set_app_state(client, "judge_reviewer", judge)
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+    ):
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={
+                "session_id": "unattended-judge",
+                "tool": "write",
+                "args": {"file_path": "/tmp/work"},
+            },
+        )
+    response.raise_for_status()
+    result = response.json()
+    expected = "approve" if judge_decision == "approve" else "deny"
+    assert result["decision"] == expected
+    assert judge_llm.generate.call_count == 1
+    record = client.get(f"/api/v1/audit/{result['call_id']}", headers=headers).json()
+    assert record["decision"] == "escalate"
+    assert record["raw_decision"] == raw
+    assert record["effective_decision"] == record["user_decision"] == expected
+    assert record["resolved_by"] == "judge"
+    assert record["outcome_override"] == "task.interaction_mode:judge_review"
+    assert (
+        client.get("/api/v1/session/unattended-judge", headers=headers).json()[
+            "escalated_count"
+        ]
+        == 1
+    )
+
+
+def test_unattended_provisional_review_is_not_human_approvable(client_no_auth):
+    from intaris.decision import Decision
+    from intaris.judge import JudgeEffectiveOutcome
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended-provisional",
+            "intention": "Unattended task",
+            "policy": {"interaction_mode": "none", "maximum_outcome": "escalate"},
+        },
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    observed = {}
+
+    class Reviewer:
+        is_enabled = True
+
+        async def review_for_evaluate(self, *, call_id, user_id, **kwargs):
+            observed["pending"] = await asyncio.to_thread(
+                evaluator._audit.query,
+                user_id=user_id,
+                decision="escalate",
+                resolved=False,
+            )
+            stats = await asyncio.to_thread(
+                client.get, "/api/v1/stats", headers=headers
+            )
+            observed["stats"] = stats.json()
+            response = await asyncio.to_thread(
+                client.post,
+                "/api/v1/decision",
+                headers=headers,
+                json={"call_id": call_id, "decision": "approve"},
+            )
+            observed["human_status"] = response.status_code
+            observed["human_error"] = response.json()["detail"]
+            record = await asyncio.to_thread(
+                evaluator._audit.resolve_escalation,
+                call_id=call_id,
+                user_id=user_id,
+                user_decision="deny",
+                resolved_by="judge",
+                judge_reasoning="Judge denied the operation.",
+                judge_decision="deny",
+            )
+            return JudgeEffectiveOutcome(
+                decision="deny",
+                reasoning="Judge denied the operation.",
+                risk=record["risk"],
+                record=record,
+                latency_ms=0,
+            )
+
+    _set_app_state(client, "judge_reviewer", Reviewer())
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "medium", "Needs review", "llm"),
+    ):
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={
+                "session_id": "unattended-provisional",
+                "tool": "write",
+                "args": {"file_path": "/tmp/work"},
+            },
+        )
+    response.raise_for_status()
+    assert response.json()["decision"] == "deny"
+    assert observed["pending"]["total"] == 0
+    assert observed["stats"]["pending_approvals"] == 0
+    assert observed["human_status"] == 400
+    assert "cannot be resolved by a human" in observed["human_error"]
+
+
+@pytest.mark.parametrize("new_session", [False, True])
+def test_unattended_repeat_call_requires_fresh_judge_review(
+    client_no_auth, new_session
+):
+    from intaris.config import JudgeConfig
+    from intaris.decision import Decision
+    from intaris.judge import JudgeReviewer
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    policy = {"interaction_mode": "none", "maximum_outcome": "escalate"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={"session_id": "first-review", "intention": "Task", "policy": policy},
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    judge_llm = Mock(
+        _timeout_ms=15000,
+        generate=Mock(
+            return_value=json.dumps(
+                {
+                    "decision": "approve",
+                    "risk": "low",
+                    "confidence": "high",
+                    "reasoning": "Judge explicitly approved this call.",
+                }
+            )
+        ),
+    )
+    _set_app_state(
+        client,
+        "judge_reviewer",
+        JudgeReviewer(
+            llm=judge_llm,
+            config=JudgeConfig(mode="advisory"),
+            audit_store=evaluator._audit,
+            session_store=evaluator._sessions,
+            evaluator=evaluator,
+        ),
+    )
+    body = {
+        "session_id": "first-review",
+        "tool": "bash",
+        "args": {"command": "git worktree add /tmp/test"},
+    }
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "medium", "Needs review", "llm"),
+    ) as llm_evaluate:
+        first = client.post("/api/v1/evaluate", headers=headers, json=body)
+        first.raise_for_status()
+        assert first.json()["decision"] == "approve"
+        first_record = evaluator._audit.get_by_call_id(
+            first.json()["call_id"], user_id="unattended-user"
+        )
+        assert (
+            evaluator._audit.find_approved_escalation(
+                user_id="unattended-user",
+                tool="bash",
+                args_hash=first_record["args_hash"],
+                cutoff="2020-01-01T00:00:00Z",
+            )
+            is None
+        )
+        if new_session:
+            client.post(
+                "/api/v1/intention",
+                headers=headers,
+                json={
+                    "session_id": "second-review",
+                    "intention": "Task",
+                    "policy": policy,
+                },
+            ).raise_for_status()
+            body["session_id"] = "second-review"
+        second = client.post("/api/v1/evaluate", headers=headers, json=body)
+    second.raise_for_status()
+    assert second.json()["decision"] == "approve"
+    assert second.json()["call_id"] != first.json()["call_id"]
+    assert llm_evaluate.call_count == judge_llm.generate.call_count == 2
+    second_record = client.get(
+        f"/api/v1/audit/{second.json()['call_id']}", headers=headers
+    ).json()
+    assert second_record["evaluation_path"] == "llm"
+    assert second_record["resolved_by"] == "judge"
+
+
+def test_unattended_call_does_not_reuse_prior_human_approval(client_no_auth):
+    from intaris.config import JudgeConfig
+    from intaris.decision import Decision
+    from intaris.judge import JudgeReviewer
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={"session_id": "interactive", "intention": "Task"},
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    body = {
+        "session_id": "interactive",
+        "tool": "bash",
+        "args": {"command": "git worktree add /tmp/test"},
+    }
+    _set_app_state(client, "judge_reviewer", None)
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "medium", "Needs review", "llm"),
+    ):
+        first = client.post("/api/v1/evaluate", headers=headers, json=body)
+    first.raise_for_status()
+    assert first.json()["decision"] == "deny"
+    client.post(
+        "/api/v1/decision",
+        headers=headers,
+        json={"call_id": first.json()["call_id"], "decision": "approve"},
+    ).raise_for_status()
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended",
+            "intention": "Task",
+            "policy": {"interaction_mode": "none", "maximum_outcome": "escalate"},
+        },
+    ).raise_for_status()
+    judge_llm = Mock(
+        _timeout_ms=15000,
+        generate=Mock(
+            return_value=json.dumps(
+                {
+                    "decision": "deny",
+                    "risk": "high",
+                    "confidence": "high",
+                    "reasoning": "Judge rejected this task call.",
+                }
+            )
+        ),
+    )
+    _set_app_state(
+        client,
+        "judge_reviewer",
+        JudgeReviewer(
+            llm=judge_llm,
+            config=JudgeConfig(mode="advisory"),
+            audit_store=evaluator._audit,
+            session_store=evaluator._sessions,
+            evaluator=evaluator,
+        ),
+    )
+    body["session_id"] = "unattended"
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("deny", "medium", "Needs review", "llm"),
+    ) as llm_evaluate:
+        second = client.post("/api/v1/evaluate", headers=headers, json=body)
+    second.raise_for_status()
+    assert second.json()["decision"] == "deny"
+    llm_evaluate.assert_called_once()
+    judge_llm.generate.assert_called_once()
+    record = client.get(
+        f"/api/v1/audit/{second.json()['call_id']}", headers=headers
+    ).json()
+    assert record["resolved_by"] == "judge"
+    assert record["effective_decision"] == "deny"
+
+
+@pytest.mark.parametrize("maximum", ["escalate", "approve"])
+def test_unattended_judge_error_persists_denial(client_no_auth, maximum):
+    from intaris.config import JudgeConfig
+    from intaris.decision import Decision
+    from intaris.judge import JudgeReviewer
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "unattended-user", "X-Agent-Id": "agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "unattended-judge-error",
+            "intention": "Unattended task",
+            "policy": {"interaction_mode": "none", "maximum_outcome": maximum},
+        },
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    judge_llm = Mock(
+        _timeout_ms=15000,
+        generate=Mock(side_effect=TimeoutError("Judge unavailable")),
+    )
+    _set_app_state(
+        client,
+        "judge_reviewer",
+        JudgeReviewer(
+            llm=judge_llm,
+            config=JudgeConfig(mode="advisory"),
+            audit_store=evaluator._audit,
+            session_store=evaluator._sessions,
+            evaluator=evaluator,
+        ),
+    )
+    with patch.object(
+        evaluator,
+        "_llm_evaluate",
+        return_value=Decision("escalate", "medium", "Needs review", "llm"),
+    ):
+        response = client.post(
+            "/api/v1/evaluate",
+            headers=headers,
+            json={
+                "session_id": "unattended-judge-error",
+                "tool": "write",
+                "args": {"file_path": "/tmp/work"},
+            },
+        )
+    response.raise_for_status()
+    result = response.json()
+    assert result["decision"] == "deny"
+    record = client.get(f"/api/v1/audit/{result['call_id']}", headers=headers).json()
+    assert record["decision"] == "escalate"
+    assert record["effective_decision"] == record["user_decision"] == "deny"
+    assert record["resolved_by"] == "judge"
+    assert "unavailable" in record["judge_reasoning"].lower()
+
+
+def test_maximum_outcome_does_not_learn_paths(client_no_auth):
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "paths",
+            "intention": "Test",
+            "details": {"working_directory": "/work/project"},
+            "policy": {"maximum_outcome": "approve"},
+        },
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    body = {
+        "session_id": "paths",
+        "tool": "read",
+        "args": {"file_path": "/private/secrets/file"},
+    }
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "critical",
+                "decision": "deny",
+                "reasoning": "Unsafe path",
+            }
+        ),
+    ) as llm:
+        first = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+        assert first["decision"] == "approve"
+        assert first["raw_decision"] == "deny"
+        assert not evaluator._approved_paths
+        client.patch(
+            "/api/v1/session/paths",
+            headers=headers,
+            json={"policy": {"maximum_outcome": "deny"}},
+        ).raise_for_status()
+        second = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+        assert second["decision"] == "deny"
+        assert llm.call_count == 2
+        assert "maximum_outcome" not in str(llm.call_args.args[0])
+
+
+def test_maximum_outcome_critical_and_hard_stops(client_no_auth):
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "critical",
+            "intention": "Test",
+            "policy": {"maximum_outcome": "approve"},
+        },
+    ).raise_for_status()
+    body = {"session_id": "critical", "tool": "bash", "args": {"command": "rm -rf /"}}
+    result = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+    assert result["raw_decision"] == "deny"
+    assert result["decision"] == "approve"
+    body.update(minimum_outcome="escalate", approval_call_id=result["call_id"])
+    assert (
+        client.post("/api/v1/evaluate", headers=headers, json=body).json()["decision"]
+        == "deny"
+    )
+    client.patch(
+        "/api/v1/session/critical/status",
+        headers=headers,
+        json={"status": "terminated"},
+    ).raise_for_status()
+    body.pop("minimum_outcome")
+    body.pop("approval_call_id")
+    assert (
+        client.post("/api/v1/evaluate", headers=headers, json=body).json()["decision"]
+        == "deny"
+    )
+
+
+@pytest.mark.parametrize("stop", ["session", "parent", "alignment"])
+def test_maximum_outcome_hard_stop_provenance(client_no_auth, stop):
+    from intaris.server import _get_db, _get_evaluator
+    from intaris.session import SessionStore
+
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    store = SessionStore(_get_db())
+    store.create(session_id="parent", user_id="ceiling-user", intention="Test")
+    store.create(
+        session_id="stopped",
+        user_id="ceiling-user",
+        intention="Test",
+        policy={"maximum_outcome": "approve"},
+        parent_session_id="parent" if stop == "parent" else None,
+    )
+    if stop in {"session", "parent"}:
+        store.update_status(
+            "parent" if stop == "parent" else "stopped",
+            "suspended",
+            user_id="ceiling-user",
+        )
+    else:
+        _get_evaluator()._alignment_barrier = Mock(
+            is_misaligned=Mock(return_value="Conflicting intention")
+        )
+    _set_app_state(client, "judge_reviewer", None)
+    result = client.post(
+        "/api/v1/evaluate",
+        headers=headers,
+        json={
+            "session_id": "stopped",
+            "tool": "read",
+            "args": {},
+            "minimum_outcome": "escalate",
+        },
+    ).json()
+    expected = "escalate" if stop == "alignment" else "deny"
+    assert result["decision"] == expected
+    assert result["maximum_outcome"] == "approve"
+    record = client.get(f"/api/v1/audit/{result['call_id']}", headers=headers).json()
+    assert record["raw_decision"] == record["effective_decision"] == expected
+    assert record["maximum_outcome"] == "approve"
+    assert record["minimum_outcome"] == "escalate"
+    assert record["outcome_override"].startswith("hard_stop.")
+
+
+def test_maximum_outcome_judge_approval_cannot_train_paths(client_no_auth):
+    from intaris.config import JudgeConfig
+    from intaris.judge import JudgeReviewer
+    from intaris.server import _get_evaluator
+
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    client.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "judge-paths",
+            "intention": "Test",
+            "details": {"working_directory": "/work/project"},
+            "policy": {"maximum_outcome": "escalate"},
+        },
+    ).raise_for_status()
+    evaluator = _get_evaluator()
+    judge_llm = Mock(
+        _timeout_ms=15000,
+        generate=Mock(
+            return_value=json.dumps(
+                {
+                    "decision": "approve",
+                    "risk": "low",
+                    "confidence": "high",
+                    "reasoning": "Judge approves",
+                }
+            )
+        ),
+    )
+    reviewer = JudgeReviewer(
+        llm=judge_llm,
+        config=JudgeConfig(mode="auto"),
+        audit_store=evaluator._audit,
+        session_store=evaluator._sessions,
+        evaluator=evaluator,
+    )
+    _set_app_state(client, "judge_reviewer", reviewer)
+    body = {
+        "session_id": "judge-paths",
+        "tool": "read",
+        "args": {"file_path": "/private/secrets/file"},
+    }
+    with patch.object(
+        evaluator._llm,
+        "generate",
+        return_value=json.dumps(
+            {
+                "aligned": False,
+                "risk": "high",
+                "decision": "deny",
+                "reasoning": "Unsafe",
+            }
+        ),
+    ) as llm:
+        first = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+        assert first["decision"] == "approve"
+        assert first["raw_decision"] == "deny"
+        assert not evaluator._approved_paths
+        client.patch(
+            "/api/v1/session/judge-paths",
+            headers=headers,
+            json={"policy": {"maximum_outcome": "deny"}},
+        ).raise_for_status()
+        second = client.post("/api/v1/evaluate", headers=headers, json=body).json()
+        assert second["decision"] == "deny"
+        assert llm.call_count == 2
+    record = client.get(f"/api/v1/audit/{first['call_id']}", headers=headers).json()
+    assert record["decision"] == "escalate"
+    assert record["effective_decision"] == "approve"
+    # A real human approval remains authoritative and can train paths.
+    client.post(
+        "/api/v1/decision",
+        headers=headers,
+        json={"call_id": first["call_id"], "decision": "approve"},
+    ).raise_for_status()
+    assert evaluator._approved_paths
+
+
+def test_maximum_outcome_validation_and_refresh(client_no_auth):
+    client = client_no_auth
+    headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
+    body = {
+        "session_id": "refresh",
+        "intention": "Test",
+        "policy": {"maximum_outcome": "allow"},
+    }
+    assert (
+        client.post("/api/v1/intention", headers=headers, json=body).status_code == 422
+    )
+    body["policy"]["maximum_outcome"] = "approve"
+    client.post("/api/v1/intention", headers=headers, json=body).raise_for_status()
+    call = {"session_id": "refresh", "tool": "bash", "args": {"command": "rm -rf /"}}
+    first = client.post("/api/v1/evaluate", headers=headers, json=call).json()
+    assert first["decision"] == "approve"
+    assert (
+        client.patch(
+            "/api/v1/session/refresh",
+            headers=headers,
+            json={"policy": {"maximum_outcome": "allow"}},
+        ).status_code
+        == 422
+    )
+    client.patch(
+        "/api/v1/session/refresh",
+        headers=headers,
+        json={"policy": {"maximum_outcome": "deny"}},
+    ).raise_for_status()
+    assert (
+        client.post("/api/v1/evaluate", headers=headers, json=call).json()["decision"]
+        == "deny"
+    )
+    record = client.get(f"/api/v1/audit/{first['call_id']}", headers=headers).json()
+    assert record["maximum_outcome"] == "approve"
+    assert record["raw_decision"] == "deny"
 
 
 def test_shutdown_flushes_buffered_session_events(env_no_auth):
@@ -1509,6 +2334,44 @@ class TestEvaluate:
         data = resp.json()
         assert data["decision"] == "approve"
         assert data["path"] == "fast"
+
+    def test_evaluate_includes_opt_in_jev_diagnostics(
+        self, client_no_auth, monkeypatch
+    ):
+        headers = {"X-User-Id": "user-jev-diagnostics"}
+        _create_session(client_no_auth, "sess-jev-diagnostics", headers)
+        monkeypatch.setattr(
+            "intaris.server._get_evaluator",
+            lambda: _FakeEvaluator(
+                {
+                    "call_id": "call-jev-diagnostics",
+                    "decision": "approve",
+                    "risk": "low",
+                    "reasoning": "Jev classified the call.",
+                    "path": "llm",
+                    "latency_ms": 42,
+                    "evaluation_metadata": {
+                        "model": "jev-1.13.0",
+                        "aligned_probability": 0.91,
+                    },
+                }
+            ),
+        )
+        response = client_no_auth.post(
+            "/api/v1/evaluate",
+            json={
+                "session_id": "sess-jev-diagnostics",
+                "tool": "write",
+                "args": {"file_path": "docs/usage.md"},
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["evaluation_metadata"] == {
+            "model": "jev-1.13.0",
+            "aligned_probability": 0.91,
+        }
 
     def test_evaluate_critical(self, client_no_auth):
         """Critical patterns are auto-denied."""

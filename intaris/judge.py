@@ -31,6 +31,7 @@ from datetime import timezone as tz
 from typing import Any
 
 from intaris.config import JudgeConfig
+from intaris.decision import UNATTENDED_JUDGE_REVIEW
 from intaris.llm import LLMClient, parse_json_response
 from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
 from intaris.precedent import find_authoritative_precedent
@@ -282,7 +283,10 @@ def _effective_outcome_from_record(
     )
     risk = fallback_risk or record.get("judge_risk") or record.get("risk")
     event_type = fallback_event_type
-    if event_type is None and record.get("judge_decision") == "defer":
+    if event_type is None and (
+        record.get("judge_decision") == "defer"
+        or record.get("outcome_override") == "session_policy.maximum_outcome:judge"
+    ):
         event_type = "judge_deferral"
     return JudgeEffectiveOutcome(
         decision="escalate",
@@ -1482,6 +1486,30 @@ class JudgeReviewer:
         record = await asyncio.to_thread(
             self._audit.get_by_call_id, call_id, user_id=user_id
         )
+        if (
+            record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
+            and record.get("effective_decision") == "escalate"
+        ):
+            # Judge timed out, failed, or did not resolve the provisional call.
+            # Persist denial before returning: an unattended task cannot wait
+            # for human approval or return an unresolved audit outcome.
+            await asyncio.to_thread(
+                self._audit.resolve_escalation,
+                call_id=call_id,
+                user_id=user_id,
+                user_decision="deny",
+                resolved_by="judge",
+                user_note="Unattended Judge review did not resolve",
+                judge_reasoning=(
+                    "Judge review unavailable or timed out; "
+                    "unattended task denied without human escalation."
+                ),
+                judge_decision="deny",
+                judge_risk=record.get("judge_risk") or record.get("risk"),
+            )
+            record = await asyncio.to_thread(
+                self._audit.get_by_call_id, call_id, user_id=user_id
+            )
         latency_ms = int((time.monotonic() - start_time) * 1000)
         return _effective_outcome_from_record(
             record,
@@ -1506,6 +1534,10 @@ class JudgeReviewer:
         record = await asyncio.to_thread(
             self._audit.get_by_call_id, call_id, user_id=user_id
         )
+
+        # Request floors are human-only, including background review entry points.
+        if record.get("minimum_outcome") in {"deny", "escalate"}:
+            return
 
         # Guard: only review tool_call escalations
         if record.get("record_type", "tool_call") != "tool_call":
@@ -1635,6 +1667,12 @@ class JudgeReviewer:
         resolution_policy = _judge_resolution_policy(
             session.get("policy"), config_mode=self._config.mode
         )
+        if record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW:
+            resolution_policy = JudgeResolutionPolicy(
+                allowed_decisions=frozenset({"approve", "deny"}),
+                on_uncertain="deny",
+                allow_human_escalation=False,
+            )
 
         # Build judge prompt
         user_prompt = _build_judge_prompt(
@@ -1699,15 +1737,16 @@ class JudgeReviewer:
         reasoning = str(result.get("reasoning", "No reasoning provided"))
         judge_risk = _normalize_judge_risk(result.get("risk"), record.get("risk"))
         confidence = str(result.get("confidence", "low"))
-        decision, confidence, reasoning = _apply_authoritative_user_precedent(
-            decision=decision,
-            confidence=confidence,
-            reasoning=reasoning,
-            tool=record.get("tool", ""),
-            args_redacted=record.get("args_redacted") or {},
-            risk=judge_risk,
-            user_decisions=user_decisions,
-        )
+        if record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW:
+            decision, confidence, reasoning = _apply_authoritative_user_precedent(
+                decision=decision,
+                confidence=confidence,
+                reasoning=reasoning,
+                tool=record.get("tool", ""),
+                args_redacted=record.get("args_redacted") or {},
+                risk=judge_risk,
+                user_decisions=user_decisions,
+            )
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -1748,6 +1787,10 @@ class JudgeReviewer:
             )
 
             # Resolve the escalation
+            if await self._defer_capped_denial(
+                record, decision, reasoning, judge_risk, notify_unresolved
+            ):
+                return
             await resolve_with_side_effects(
                 call_id=call_id,
                 user_id=user_id,
@@ -1785,7 +1828,10 @@ class JudgeReviewer:
 
         elif self._config.mode == "advisory":
             original_decision = decision
-            if judge_risk == "low":
+            if (
+                judge_risk == "low"
+                and record.get("outcome_override") != UNATTENDED_JUDGE_REVIEW
+            ):
                 decision = "approve"
                 if original_decision != "approve":
                     reasoning = (
@@ -1820,6 +1866,11 @@ class JudgeReviewer:
                 reasoning=reasoning,
                 policy=resolution_policy,
             )
+
+            if await self._defer_capped_denial(
+                record, decision, reasoning, judge_risk, notify_unresolved
+            ):
+                return
 
             if decision == "defer":
                 # Store reasoning but leave unresolved for human
@@ -1894,6 +1945,48 @@ class JudgeReviewer:
                     confidence,
                     latency_ms,
                 )
+
+    async def _defer_capped_denial(
+        self,
+        record: dict[str, Any],
+        decision: str,
+        reasoning: str,
+        risk: str,
+        notify_unresolved: bool,
+    ) -> bool:
+        """Keep capped judge denials pending, using the immutable call policy."""
+        if (
+            decision != "deny"
+            or record.get("maximum_outcome") != "escalate"
+            or record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
+        ):
+            return False
+        reasoning = (
+            f"Session maximum_outcome=escalate; judge denial capped. {reasoning}"
+        )
+        await asyncio.to_thread(
+            self._audit.set_judge_reasoning,
+            record["call_id"],
+            reasoning,
+            user_id=record["user_id"],
+            judge_decision="deny",
+            judge_risk=risk,
+            outcome_override="session_policy.maximum_outcome:judge",
+        )
+        if self._metrics:
+            self._metrics.judge_deferrals_total += 1
+        if notify_unresolved and self._config.notify_mode != "never":
+            await self._send_escalation_notification(
+                call_id=record["call_id"],
+                user_id=record["user_id"],
+                session_id=record["session_id"],
+                agent_id=record.get("agent_id"),
+                tool=record.get("tool"),
+                risk=risk,
+                reasoning=reasoning,
+                event_type="judge_deferral",
+            )
+        return True
 
     def _should_notify_resolution(self, decision: str) -> bool:
         """Check if a resolution notification should be sent.

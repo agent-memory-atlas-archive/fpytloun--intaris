@@ -71,6 +71,7 @@ _session_intention: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _config = None
 _db = None
 _evaluator = None
+_jev_client = None
 _mcp_proxy_ref = None  # Module-level reference for _MCPEndpoint ASGI wrapper
 
 
@@ -90,6 +91,18 @@ def _get_db():
     return _db
 
 
+def _get_jev_client():
+    global _jev_client
+    cfg = _get_config()
+    if not cfg.jev.enabled:
+        return None
+    if _jev_client is None:
+        from intaris.jev import JevClient
+
+        _jev_client = JevClient(cfg.jev)
+    return _jev_client
+
+
 def _get_evaluator(alignment_barrier=None):
     global _evaluator
     if _evaluator is None:
@@ -107,6 +120,7 @@ def _get_evaluator(alignment_barrier=None):
             db=db,
             analysis_config=cfg.analysis,
             alignment_barrier=alignment_barrier,
+            jev=_get_jev_client(),
         )
     return _evaluator
 
@@ -779,10 +793,12 @@ async def lifespan(app):
     from intaris.alignment import AlignmentBarrier
 
     alignment_timeout_ms = int(os.environ.get("ALIGNMENT_BARRIER_TIMEOUT_MS", "15000"))
-    if cfg.analysis.enabled and analysis_llm is not None:
+    alignment_jev = _get_jev_client()
+    if cfg.analysis.enabled and (analysis_llm is not None or alignment_jev is not None):
         app.state.alignment_barrier = AlignmentBarrier(
             db=_get_db(),
             llm=analysis_llm,
+            jev=alignment_jev,
             timeout_ms=alignment_timeout_ms,
         )
         app.state.alignment_barrier.set_event_bus(app.state.event_bus)
@@ -947,7 +963,7 @@ async def lifespan(app):
             pass  # Table may not exist yet on first run.
 
     # Initialize MCP proxy
-    global _mcp_proxy_ref
+    global _jev_client, _mcp_proxy_ref
     try:
         mcp_proxy = _init_mcp_proxy(cfg)
     except Exception:
@@ -1097,6 +1113,11 @@ async def lifespan(app):
         with contextlib.suppress(asyncio.CancelledError, Exception):
             db = _get_db()
             db.close()
+
+        if _jev_client is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                _jev_client.close()
+            _jev_client = None
 
         logger.info("Intaris shut down")
 

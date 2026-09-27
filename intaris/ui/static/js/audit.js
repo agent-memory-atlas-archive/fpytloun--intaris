@@ -68,6 +68,10 @@ function auditTab() {
             call_id: callId,
             source: 'evaluation',
             decision: data.decision,
+            raw_decision: data.raw_decision,
+            effective_decision: data.effective_decision,
+            maximum_outcome: data.maximum_outcome,
+            outcome_override: data.outcome_override,
             tool: data.tool,
             risk: data.risk,
             record_type: data.record_type || 'tool_call',
@@ -100,6 +104,7 @@ function auditTab() {
         // Update the resolved record in-place if visible
         this._applyResolutionUpdate(data.call_id, {
           user_decision: data.user_decision,
+          effective_decision: data.user_decision,
           user_note: data.user_note,
           resolved_by: data.resolved_by,
           resolved_at: new Date().toISOString(),

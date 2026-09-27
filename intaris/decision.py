@@ -29,14 +29,24 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Persisted audit marker for a non-executable, Judge-only unattended review.
+UNATTENDED_JUDGE_REVIEW = "task.interaction_mode:judge_review"
 
 
 def clamp_outcome(actual: str, minimum: str | None) -> str:
     """Return the stricter outcome without weakening an existing denial."""
     order = {"deny": 0, "escalate": 1, "approve": 2}
     return actual if minimum is None else min((actual, minimum), key=order.__getitem__)
+
+
+def cap_outcome(actual: str, maximum: str | None) -> str:
+    """Limit evaluated enforcement severity; never use for structural hard stops."""
+    order = {"deny": 0, "escalate": 1, "approve": 2}
+    return actual if maximum is None else max((actual, maximum), key=order.__getitem__)
 
 
 @dataclass
@@ -47,6 +57,7 @@ class EvaluationResult:
     risk: str  # "low", "medium", "high", "critical"
     reasoning: str
     decision: str  # "approve", "deny", "escalate"
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -57,6 +68,7 @@ class Decision:
     risk: str
     reasoning: str
     path: str  # "fast", "critical", "llm"
+    metadata: dict[str, Any] | None = None
 
     @property
     def is_approved(self) -> bool:

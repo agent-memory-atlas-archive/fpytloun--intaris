@@ -54,6 +54,12 @@ class EvaluateResponse(BaseModel):
     """Response from tool call evaluation."""
 
     call_id: str = Field(..., description="Unique call identifier")
+    raw_decision: str | None = Field(None, exclude_if=lambda value: value is None)
+    effective_decision: str | None = Field(None, exclude_if=lambda value: value is None)
+    maximum_outcome: Literal["deny", "escalate", "approve"] | None = Field(
+        None, exclude_if=lambda value: value is None
+    )
+    outcome_override: str | None = Field(None, exclude_if=lambda value: value is None)
     minimum_outcome: Literal["deny", "escalate", "approve"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -64,6 +70,11 @@ class EvaluateResponse(BaseModel):
     risk: str | None = Field(None, description="Risk level")
     path: str = Field(..., description="Evaluation path: fast, critical, or llm")
     latency_ms: int = Field(..., description="Evaluation latency in ms")
+    evaluation_metadata: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Opt-in non-sensitive evaluator probabilities and usage.",
+    )
     injection_detected: bool = Field(
         False,
         description=(
@@ -95,6 +106,9 @@ class SessionPolicy(BaseModel):
     which could be used for prompt injection attacks.
     """
 
+    maximum_outcome: Literal["deny", "escalate", "approve"] | None = Field(
+        None, description="Maximum evaluated enforcement severity; request minimum wins"
+    )
     allow_tools: list[str] | None = Field(
         None, description="Glob patterns for tools to auto-allow"
     )
@@ -241,6 +255,11 @@ class AuditRecord(BaseModel):
     classification: str | None = None
     evaluation_path: str | None = None
     decision: str | None = None
+    raw_decision: str | None = None
+    effective_decision: str | None = None
+    maximum_outcome: str | None = None
+    minimum_outcome: str | None = None
+    outcome_override: str | None = None
     risk: str | None = None
     reasoning: str | None = None
     latency_ms: int | None = None

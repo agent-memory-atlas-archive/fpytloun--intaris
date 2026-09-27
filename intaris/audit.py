@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from intaris.db import Database
+from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,10 @@ class AuditStore:
         profile_version: int | None = None,
         intention: str | None = None,
         injection_detected: bool = False,
+        raw_decision: str | None = None,
+        maximum_outcome: str | None = None,
+        minimum_outcome: str | None = None,
+        outcome_override: str | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -113,8 +118,11 @@ class AuditStore:
                     (id, call_id, record_type, user_id, session_id, agent_id,
                      timestamp, tool, args_redacted, content, classification,
                      evaluation_path, decision, risk, reasoning, latency_ms,
-                     args_hash, profile_version, intention, injection_detected)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     args_hash, profile_version, intention, injection_detected,
+                     raw_decision, effective_decision, maximum_outcome,
+                     minimum_outcome, outcome_override)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -137,6 +145,11 @@ class AuditStore:
                     profile_version,
                     intention,
                     injection_detected,
+                    raw_decision or decision,
+                    decision,
+                    maximum_outcome,
+                    minimum_outcome,
+                    outcome_override,
                 ),
             )
 
@@ -191,6 +204,11 @@ class AuditStore:
             "classification": classification,
             "evaluation_path": evaluation_path,
             "decision": decision,
+            "raw_decision": raw_decision or decision,
+            "effective_decision": decision,
+            "maximum_outcome": maximum_outcome,
+            "minimum_outcome": minimum_outcome,
+            "outcome_override": outcome_override,
             "risk": risk,
             "reasoning": reasoning,
             "latency_ms": latency_ms,
@@ -310,6 +328,9 @@ class AuditStore:
             conditions.append("user_decision IS NOT NULL")
         elif resolved is False:
             conditions.append("user_decision IS NULL")
+            # Judge-only provisional calls must not appear in human approvals.
+            conditions.append("(outcome_override IS NULL OR outcome_override != ?)")
+            params.append(UNATTENDED_JUDGE_REVIEW)
 
         where = ""
         if conditions:
@@ -474,11 +495,17 @@ class AuditStore:
                 SELECT call_id, reasoning FROM audit_log
                 WHERE user_id = ? AND tool = ?
                   AND args_hash = ? AND user_decision = 'approve'
+                  AND (outcome_override IS NULL OR outcome_override != ?)
+                  AND (
+                      resolved_by = 'user'
+                      OR COALESCE(raw_decision, '') != 'deny'
+                      OR COALESCE(maximum_outcome, 'deny') = 'deny'
+                  )
                   AND resolved_at >= ?
                 ORDER BY resolved_at DESC
                 LIMIT 1
                 """,
-                (user_id, tool, args_hash, cutoff),
+                (user_id, tool, args_hash, UNATTENDED_JUDGE_REVIEW, cutoff),
             )
             row = cur.fetchone()
 
@@ -550,10 +577,12 @@ class AuditStore:
                     resolved_by = ?,
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
-                    judge_risk = COALESCE(?, judge_risk)
+                    judge_risk = COALESCE(?, judge_risk),
+                    effective_decision = ?
                 WHERE call_id = ? AND user_id = ?
                   AND decision IN ('escalate', 'deny')
                   AND (user_decision IS NULL OR resolved_by = 'judge')
+                  AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                 """,
                 (
                     user_decision,
@@ -563,13 +592,23 @@ class AuditStore:
                     judge_reasoning,
                     judge_decision,
                     judge_risk,
+                    user_decision,
                     call_id,
                     user_id,
+                    resolved_by,
+                    UNATTENDED_JUDGE_REVIEW,
                 ),
             )
             if cur.rowcount == 0:
                 # Determine why the update failed for a clear error message
                 record = self.get_by_call_id(call_id, user_id=user_id)
+                if (
+                    resolved_by == "user"
+                    and record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
+                ):
+                    raise ValueError(
+                        "Unattended Judge review cannot be resolved by a human"
+                    )
                 if record["decision"] not in ("escalate", "deny"):
                     raise ValueError(
                         f"Call {call_id} cannot be resolved "
@@ -598,6 +637,7 @@ class AuditStore:
         user_id: str,
         judge_decision: str | None = None,
         judge_risk: str | None = None,
+        outcome_override: str | None = None,
     ) -> None:
         """Store judge reasoning on an unresolved escalation.
 
@@ -623,12 +663,20 @@ class AuditStore:
                 UPDATE audit_log
                 SET judge_reasoning = ?,
                     judge_decision = COALESCE(?, judge_decision),
-                    judge_risk = COALESCE(?, judge_risk)
+                    judge_risk = COALESCE(?, judge_risk),
+                    outcome_override = COALESCE(?, outcome_override)
                 WHERE call_id = ? AND user_id = ?
                   AND decision = 'escalate'
                   AND user_decision IS NULL
                 """,
-                (judge_reasoning, judge_decision, judge_risk, call_id, user_id),
+                (
+                    judge_reasoning,
+                    judge_decision,
+                    judge_risk,
+                    outcome_override,
+                    call_id,
+                    user_id,
+                ),
             )
 
     def get_latest_reasoning(

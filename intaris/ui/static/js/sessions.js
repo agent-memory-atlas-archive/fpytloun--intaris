@@ -163,6 +163,10 @@ function sessionsTab() {
             {
               call_id: auditCallId,
               decision: data.decision,
+              raw_decision: data.raw_decision,
+              effective_decision: data.effective_decision,
+              maximum_outcome: data.maximum_outcome,
+              outcome_override: data.outcome_override,
               tool: data.tool,
               risk: data.risk,
               record_type: data.record_type || 'tool_call',
@@ -611,9 +615,11 @@ function sessionsTab() {
         const record = this.sessionAudit.find(r => r.call_id === callId);
         if (record) {
           record.user_decision = decision;
+          record.effective_decision = decision;
         }
         if (this.expandedAuditRecord && this.expandedAuditRecord.call_id === callId) {
           this.expandedAuditRecord.user_decision = decision;
+          this.expandedAuditRecord.effective_decision = decision;
           this.expandedAuditRecord.user_note = note;
           this.expandedAuditRecord.resolved_at = new Date().toISOString();
         }

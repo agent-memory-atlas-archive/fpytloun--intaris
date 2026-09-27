@@ -32,7 +32,7 @@ import asyncio
 import functools
 import logging
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from intaris.db import Database
 from intaris.llm import LLMClient, parse_json_response
@@ -44,6 +44,9 @@ from intaris.prompts import (
 from intaris.sanitize import ANTI_INJECTION_PREAMBLE
 from intaris.session import SessionStore
 
+if TYPE_CHECKING:
+    from intaris.jev import JevClient
+
 logger = logging.getLogger(__name__)
 
 # Default barrier timeout: generous because this is a one-time check per
@@ -54,9 +57,10 @@ _DEFAULT_ALIGNMENT_TIMEOUT_MS = 15000
 
 def check_intention_alignment(
     *,
-    llm: LLMClient,
+    llm: LLMClient | None,
     parent_intention: str,
     child_intention: str,
+    jev: JevClient | None = None,
 ) -> tuple[bool, str]:
     """Check whether a child session's intention is aligned with its parent.
 
@@ -73,6 +77,17 @@ def check_intention_alignment(
         (True, "") to avoid blocking session creation.
     """
     try:
+        if jev is not None:
+            return jev.check_alignment(
+                parent_intention=parent_intention,
+                child_intention=child_intention,
+                evaluation_rules=ALIGNMENT_CHECK_SYSTEM_PROMPT.format(
+                    anti_injection=ANTI_INJECTION_PREAMBLE,
+                ),
+            )
+        if llm is None:
+            raise RuntimeError("Alignment check has no configured model backend")
+
         user_prompt = build_alignment_check_prompt(
             parent_intention=parent_intention,
             child_intention=child_intention,
@@ -100,7 +115,14 @@ def check_intention_alignment(
         reasoning = str(result.get("reasoning", ""))
         return aligned, reasoning
 
-    except Exception:
+    except Exception as exc:
+        if jev is not None:
+            logger.exception("Jev alignment check failed — escalating for review")
+            return (
+                False,
+                "Jev alignment check failed; escalating because parent/child "
+                f"alignment could not be verified ({type(exc).__name__}).",
+            )
         logger.exception("Alignment check failed — defaulting to aligned (fail-open)")
         return True, ""
 
@@ -127,11 +149,13 @@ class AlignmentBarrier:
         self,
         *,
         db: Database,
-        llm: LLMClient,
+        llm: LLMClient | None,
+        jev: JevClient | None = None,
         timeout_ms: int = _DEFAULT_ALIGNMENT_TIMEOUT_MS,
     ) -> None:
         self._db = db
         self._llm = llm
+        self._jev = jev
         self._timeout = timeout_ms / 1000.0
         self._event_bus: Any | None = None
         self._pending: dict[tuple[str, str], tuple[asyncio.Event, asyncio.Task]] = {}
@@ -468,6 +492,7 @@ class AlignmentBarrier:
                 functools.partial(
                     check_intention_alignment,
                     llm=self._llm,
+                    jev=self._jev,
                     parent_intention=parent_intention,
                     child_intention=child_intention,
                 ),

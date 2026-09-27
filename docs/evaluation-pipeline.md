@@ -112,13 +112,15 @@ When `working_directory` is set on a session, the classifier enforces filesystem
 
 5. **Approved path prefix cache**: When the LLM approves an out-of-project read, the evaluator caches the approved directory prefix. Subsequent reads under that prefix are fast-pathed without LLM evaluation. Max 50 prefixes per session, FIFO eviction.
 
-## LLM Safety Evaluation
+## Model Safety Evaluation
 
-Tool calls classified as WRITE are sent to the LLM for safety evaluation.
+Tool calls classified as WRITE are sent to the configured evaluator backend.
+`EVALUATOR_BACKEND=llm` uses the OpenAI-compatible evaluator;
+`EVALUATOR_BACKEND=jev` uses TypeSafe Jev typed questions.
 
 ### Evaluation Context
 
-The LLM receives:
+The evaluator receives:
 
 - **Tool name and arguments** (redacted)
 - **Session intention** (what the user is trying to accomplish)
@@ -127,9 +129,9 @@ The LLM receives:
 - **Behavioral alert** (if the user has a high/critical risk profile)
 - **Recent tool history** (last few tool calls for context)
 
-### Structured Output
+### Classification Output
 
-The LLM returns a JSON object:
+The LLM backend returns a JSON object:
 
 ```json
 {
@@ -146,9 +148,20 @@ Fields:
 - **reasoning** (string): Explanation of the assessment
 - **decision** (`approve` | `deny` | `escalate`): LLM's recommended decision
 
+The Jev backend asks independent typed questions for the same alignment, risk,
+and disposition dimensions. It validates the complete probability
+distributions. If any dimension is below `JEV_MINIMUM_CONFIDENCE`, the result
+is normalized to a high-risk escalation so uncertainty can never become an
+approval or an uncertain critical denial. Since Jev does not generate prose,
+Intaris creates factual audit text from the selected labels, probabilities,
+and exact returned model version.
+
 ### Timeout
 
-Default: 4000ms (`LLM_TIMEOUT_MS`). Must be under the 5-second circuit breaker in client integrations. If the LLM times out, the evaluation fails and the tool call is blocked (fail-closed).
+Default: 4000ms (`LLM_TIMEOUT_MS` or `JEV_TIMEOUT_MS`). Must be under
+the 5-second circuit breaker in client integrations. If the configured
+evaluator times out, the evaluation fails and the tool call is blocked
+(fail-closed). There is no silent cross-provider fallback.
 
 ## Decision Matrix
 
@@ -171,7 +184,7 @@ Each decision is tagged with the path that produced it:
 |---|---|
 | `fast` | Read-only auto-approve, escalation retry, or session status deny |
 | `critical` | Critical pattern auto-deny |
-| `llm` | LLM safety evaluation -> decision matrix |
+| `llm` | Configured model safety evaluation -> decision matrix |
 | `alignment` | Alignment misalignment escalation (child vs parent intention) |
 
 ## Escalation Workflow

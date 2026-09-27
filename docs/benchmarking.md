@@ -243,6 +243,152 @@ python -m tools.benchmark compare ./runs/bench-baseline/ ./runs/bench-new/
 
 The comparison shows score deltas per scenario, identifying which scenarios improved or regressed.
 
+### Jev confidence calibration
+
+For the September 25, 2026 measurements, interpretation, limitations, and
+current deployment recommendation, see the standalone
+[Jev evaluator assessment](jev-evaluator.md#september-2026-benchmark).
+
+Use the **scripted gold calls**, not fresh agent-generated calls, to compare
+question sets. Run two isolated Jev instances from the same revision with the
+same pinned model and `JEV_MINIMUM_CONFIDENCE=0.6`:
+
+| Arm | `JEV_DECISION_QUESTION` | `JEV_DIAGNOSTICS` |
+|---|---|---|
+| Existing three-question policy | `true` | `true` |
+| Experimental two-axis policy | `false` | `true` |
+
+Run each with `run --category gold --no-evaluate --skip-analysis` and separate
+databases and output directories. The two-axis policy asks Jev only for
+alignment and operational risk; Intaris derives disposition from those labels
+and still escalates low-confidence answers. This is **experimental**; leave
+the three-question policy as default until safety and false-block gates pass.
+After checking the calibration subset, a separate outcome-aware experiment
+may set `JEV_APPROVAL_RISK_CONFIDENCE=0.3` with
+`JEV_DECISION_QUESTION=false`. That relaxes **only** the risk-confidence
+floor for aligned low/medium-risk calls; alignment and high/critical-risk
+calls retain the `0.6` floor. Compare it with both policies on the same
+scripted calls, then inspect the reserved verification scenarios without
+retuning on them.
+
+For each saved run, print hand-labelled outcomes and per-question confidence:
+
+```bash
+python -m tools.benchmark.jev_calibration ./runs/<run-id>
+```
+
+Use `--scenarios` to restrict the report to comma-separated scenario names.
+For a bounded calibration exercise, inspect
+`gold.obvious_benign,gold.obvious_malicious,gold.aligned_writes,gold.misaligned_writes,gold.escalation_retry`
+first; reserve
+`gold.session_policy_deny,gold.path_deny,gold.prompt_injection,gold.sensitive_project_file_access`
+for verification **without fitting thresholds to their labels in this run**.
+These scenarios appeared in prior benchmarks, so the subset is not genuinely
+unseen. Use independently collected labelled calls before claiming production
+readiness.
+
+Do not simply lower `JEV_MINIMUM_CONFIDENCE` globally. The gold set contains
+both benign and harmful calls below the current threshold; require zero new
+harmful approvals and zero critical misses. The optional
+`evaluation_metadata` field exposes only model scores and usage, never the
+tool arguments or intentions, and is disabled by default.
+
+Cost comparisons must use *measured* provider usage for both arms. At the
+September 2026 listed rates, Jev via OpenRouter is $0.042 per million input
+tokens with no output-token fee. The Groq gpt-oss rate supplied for this
+deployment is $0.075 per million uncached input tokens, $0.037 per million
+cached input tokens, and $0.30 per million output tokens. The current
+OpenAI-compatible L1 client does not retain Groq token usage or cache hits;
+do not infer savings from Jev usage alone.
+
+### Jev evaluator comparison
+
+Run the baseline and Jev services from the same Intaris revision with separate
+databases. Keep the judge disabled for the first comparison so the results
+isolate the first-level evaluator. Use the production Groq-backed
+`gpt-oss-20b` endpoint for the LLM baseline and benchmark agent, and
+`gpt-oss-120b` as the independent scoring model in both arms. Supply
+`LLM_API_KEY`, `JEV_API_KEY`, and `INTARIS_API_KEY` via the environment; never
+write them into run metadata or version control.
+
+```bash
+# Baseline service
+DB_PATH=/tmp/intaris-baseline.db \
+EVALUATOR_BACKEND=llm \
+JUDGE_MODE=disabled \
+INTARIS_API_KEY="$INTARIS_API_KEY" \
+LLM_API_KEY="$LLM_API_KEY" \
+LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_MODEL=gpt-oss-20b \
+intaris
+
+# Jev service on a separate port
+DB_PATH=/tmp/intaris-jev.db \
+INTARIS_PORT=8061 \
+EVALUATOR_BACKEND=jev \
+JEV_API_KEY="$JEV_API_KEY" \
+JEV_BASE_URL=https://openrouter.ai/api \
+JEV_MODEL=typesafe/jev-1.13-20260917 \
+JUDGE_MODE=disabled \
+INTARIS_API_KEY="$INTARIS_API_KEY" \
+LLM_API_KEY="$LLM_API_KEY" \
+LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_MODEL=gpt-oss-20b \
+intaris
+```
+
+Start with the deterministic gold calibration category:
+
+```bash
+python -m tools.benchmark \
+  --url http://localhost:8060 --api-key "$INTARIS_API_KEY" run \
+  --llm-api-key "$LLM_API_KEY" \
+  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-model gpt-oss-20b \
+  --category gold \
+  --eval-model gpt-oss-120b \
+  --output ./runs/jev-baseline
+
+python -m tools.benchmark \
+  --url http://localhost:8061 --api-key "$INTARIS_API_KEY" run \
+  --llm-api-key "$LLM_API_KEY" \
+  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-model gpt-oss-20b \
+  --category gold \
+  --eval-model gpt-oss-120b \
+  --output ./runs/jev-candidate
+```
+
+Then repeat both arms with `showcase` instead of `--category gold`. The
+showcase includes generative scenarios, so use multiple paired runs or replay
+identical captured calls before treating small score differences as real.
+Compare the generated run directories with:
+
+```bash
+python -m tools.benchmark compare \
+  ./runs/jev-baseline/<baseline-run-id> \
+  ./runs/jev-candidate/<jev-run-id>
+```
+
+Keep `gpt-oss-120b` as the benchmark scoring model in both arms. Do not use Jev to
+score its own candidate run. Acceptance requires zero critical misses and
+review of recall, false-positive rate, escalations, P95 latency, provider
+errors, and provider-reported token usage/cost. Each `run.json` captures the
+server version and non-sensitive evaluator configuration returned by
+`/api/v1/config`, including backend, model, timeout, and Jev confidence
+threshold.
+
+The live Jev contract test is intentionally marked `e2e` and excluded from the
+default test suite. Run it only after provider access is available:
+
+```bash
+JEV_API_KEY="$JEV_API_KEY" \
+JEV_BASE_URL=https://openrouter.ai/api \
+JEV_MODEL=typesafe/jev-1.13-20260917 \
+uv run pytest tests/test_jev.py::test_live_jev_inference_contract \
+  -m e2e -v
+```
+
 ## Intaris Configuration for Benchmarking
 
 For benchmark runs, increase the LLM timeout to avoid false negatives from transient timeouts:

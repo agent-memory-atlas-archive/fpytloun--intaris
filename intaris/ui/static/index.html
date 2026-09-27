@@ -824,6 +824,9 @@
                               </div>
                             </div>
                           </template>
+                          <template x-if="expandedAuditRecord?.maximum_outcome">
+                            <div class="text-sm mb-2" x-text="'Outcome policy: raw ' + expandedAuditRecord.raw_decision + ' → effective ' + expandedAuditRecord.effective_decision + '; maximum ' + expandedAuditRecord.maximum_outcome + '; override ' + (expandedAuditRecord.outcome_override || 'none')"></div>
+                          </template>
                           <!-- Judge Reasoning -->
                           <template x-if="expandedAuditRecord?.judge_reasoning">
                             <div class="mb-2">
@@ -1231,6 +1234,9 @@
                               x-text="resolving[expandedRecord.call_id] ? 'Confirming...' : 'Confirm Deny'"></button>
                     </div>
                   </div>
+                </template>
+                <template x-if="expandedRecord?.maximum_outcome">
+                  <div class="text-sm mb-3" x-text="'Outcome policy: raw ' + expandedRecord.raw_decision + ' → effective ' + expandedRecord.effective_decision + '; maximum ' + expandedRecord.maximum_outcome + '; override ' + (expandedRecord.outcome_override || 'none')"></div>
                 </template>
                 <!-- Judge Reasoning -->
                 <template x-if="expandedRecord?.judge_reasoning">

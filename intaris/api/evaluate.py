@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from intaris.api.deps import SessionContext, get_session_context
 from intaris.api.schemas import EvaluateRequest, EvaluateResponse
+from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ async def evaluate(
         # concurrent request processing — including /reasoning calls that
         # the intention barrier is waiting for.
         loop = asyncio.get_running_loop()
+        judge_reviewer = getattr(http_request.app.state, "judge_reviewer", None)
         result = await loop.run_in_executor(
             None,
             functools.partial(
@@ -151,10 +153,14 @@ async def evaluate(
                 context=request.context,
                 minimum_outcome=request.minimum_outcome,
                 approval_call_id=request.approval_call_id,
+                judge_unattended=(
+                    judge_reviewer is not None
+                    and judge_reviewer.is_enabled
+                    and request.minimum_outcome is None
+                ),
             ),
         )
 
-        judge_reviewer = getattr(http_request.app.state, "judge_reviewer", None)
         dispatcher = getattr(http_request.app.state, "notification_dispatcher", None)
         judge_waited = False
 
@@ -171,7 +177,19 @@ async def evaluate(
                     session_id=request.session_id,
                     agent_id=agent_id,
                 )
+                if result.get(
+                    "outcome_override"
+                ) == UNATTENDED_JUDGE_REVIEW and outcome.decision not in {
+                    "approve",
+                    "deny",
+                }:
+                    raise RuntimeError(
+                        "Unattended Judge review did not resolve the evaluation"
+                    )
                 result["decision"] = outcome.decision
+                if result.get("maximum_outcome") is not None:
+                    result["effective_decision"] = outcome.decision
+                    result["outcome_override"] = outcome.record.get("outcome_override")
                 result["reasoning"] = outcome.reasoning
                 result["risk"] = outcome.risk
                 result["latency_ms"] = int(
@@ -268,6 +286,10 @@ async def evaluate(
                     "user_id": ctx.user_id,
                     "agent_id": agent_id,
                     "decision": result["decision"],
+                    "raw_decision": result.get("raw_decision"),
+                    "effective_decision": result["decision"],
+                    "maximum_outcome": result.get("maximum_outcome"),
+                    "outcome_override": result.get("outcome_override"),
                     "risk": result.get("risk"),
                     "path": result["path"],
                     "latency_ms": result["latency_ms"],
@@ -295,6 +317,10 @@ async def evaluate(
                                 "args_redacted": result.get("args_redacted"),
                                 "classification": result.get("classification"),
                                 "decision": result["decision"],
+                                "raw_decision": result.get("raw_decision"),
+                                "effective_decision": result["decision"],
+                                "maximum_outcome": result.get("maximum_outcome"),
+                                "outcome_override": result.get("outcome_override"),
                                 "risk": result.get("risk"),
                                 "reasoning": result.get("reasoning"),
                                 "path": result["path"],

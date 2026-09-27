@@ -382,6 +382,15 @@ class Database:
 
     def _migrate_sqlite(self, conn: sqlite3.Connection) -> None:
         """Run schema migrations for SQLite backend."""
+        for column in (
+            "raw_decision",
+            "effective_decision",
+            "maximum_outcome",
+            "minimum_outcome",
+            "outcome_override",
+        ):
+            if not self._sqlite_column_exists(conn, "audit_log", column):
+                conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} TEXT")
         # Migration: add args_hash to audit_log
         if not self._sqlite_column_exists(conn, "audit_log", "args_hash"):
             conn.execute("ALTER TABLE audit_log ADD COLUMN args_hash TEXT")
@@ -969,6 +978,11 @@ class Database:
                 ("audit_log", "judge_reasoning", "TEXT"),
                 ("audit_log", "judge_decision", "TEXT"),
                 ("audit_log", "judge_risk", "TEXT"),
+                ("audit_log", "raw_decision", "TEXT"),
+                ("audit_log", "effective_decision", "TEXT"),
+                ("audit_log", "maximum_outcome", "TEXT"),
+                ("audit_log", "minimum_outcome", "TEXT"),
+                ("audit_log", "outcome_override", "TEXT"),
                 ("sessions", "title", "TEXT"),
                 ("analysis_tasks", "started_at", "TIMESTAMPTZ"),
                 ("analysis_tasks", "heartbeat_at", "TIMESTAMPTZ"),

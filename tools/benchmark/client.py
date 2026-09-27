@@ -470,6 +470,10 @@ class IntarisClient:
         """
         return self._request("GET", "/api/v1/whoami")
 
+    def server_config(self) -> dict[str, Any]:
+        """Get non-sensitive server and evaluator configuration."""
+        return self._request("GET", "/api/v1/config")
+
     def stats(self, *, agent_id: str | None = None) -> dict[str, Any]:
         """Get aggregated dashboard statistics.
 

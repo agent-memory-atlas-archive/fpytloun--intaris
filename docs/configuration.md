@@ -44,19 +44,66 @@ JWT validation requires:
 - `sub` claim present
 - matching `agent_id` claim and `X-Agent-Id` header when both are provided
 
-## LLM (Safety Evaluation)
+## Tool-Call Evaluator
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_API_KEY` | (required) | API key for the LLM provider. Falls back to `OPENAI_API_KEY`. |
+| `EVALUATOR_BACKEND` | `llm` | Bounded evaluator backend: `llm` or `jev`. |
+| `LLM_API_KEY` | (required for generative features) | API key for the LLM provider. Falls back to `OPENAI_API_KEY`. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API base URL. Falls back to `OPENAI_API_BASE`. |
-| `LLM_MODEL` | `gpt-5.4-nano` | Model for safety evaluation. Should be fast and cheap. |
+| `LLM_MODEL` | `gpt-5.4-nano` | Model for safety evaluation when `EVALUATOR_BACKEND=llm`. |
 | `LLM_REASONING_EFFORT` | `low` | Reasoning effort hint (provider-specific). |
 | `LLM_TIMEOUT_MS` | `4000` | Timeout for LLM calls in milliseconds. Must be under the 5-second circuit breaker. Minimum: 500ms. |
+| `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
+| `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
+| `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
+| `JEV_TIMEOUT_MS` | `4000` | Jev timeout in milliseconds. Minimum: 500ms. |
+| `JEV_MINIMUM_CONFIDENCE` | `0.6` | Minimum confidence for each Jev classification dimension. Lower-confidence tool calls and alignments escalate. |
+| `JEV_DECISION_QUESTION` | `true` | Keep the third Jev disposition question; set `false` only for the experimental two-axis benchmark, where Intaris derives disposition from alignment and risk. |
+| `JEV_DIAGNOSTICS` | `false` | Include model probabilities, per-question confidence, and token usage in authenticated evaluation responses for calibration. No tool arguments or intention text. |
+| `JEV_APPROVAL_RISK_CONFIDENCE` | (unset) | Experimental risk-confidence floor for aligned low/medium-risk calls when `JEV_DECISION_QUESTION=false`; alignment and all other risks retain `JEV_MINIMUM_CONFIDENCE`. Requires explicit calibration. |
 
 ### Model Selection
 
-The evaluation model should be fast and inexpensive -- it's called on every non-read-only tool call. `gpt-5.4-nano` or similar small models work well. The model must support structured output (JSON mode).
+The evaluation model should be fast and inexpensive -- it is called on every
+non-read-only tool call. The default `llm` backend requires an
+OpenAI-compatible model with structured JSON output.
+
+The `jev` backend uses TypeSafe's System One API for bounded alignment, risk,
+and disposition classifications. It also handles parent/child intention
+alignment. Jev does not replace generative features: intention generation,
+the judge, L2 summaries and L3 analysis continue using their respective LLM
+configuration. Jev provider failures propagate as evaluation failures; Intaris
+does not silently switch models. Jev's returned probabilities are converted
+into concise audit text and are not represented as model-generated reasoning.
+It is opt-in and **not the recommended production default**; see the
+[Jev evaluator assessment](jev-evaluator.md) for benchmark results and caveats.
+
+Example split configuration:
+
+```bash
+EVALUATOR_BACKEND=jev
+JEV_API_KEY=...
+JEV_MODEL=jev-1.13.0
+
+# Generative intention, analysis and judge paths
+LLM_API_KEY=...
+ANALYSIS_LLM_MODEL=gpt-5.4-mini
+JUDGE_LLM_MODEL=gpt-5.4
+```
+
+For Jev through OpenRouter with the production Groq-backed generative setup:
+
+```bash
+EVALUATOR_BACKEND=jev
+JEV_BASE_URL=https://openrouter.ai/api
+JEV_MODEL=typesafe/jev-1.13-20260917
+JEV_API_KEY=<OpenRouter API key>
+LLM_MODEL=gpt-oss-20b
+LLM_BASE_URL=https://openai.fpy.cz/v1
+ANALYSIS_LLM_MODEL=gpt-oss-120b
+JUDGE_LLM_MODEL=gpt-oss-120b
+```
 
 ## LLM (L2 Behavioral Analysis)
 

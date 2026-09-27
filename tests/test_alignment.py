@@ -114,6 +114,44 @@ class TestCheckIntentionAlignment:
         assert aligned is True
         assert reasoning == ""
 
+    def test_jev_backend_is_used_without_llm(self):
+        """Jev handles bounded alignment while generative LLM stays separate."""
+        from intaris.alignment import check_intention_alignment
+
+        jev = MagicMock()
+        jev.check_alignment.return_value = (
+            False,
+            "Jev classified the child intention as not aligned.",
+        )
+
+        aligned, reasoning = check_intention_alignment(
+            llm=None,
+            jev=jev,
+            parent_intention="Maintain the web application",
+            child_intention="Delete production backups",
+        )
+
+        assert aligned is False
+        assert "not aligned" in reasoning
+        jev.check_alignment.assert_called_once()
+
+    def test_jev_failure_escalates_instead_of_failing_open(self):
+        """Unverified Jev alignment is represented as misalignment."""
+        from intaris.alignment import check_intention_alignment
+
+        jev = MagicMock()
+        jev.check_alignment.side_effect = RuntimeError("provider unavailable")
+
+        aligned, reasoning = check_intention_alignment(
+            llm=None,
+            jev=jev,
+            parent_intention="Maintain the web application",
+            child_intention="Update the API documentation",
+        )
+
+        assert aligned is False
+        assert "could not be verified" in reasoning
+
 
 # ── AlignmentBarrier tests ────────────────────────────────────────────
 

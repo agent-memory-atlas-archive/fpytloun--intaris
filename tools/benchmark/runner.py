@@ -703,6 +703,17 @@ class ScenarioRunner:
 
     def _save_run_meta(self, session_ids: list[str]) -> None:
         """Save run.json with config, timestamp, scenario list, totals."""
+        if self.config.dry_run:
+            server_config = {"capture_skipped": "dry_run"}
+        else:
+            try:
+                server_config = self.intaris.server_config()
+            except IntarisError as exc:
+                logger.warning(
+                    "Could not capture Intaris config for run metadata: %s", exc
+                )
+                server_config = {"capture_error": str(exc)}
+
         meta: dict[str, Any] = {
             "run_id": self.run_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -719,6 +730,7 @@ class ScenarioRunner:
             "dry_run": self.config.dry_run,
             "session_ids": session_ids,
             "session_count": len(session_ids),
+            "intaris_config": server_config,
         }
         self.store.save_run_meta(meta)
         logger.debug("Run metadata saved: %s", self.store.run_dir / "run.json")

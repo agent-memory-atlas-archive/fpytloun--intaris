@@ -12,6 +12,7 @@
 |---|---|
 | [Architecture](architecture.md) | System design, layer responsibilities, and key design decisions |
 | [Evaluation Pipeline](evaluation-pipeline.md) | How tool calls are classified, evaluated, and decided |
+| [Jev Evaluator](jev-evaluator.md) | Experimental L1 backend, Groq comparison, benchmark results, and deployment status |
 
 ## Reference
 

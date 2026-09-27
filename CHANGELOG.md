@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-27
+
+### Added
+
+- **Jev evaluation backend** -- Support Jev through the OpenRouter Decisions API as an alternative tool-call evaluator, with outcome-aware confidence calibration and configuration documentation.
+- **Session policy outcome ceiling** -- Limit the most permissive evaluation outcome per session and retain the policy decision in audit provenance.
+- **Evaluator benchmarks** -- Document production-model comparisons, Jev calibration, and the resulting evaluator assessment.
+
+### Fixed
+
+- **Unattended escalations** -- Deny evaluations that require escalation when no human approval channel is available, and allow Judge review before resolving unattended escalations.
+
+### Changed
+
+- **Release metadata** -- Bump the Intaris package and MCP proxy client identity to `0.11.0`.
+
 ## [0.10.1] - 2026-09-13
 
 ### Fixed

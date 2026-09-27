@@ -190,6 +190,12 @@ The middleware sets three ContextVars (`_session_user_id`, `_session_agent_id`, 
 | `INTARIS_API_KEY` | Single shared API key (auth only, no user binding) |
 | `INTARIS_API_KEYS` | JSON dict mapping API keys to user_ids (`{"key": "user", "key2": "*"}`) |
 | `RATE_LIMIT` | Max evaluations per session per minute (default 60, 0 = no limit) |
+| `EVALUATOR_BACKEND` | Tool-call evaluator backend: `llm` (default) or `jev` |
+| `JEV_API_KEY` | TypeSafe API key required when `EVALUATOR_BACKEND=jev` (falls back to `TYPESAFE_API_KEY`) |
+| `JEV_MODEL` | Pinned Jev model (default `jev-1.13.0`) |
+| `JEV_BASE_URL` | TypeSafe API base URL (default `https://api.typesafe.ai`) |
+| `JEV_TIMEOUT_MS` | Jev request timeout (default `4000`) |
+| `JEV_MINIMUM_CONFIDENCE` | Minimum confidence before Jev results escalate (default `0.6`) |
 | `COOKIE_SECURE` | Set the Secure flag on SSO cookies (default `true`). Set to `false` for local development over plain HTTP. |
 | `WEBHOOK_URL` | Cognis webhook URL for escalation callbacks (optional) |
 | `WEBHOOK_SECRET` | HMAC-SHA256 secret for signing webhook payloads (required if WEBHOOK_URL is set) |

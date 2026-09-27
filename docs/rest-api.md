@@ -55,6 +55,7 @@ When judge auto-resolution is enabled and the first-pass evaluator escalates, th
 | `risk` | string | `low`, `medium`, `high`, or `critical` |
 | `path` | string | Evaluation path: `fast`, `critical`, `llm`, or `alignment` |
 | `latency_ms` | integer | Evaluation time in milliseconds |
+| `evaluation_metadata` | object or null | Optional non-sensitive Jev probabilities, confidence, model, and usage when `JEV_DIAGNOSTICS=true`; absent by default |
 | `session_status` | string | Current session status (if changed) |
 | `status_reason` | string | Reason for status change (if any) |
 

@@ -2238,6 +2238,16 @@ def _format_tool_call(tc: dict[str, Any]) -> str:
     )
 
     line = f'[{ts}] {tool}({args_brief}) -> {decision}{risk_str} "{reasoning_brief}"'
+    if tc.get("maximum_outcome") is not None:
+        line += (
+            f" [raw={tc.get('raw_decision')}; "
+            f"effective={tc.get('effective_decision') or decision}; "
+            f"maximum_outcome={tc['maximum_outcome']}; "
+            f"override={tc.get('outcome_override') or 'none'}; "
+            f"judge={tc.get('judge_decision') or 'none'}]"
+        )
+        if tc.get("outcome_override"):
+            line += " Policy enforcement override is not evidence of safe behavior."
 
     # Append content security flags for non-read calls
     if classification != "read":

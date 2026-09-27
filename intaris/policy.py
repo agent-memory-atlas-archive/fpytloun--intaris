@@ -70,6 +70,8 @@ def effective_policy_for_evaluator(
         return policy
 
     effective = dict(policy)
+    # Enforcement settings must not bias the underlying safety assessment.
+    effective.pop("maximum_outcome", None)
     allow_paths = policy.get("allow_paths")
     if isinstance(allow_paths, list):
         effective["allow_paths"] = _reduce_allow_paths_for_prompt(allow_paths)

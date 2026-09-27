@@ -21,6 +21,27 @@ from intaris.session import SessionStore
 
 TEST_USER = "test-user"
 
+
+def test_policy_override_is_visible_in_analysis():
+    from intaris.analyzer import _format_tool_call
+
+    text = _format_tool_call(
+        {
+            "tool": "bash",
+            "decision": "approve",
+            "raw_decision": "deny",
+            "effective_decision": "approve",
+            "risk": "critical",
+            "maximum_outcome": "approve",
+            "outcome_override": "session_policy.maximum_outcome",
+        }
+    )
+    assert "raw=deny" in text
+    assert "effective=approve" in text
+    assert "maximum_outcome=approve" in text
+    assert "not evidence of safe behavior" in text
+
+
 _SUMMARY_RESPONSE = json.dumps(
     {
         "summary": "Session focused on implementing auth module.",

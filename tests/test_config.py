@@ -9,6 +9,7 @@ import pytest
 from intaris.config import (
     Config,
     DBConfig,
+    JevConfig,
     LLMConfig,
     SearchConfig,
     ServerConfig,
@@ -24,6 +25,13 @@ class TestConfigDefaults:
         assert config.model == "gpt-5.4-nano"
         assert config.temperature == 0.1
         assert config.timeout_ms == 4000
+
+    def test_jev_defaults(self):
+        config = JevConfig()
+        assert config.model == "jev-1.13.0"
+        assert config.base_url == "https://api.typesafe.ai"
+        assert config.timeout_ms == 4000
+        assert config.minimum_confidence == 0.6
 
     def test_db_defaults(self):
         config = DBConfig()
@@ -68,6 +76,80 @@ class TestConfigValidation:
         if config.llm.api_key:
             with pytest.raises(ValueError, match="too low"):
                 config.validate()
+
+    def test_jev_requires_api_key_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("EVALUATOR_BACKEND", "jev")
+        monkeypatch.delenv("JEV_API_KEY", raising=False)
+        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+        config = Config(
+            llm=LLMConfig(api_key="test-llm-key"),
+            jev=JevConfig(),
+        )
+
+        with pytest.raises(ValueError, match="JEV_API_KEY"):
+            config.validate()
+
+    def test_openrouter_does_not_reuse_typesafe_api_key(self, monkeypatch):
+        monkeypatch.setenv("EVALUATOR_BACKEND", "jev")
+        monkeypatch.setenv("JEV_BASE_URL", "https://openrouter.ai/api")
+        monkeypatch.setenv("TYPESAFE_API_KEY", "typesafe-only-secret")
+        monkeypatch.delenv("JEV_API_KEY", raising=False)
+        config = Config(llm=LLMConfig(api_key="test-llm-key"), jev=JevConfig())
+
+        assert config.jev.api_key == ""
+        with pytest.raises(ValueError, match="JEV_API_KEY"):
+            config.validate()
+
+    def test_explicit_openrouter_base_does_not_inherit_typesafe_key(self, monkeypatch):
+        monkeypatch.setenv("TYPESAFE_API_KEY", "typesafe-only-secret")
+        monkeypatch.delenv("JEV_API_KEY", raising=False)
+        monkeypatch.delenv("JEV_BASE_URL", raising=False)
+        config = Config(
+            llm=LLMConfig(api_key="test-llm-key"),
+            jev=JevConfig(enabled=True, base_url="https://openrouter.ai/api"),
+        )
+
+        assert config.jev.api_key == ""
+        with pytest.raises(ValueError, match="JEV_API_KEY"):
+            config.validate()
+
+    def test_jev_confidence_must_be_probability(self):
+        config = Config(
+            llm=LLMConfig(api_key="test-llm-key"),
+            jev=JevConfig(
+                enabled=True,
+                api_key="test-typesafe-key",
+                minimum_confidence=1.1,
+            ),
+        )
+
+        with pytest.raises(ValueError, match="JEV_MINIMUM_CONFIDENCE"):
+            config.validate()
+
+    def test_invalid_jev_settings_are_ignored_for_llm_backend(self):
+        config = Config(
+            llm=LLMConfig(api_key="test-llm-key"),
+            jev=JevConfig(
+                enabled=False,
+                timeout_ms=1,
+                minimum_confidence=2.0,
+            ),
+        )
+
+        config.validate()
+
+    def test_approval_risk_floor_requires_two_axis_policy(self):
+        config = Config(
+            llm=LLMConfig(api_key="test-llm-key"),
+            jev=JevConfig(
+                enabled=True,
+                api_key="test-typesafe-key",
+                approval_risk_confidence=0.3,
+            ),
+        )
+
+        with pytest.raises(ValueError, match="JEV_DECISION_QUESTION=false"):
+            config.validate()
 
     def test_negative_rate_limit(self):
         config = Config(llm=LLMConfig())

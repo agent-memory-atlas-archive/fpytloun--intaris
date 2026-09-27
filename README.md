@@ -145,6 +145,7 @@ Intaris catches 100% of critical threats (destructive commands, data exfiltratio
 | Avg Latency | 1.1s |
 
 See the [Benchmarking docs](docs/benchmarking.md) for methodology, scenario details, and how to run your own benchmarks.
+The separate [Jev evaluator assessment](docs/jev-evaluator.md) compares an experimental backend with a Groq-backed `gpt-oss-20b` L1 evaluator; Jev is **not** the recommended production default.
 
 ## Documentation
 
@@ -153,6 +154,7 @@ See the [Benchmarking docs](docs/benchmarking.md) for methodology, scenario deta
 | [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
 | [Architecture](docs/architecture.md) | System design, layers, and key decisions |
 | [Evaluation Pipeline](docs/evaluation-pipeline.md) | Classification, LLM evaluation, and decision matrix |
+| [Jev Evaluator](docs/jev-evaluator.md) | Experimental L1 backend, measured Groq comparison, and status |
 | [Configuration](docs/configuration.md) | Environment variable reference |
 | [REST API](docs/rest-api.md) | Full API endpoint reference |
 | [MCP Proxy](docs/mcp-proxy.md) | MCP proxy setup, tool namespacing, and preferences |

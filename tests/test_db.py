@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -41,6 +42,54 @@ def task_queue(db):
 
 class TestSessionStore:
     """Test session CRUD operations."""
+
+    def test_outcome_provenance_pg_migration_columns(self):
+        conn = MagicMock()
+        conn.cursor.return_value.fetchone.return_value = None
+        db = Database.__new__(Database)
+        db._migrate_pg(conn)
+        statements = [
+            call.args[0] for call in conn.cursor.return_value.execute.call_args_list
+        ]
+        for field in (
+            "raw_decision",
+            "effective_decision",
+            "maximum_outcome",
+            "minimum_outcome",
+            "outcome_override",
+        ):
+            assert (
+                f"ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS {field} TEXT"
+                in statements
+            )
+
+    def test_outcome_provenance_migration_is_additive_and_idempotent(self, tmp_path):
+        path = str(tmp_path / "legacy.db")
+        with sqlite3.connect(path) as conn:
+            conn.executescript(_SCHEMA_SQL_SQLITE)
+            conn.execute(
+                "INSERT INTO sessions (user_id, session_id, intention, created_at, updated_at) "
+                "VALUES ('tenant', 'session', 'Test', '2026-01-01', '2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO audit_log (id, call_id, user_id, session_id, timestamp, "
+                "decision, evaluation_path, latency_ms) "
+                "VALUES ('record', 'call', 'tenant', 'session', '2026-01-01', "
+                "'deny', 'critical', 0)"
+            )
+        for _ in range(2):
+            db = Database(DBConfig(path=path))
+            record = AuditStore(db).get_by_call_id("call", user_id="tenant")
+            assert record["decision"] == "deny"
+            for field in (
+                "raw_decision",
+                "effective_decision",
+                "maximum_outcome",
+                "minimum_outcome",
+                "outcome_override",
+            ):
+                assert record[field] is None
+            db.close()
 
     def test_database_metrics_record_queries_and_transactions(self, db):
         before = db.metrics()
