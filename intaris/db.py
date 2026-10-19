@@ -187,6 +187,8 @@ class Database:
         self._query_latency = Histogram()
         self._transaction_latency = Histogram()
         self._pool_wait_latency = Histogram()
+        self._analysis_wakeup = None
+        self._database_url = config.database_url
 
         if self._backend == "postgresql":
             self._init_postgresql(config)
@@ -317,7 +319,7 @@ class Database:
                 raise
 
     @contextmanager
-    def cursor(self) -> Generator[Any, None, None]:
+    def cursor(self, *, notify_analysis: bool = False) -> Generator[Any, None, None]:
         """Context manager for cursor-based operations.
 
         Commits on success, rolls back on exception.
@@ -333,6 +335,8 @@ class Database:
                 )
                 try:
                     yield wrapper
+                    if notify_analysis:
+                        wrapper.execute("SELECT pg_notify('intaris_analysis', '')")
                 finally:
                     raw_cursor.close()
                 conn.commit()
@@ -355,6 +359,28 @@ class Database:
                     self._transaction_latency.observe(
                         (time.monotonic() - started_at) * 1000
                     )
+        # Only reached after a successful commit, never on rollback. PostgreSQL
+        # also delivers the transactional notification to other processes.
+        if notify_analysis and self._analysis_wakeup is not None:
+            self._analysis_wakeup.notify()
+
+    def analysis_wakeup(self):
+        """Return the one analysis coordinator owned by this application DB."""
+        if self._analysis_wakeup is None:
+            from intaris.queue_wakeup import AnalysisWakeup
+
+            self._analysis_wakeup = AnalysisWakeup(self)
+        return self._analysis_wakeup
+
+    def open_analysis_listener(self):
+        """Open a dedicated non-pooled hint connection; caller must close it."""
+        if self.backend == "postgresql":
+            import psycopg2
+
+            return psycopg2.connect(self._database_url, async_=True, connect_timeout=5)
+        # :memory: is connection-local. Local post-commit hints still work;
+        # data_version only adds cross-process support for file databases.
+        return sqlite3.connect(self._path, isolation_level=None, timeout=0.1)
 
     # ── Schema Management ─────────────────────────────────────────
 
@@ -382,6 +408,34 @@ class Database:
 
     def _migrate_sqlite(self, conn: sqlite3.Connection) -> None:
         """Run schema migrations for SQLite backend."""
+        from intaris.workflow_scope import SCHEMA
+
+        conn.execute(SCHEMA)
+        for column in ("policy_revision", "state_revision"):
+            if not self._sqlite_column_exists(conn, "sessions", column):
+                conn.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1"
+                )
+        if not self._sqlite_column_exists(conn, "audit_log", "evaluation_metadata"):
+            conn.execute("ALTER TABLE audit_log ADD COLUMN evaluation_metadata TEXT")
+        for column in ("logical_call_id", "action_digest", "resolution_scope"):
+            if not self._sqlite_column_exists(conn, "audit_log", column):
+                conn.execute(f"ALTER TABLE audit_log ADD COLUMN {column} TEXT")
+        if not self._sqlite_column_exists(conn, "sessions", "alignment_state"):
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN alignment_state TEXT NOT NULL DEFAULT 'ready'"
+            )
+        if not self._sqlite_column_exists(conn, "sessions", "latest_user_evidence"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN latest_user_evidence TEXT")
+        if not self._sqlite_column_exists(conn, "sessions", "alignment_reason"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN alignment_reason TEXT")
+        for column in ("policy_source", "parent_policy_hash"):
+            if not self._sqlite_column_exists(conn, "sessions", column):
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+        if not self._sqlite_column_exists(conn, "sessions", "original_assignment"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN original_assignment TEXT")
+        if not self._sqlite_column_exists(conn, "sessions", "intention_profile"):
+            conn.execute("ALTER TABLE sessions ADD COLUMN intention_profile TEXT")
         for column in (
             "raw_decision",
             "effective_decision",
@@ -571,6 +625,9 @@ class Database:
         if not self._sqlite_column_exists(conn, "analysis_tasks", "heartbeat_at"):
             conn.execute("ALTER TABLE analysis_tasks ADD COLUMN heartbeat_at TEXT")
             logger.info("Migration: added heartbeat_at column to analysis_tasks")
+
+        if not self._sqlite_column_exists(conn, "analysis_tasks", "claim_token"):
+            conn.execute("ALTER TABLE analysis_tasks ADD COLUMN claim_token TEXT")
 
         if not self._sqlite_column_exists(conn, "analysis_tasks", "agent_id"):
             conn.execute(
@@ -950,10 +1007,26 @@ class Database:
         PostgreSQL supports ADD COLUMN IF NOT EXISTS, so migrations
         are simpler than SQLite.
         """
+        from intaris.workflow_scope import SCHEMA
+
         cur = conn.cursor()
+        cur.execute(SCHEMA)
         try:
             # All columns that may need adding (idempotent with IF NOT EXISTS)
             migrations = [
+                ("sessions", "policy_revision", "INTEGER NOT NULL DEFAULT 1"),
+                ("sessions", "state_revision", "INTEGER NOT NULL DEFAULT 1"),
+                ("audit_log", "evaluation_metadata", "TEXT"),
+                ("audit_log", "logical_call_id", "TEXT"),
+                ("audit_log", "action_digest", "TEXT"),
+                ("audit_log", "resolution_scope", "TEXT"),
+                ("sessions", "alignment_state", "TEXT NOT NULL DEFAULT 'ready'"),
+                ("sessions", "alignment_reason", "TEXT"),
+                ("sessions", "policy_source", "TEXT"),
+                ("sessions", "parent_policy_hash", "TEXT"),
+                ("sessions", "latest_user_evidence", "TEXT"),
+                ("sessions", "original_assignment", "TEXT"),
+                ("sessions", "intention_profile", "TEXT"),
                 ("audit_log", "args_hash", "TEXT"),
                 ("sessions", "last_activity_at", "TIMESTAMPTZ"),
                 ("sessions", "parent_session_id", "TEXT"),
@@ -986,6 +1059,7 @@ class Database:
                 ("sessions", "title", "TEXT"),
                 ("analysis_tasks", "started_at", "TIMESTAMPTZ"),
                 ("analysis_tasks", "heartbeat_at", "TIMESTAMPTZ"),
+                ("analysis_tasks", "claim_token", "TEXT"),
                 ("analysis_tasks", "agent_id", "TEXT DEFAULT ''"),
             ]
             for table, column, col_type in migrations:
@@ -1462,6 +1536,7 @@ CREATE TABLE IF NOT EXISTS analysis_tasks (
     created_at      TEXT NOT NULL,
     started_at      TEXT,
     heartbeat_at    TEXT,
+    claim_token     TEXT,
     completed_at    TEXT
 );
 
@@ -1762,6 +1837,7 @@ CREATE TABLE IF NOT EXISTS analysis_tasks (
     created_at      TIMESTAMPTZ NOT NULL,
     started_at      TIMESTAMPTZ,
     heartbeat_at    TIMESTAMPTZ,
+    claim_token     TEXT,
     completed_at    TIMESTAMPTZ
 );
 

@@ -4,6 +4,28 @@ from __future__ import annotations
 
 from typing import Any
 
+POLICY_CLAUSE_GUIDANCE = """\
+## Operator Allowance and Restriction Semantics
+Session allow_policies describe positive allowances, not an exhaustive allowlist.
+Failure to match an allowance is not itself a deny-policy violation. Evaluate
+the remaining action under the active task, profile and explicit controls.
+Do not infer "everything else is forbidden" merely because allowances exist.
+Explicit restrictive wording such as "only", "must not", or "do not" remains
+binding, including when it appears inside an allowance. Deny policies take
+precedence over allowances. A safe operation can still violate an explicit rule;
+do not erase that rule or grant broader access because the operation is low risk.
+
+Assess purpose from original task evidence and the actual operation, not an exact
+keyword match to a generated intention. Research and validation for a multi-topic
+report may concern any of its topics, including security or finance; an omitted
+topic in the summary is not proof of unrelated work. Assess operational risk
+separately from task relationship: a public search about hacking does not execute
+a hack. Inspect query arguments for private-data disclosure and fetched resources
+for access restrictions; a web tool name is not blanket permission.
+Uncertain alignment or a non-matching allowance is not evidence of high
+operational risk. Preserve uncertainty without manufacturing danger or consent.
+"""
+
 
 def normalized_policy_clauses(
     policy: dict[str, Any] | None,

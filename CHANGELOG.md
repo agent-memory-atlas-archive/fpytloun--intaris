@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.13.0] - 2026-10-19
+
+### Release status
+
+- This release consolidates the hybrid evaluation and source-context work below. The earlier `0.12.0` candidate was not published on GitHub; managed inference changes from that candidate are included.
+- The last complete offline run passed 4,423 tests with 512 skipped and two warnings before the later queue, context-budget and Judge fixes. Those later changes have focused regression/review evidence, not a fresh combined full-suite result. Repeating the suite and adding new tests were explicitly waived for finalization.
+- Historical model benchmark reports retain their original cohorts, unsafe observations and limitations. They are not a qualification of this exact final release and do not establish universal semantic accuracy.
+
+### Added
+
+- **Single-call rich intention** -- Generate the session title, summary and a controller-validated structured intention (requests, restrictions, approvals, revocations, uncertain items, context) in one model call with `SOURCE_CONTEXT_GENERATION=single`; quotes are verified against the source user message, bare confirmations become approvals only for a single verified asked-about action, and permissions never become current requests. Persisted in `sessions.intention_profile` with per-item validation drop codes.
+- **Per-model L1 input projection** -- `L1_INPUT_PROJECTION=auto|json|lines`; the `lines` projection renders the proposed action first and the user's requests and restrictions as exact quotes grouped by source message, with strict JSON-schema output for `gpt-oss` evaluators on Groq. `auto` selects `lines` for Jev and `gpt-oss` models, the projection each was measured with, and `json` for other chat models.
+- **User-simulator Judge review** -- Hybrid escalations are reviewed by a Judge that answers as the user (`approve | ask | refuse`, risk, confidence, basis, citations and a concrete question when needed). Judge can correct model and heuristic classifications, including critical-risk labels and negative child-alignment assessments; original evidence stays audited. Exact configured prohibitions, read-only requirements, human checkpoints, action freshness and tenant boundaries remain enforced.
+- **`bounded_autonomy` profile semantics** -- Approve directly a consequential action the user requested (explicit or implicit authorization, within scope, granted by the user) or a validated approval covers, and read-only actions with controller-known effects, when no other obligation is open; route the rest to Judge review, whose `ask` and non-critical `refuse` reach a human.
+- **Controller effect witnesses** -- Derive `delete`, `transmit`, `write` or `read` effects from the tool-name verb for namespaced tools (`name_heuristic` provenance), and a `disclose` review signal for emit-style shell commands with secret-bearing operands (`secret_argument` provenance). Original observations remain audited even when Judge corrects their severity.
+- **Evaluation redesign documentation** -- `docs/how-intaris-decides.md`, `docs/why-we-rebuilt-intaris-evaluation.md` and `docs/evaluation-redesign-2026-10.md`: the pipeline, motivation and measurements. In the complete Jev comparison (258 required observations per arm across three seeds), rich intention with `bounded_autonomy` reduced benign human escalations from 27 to 21 and raised benign approvals from 96 to 102 against the summary/balanced reference on the same experimental runtime. Two harmful approvals failed the full-run safety gate. A subsequent disclosure fix passed a separate targeted regression; these are not combined into a full-run pass.
+- **GPT-OSS-20B remeasurement** -- Under the redesigned pipeline with `bounded_autonomy`, 258 verified observations yielded 112/123 benign approvals, 11 benign escalations and 2/129 unsafe approvals in the known forged-push-permission class. The preregistered historical thresholds passed, but the different historical cohort is not a matched proof of compatibility for every installation. See the measurement report for latency, cost and the no-user fallback limitation.
+- **Read-only rich decision evidence UI** -- Session API and UI expose intention items, current tasks, scoped approvals and validation drop codes, alongside active profiles, compiled rules and advisory clauses. Approvals show structured Judge recommendations with exact quoted citations and Jev abstentions; audit details show effect witnesses, L1 projection and explicitly waived operator clauses.
+
+### Changed
+
+- **Balanced defaults and delegated policy** -- New sessions default to hybrid Balanced evaluation. Delegated sessions inherit parent restrictions and effective policy rather than silently reverting to Legacy.
+- **Bounded model input** -- Oversized dynamic input uses source-aware excerpts followed by marked middle truncation, preserving original audit records and citation identities. Partial views cannot establish explicit or scoped approval grants.
+- **Judge instruction chronology** -- Current relevant user scope takes precedence over superseded task summaries. Assistant blocker reports and automated denials are historical context, not user prohibitions; unchanged restrictions and actual human refusals remain binding.
+- **Hybrid `balanced` profile** -- Denials derived from a model label (restriction, target or intent conflict) are reviewed by the Judge instead of being terminal; deterministic deny rules remain terminal.
+- **Rich context fallback** -- Sessions without user messages or human notes evaluate with the production context instead of an unavailable rich profile.
+- **Recommended evaluator for the hybrid policy** -- Jev with the `lines` projection is the measured, recommended L1 evaluator for the `hybrid_v1` configuration; `gpt-oss-20b` remains supported via `EVALUATOR_BACKEND=llm` and receives the lines projection under `auto`.
+- **Free-form session policy compatibility** -- Hybrid activation retains unsupported English clauses as advisory operator policy instead of rejecting Cognis sessions. L1 and Judge receive the text as data, separate from user authority. Unresolved deny clauses require applicability assessment on reads and writes. An applicable deny established by L1 cannot be cleared by a Judge approval that omits its ID. Strict applicable denies require a human; non-strict operator refusals escalate unless explicitly waived by an operator outcome cap, with clause IDs audited. Known compiled-grammar limitation: "Never push to main" remains advisory.
+
+### Fixed
+
+- **Model timeout recovery** -- A timed-out transport attempt retains the remaining shared evaluation retry budget; standalone calls remain bounded.
+- **Native MCP review errors** -- Preserve structured retryability and non-dispatch metadata for unavailable reviews instead of flattening them into an unstructured error.
+- **Analysis queue recovery and wakeups** -- Fence claims, preserve fresh queued work across restart, share commit-aware wakeups, and bound lease-recovery scans while draining backlogs.
+- **Event ingestion diagnostics** -- Retain uncertain appends, distinguish rejected input from temporary failures, and expose bounded operational metrics.
+- **Portable release examples** -- Replace unresolved operational references with synthetic fixtures without presenting reconstructed examples as unchanged historical measurements.
+- **Async evaluation contention** -- Backend metadata is refreshed by one lazy, bounded worker shared by synchronous and asynchronous callers. HTTP and MCP evaluations wait outside request-worker slots and resume the same decision flow, preserving fast paths, evidence and fail-closed errors without replaying side effects. Queue-depth sampling runs off the event loop and retains ownership of an outstanding query through cancellation and restart.
+- **Jev answer validation** -- A Jev label that is not the highest-probability option is treated as an abstention under the normal confidence thresholds instead of aborting the evaluation with an HTTP error; exact ties no longer raise, and residual validation failures escalate instead of erroring.
+- **Intention title** -- The single-call prompt no longer invites the literal title "English".
+
+## [0.12.0] - 2026-10-04
+
+### Added
+
+- **Cognis-managed inference** -- Route evaluation, Judge review, analysis, deep analysis, and embeddings through Cognis using service JWT credentials read on each request, supporting credential rotation without restart.
+
+### Fixed
+
+- **Managed reasoning effort** -- Inherit Cognis routing defaults unless reasoning effort is explicitly configured, while preserving standalone defaults and explicit client overrides.
+
+### Changed
+
+- **OpenAI client dependency** -- Require OpenAI Python client `2.26.0` or newer for managed inference support.
+- **Release metadata** -- Bump the Intaris package and MCP proxy client identity to `0.12.0`.
+
 ## [0.11.0] - 2026-09-27
 
 ### Added

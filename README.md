@@ -4,24 +4,30 @@
 
 # intaris
 
-Guardrails service for AI agents. Intaris sits between your AI agent and its tools, evaluating every tool call for safety and alignment before allowing execution. Works with [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://github.com/fpytloun/openclaw/tree/v2026.3.13), and any MCP-compatible client.
+Intaris helps detect when an AI agent may be drifting from the user's intention. It combines intention-aware evaluation of tool calls with behavioral analysis over a session and across sessions. Works with [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenClaw](https://github.com/fpytloun/openclaw/tree/v2026.3.13), and any MCP-compatible client.
 
-**Default-deny.** Every tool call is classified and evaluated. Read-only operations are fast-pathed; everything else goes through LLM safety evaluation. Unknown tools are never auto-approved.
+**Intention guardrails.** Intaris evaluates tool use against the user's stated intention, including explicit restrictions. A read-only fast path handles routine calls; other calls can go through model evaluation and, when needed, escalation. Evaluations are recorded in an audit trail.
+
+**Behavior analytics.** Session summaries and cross-session analysis can surface patterns that a single tool call may not show.
 
 **Real-time.** Sub-second evaluation with a priority-ordered decision matrix. Read-only calls resolve in under 1ms. LLM evaluations complete within the 5-second circuit breaker. WebSocket streaming for live monitoring.
 
 **Self-hosted.** Single Python process, SQLite or PostgreSQL storage, no external dependencies beyond an LLM API key. Your code and audit trail stay under your control.
 
+Intaris is not a sandbox, an antivirus, or proof that an agent cannot construct harmful actions. Pair it with a sandbox that isolates filesystem and network access and limits available tools when working with untrusted agents.
+
+See [Intaris purpose and threat model](docs/purpose-and-threat-model.md) for scope and deployment guidance.
+
 Part of the [Cognara](https://github.com/fpytloun) platform (Cognis controller, Intaris guardrails, [Mnemory](https://github.com/fpytloun/mnemory) memory).
 
 ## Features
 
-- **Default-deny classifier** -- Explicit read-only allowlist with critical pattern detection. Everything not allowlisted goes through LLM evaluation.
-- **LLM safety evaluation** -- OpenAI-compatible structured output for alignment checking, risk assessment, and decision reasoning.
-- **Priority-ordered decision matrix** -- Critical risk auto-denies, aligned low/medium approves, high risk and misalignment escalate for human review.
+- **Tool-call assessment** -- Jev or an OpenAI-compatible model assesses action facts. Assessment is not itself permission.
+- **Policy-controlled decisions** -- The hybrid pipeline combines controller evidence, policy obligations and bounded model assessments. The legacy pipeline remains available; identify the mode when comparing results.
+- **Source-aware review** -- Independent Judge review can consider original task instructions and scoped runtime evidence without treating generated summaries as user consent.
 - **Session management** -- Hierarchical parent/child sessions with intention tracking, lifecycle states, and idle sweep.
 - **Intention tracking** -- User-driven intention model with IntentionBarrier for real-time updates and AlignmentBarrier for parent/child enforcement.
-- **MCP proxy** -- Sits between clients and upstream MCP servers, evaluating every tool call with per-tool preference overrides.
+- **MCP proxy** -- Sits between clients and upstream MCP servers, applying Intaris evaluation with per-tool preference overrides.
 - **Audit trail** -- Every evaluation is logged with decision, reasoning, risk level, classification, latency, and redacted arguments.
 - **Secret redaction** -- API keys, passwords, tokens, and connection strings are automatically redacted before audit storage.
 - **Filesystem path protection** -- Working directory enforcement with approved path prefix learning from LLM approvals.
@@ -29,12 +35,15 @@ Part of the [Cognara](https://github.com/fpytloun) platform (Cognis controller, 
 - **Cognis-ready auth** -- Accepts Cognis-issued ES256 JWTs for service-to-service calls while keeping standalone API key auth for direct clients.
 - **Behavioral analysis** -- Three-layer system: per-call data collection, session summaries, and cross-session behavioral profiling.
 - **Management UI** -- Built-in web dashboard with session tree view, audit log, approval queue, MCP server management, and real-time charts.
-- **Judge auto-resolution** -- Escalated tool calls can be automatically reviewed by a more capable LLM (gpt-5.4), reducing human intervention while maintaining safety. Three modes: disabled, auto, advisory.
+- **Judge review** -- A separately configured model reviews eligible escalations within policy limits. Review can approve, refuse, ask, or be unavailable; it is not a guarantee against unnecessary escalations or unsafe decisions.
 - **Webhook callbacks** -- HMAC-signed escalation notifications for external approval systems.
 - **Notification channels** -- Per-user push notifications (Pushover, Slack, webhook) with one-click approve/deny action links.
 - **Rate limiting** -- Per-session sliding window rate limiter to prevent runaway agents.
 
 ## Quick Start
+
+The experimental hybrid runtime also supports [single-call rich intention
+generation](docs/single-call-intention.md), without a second extraction request.
 
 Intaris needs an OpenAI-compatible API key for safety evaluation. It picks up `LLM_API_KEY` from your environment automatically.
 
@@ -124,33 +133,28 @@ See the [Management UI docs](docs/management-ui.md) for all tabs and features.
 
 **Intercept.** The client integration (plugin, hooks, or MCP proxy) captures every tool call before execution and sends it to Intaris for evaluation.
 
-**Classify.** The classifier checks the tool against a priority chain: session policy denies, tool preference overrides, critical patterns, the read-only allowlist, and filesystem path policy. Read-only tools are auto-approved. Critical patterns are auto-denied.
+**Establish context.** The hybrid pipeline distinguishes authenticated user/controller evidence from agent descriptions, tool output and generated summaries. Coverage and provenance matter; loaded skills and shell-target details are context, not grants.
 
-**Evaluate.** Tool calls classified as WRITE go through LLM safety evaluation. The LLM assesses alignment with the session intention, risk level (low/medium/high/critical), and recommends a decision -- all within a 4-second timeout.
+**Assess and decide.** The configured evaluator supplies bounded action assessments. Deterministic policy owns permissions and outcome limits; the classifier does not become the final authority on task scope or user consent.
 
-**Decide.** The decision matrix applies priority-ordered rules: critical risk always denies, aligned low/medium risk approves, high risk and misalignment escalate for human review. The decision, reasoning, and full context are recorded in the audit trail.
+**Review when required.** Judge independently reviews eligible escalations using original task evidence. Unavailable review is distinct from a user refusal. Transient model and routing failures use bounded retries; retries do not authorize or execute the proposed tool.
 
-See the [Architecture](docs/architecture.md) and [Evaluation Pipeline](docs/evaluation-pipeline.md) docs for the full technical details.
+This describes the hybrid pipeline. Legacy behavior remains selectable; see [stage separation](docs/evaluation-stage-separation.md), [configuration](docs/configuration.md), and the [release verification record](docs/release-verification-2026-10.md).
 
 ## Benchmark Results
 
-Intaris catches 100% of critical threats (destructive commands, data exfiltration, RCE) with zero false positives. Across the last published 41-scenario benchmark run including adversarial attacks, social engineering, and cross-session patterns, Intaris achieves 94% F1 with 100% precision -- it never blocks legitimate developer work. The current scenario catalog also includes a new sensitive project-file access regression scenario that will be included in the next full benchmark run.
+Benchmark results apply to a specific revision, corpus, configuration and grading method—not every deployment. Earlier headline scores are not current release measurements. Historical experiments include both harmful approvals and unnecessary blocks; a targeted regression pass cannot replace a complete rerun.
 
-| Metric | Value |
-|---|---|
-| Precision | 100% |
-| F1 Score | 93.7% |
-| False Positive Rate | 0.0% |
-| Critical Misses | 0 |
-| Avg Latency | 1.1s |
+The [final balanced authorization replay](docs/balanced-authorization-acceptance-2026-10-15.md) collected 225 action observations and recorded 144 history checkpoints. The earlier four forged-push approvals are now blocked, while valid scoped push, same-action human approval, local tests and lint remain approved across three trials. All 27 benign source-counterfactual observations are approved. History qualification remains incomplete: 21 checkpoint rows lack established evidence. The report preserves the baseline, failed iterations, label caveats and cumulative cost rather than presenting a universal safety score.
 
 See the [Benchmarking docs](docs/benchmarking.md) for methodology, scenario details, and how to run your own benchmarks.
-The separate [Jev evaluator assessment](docs/jev-evaluator.md) compares an experimental backend with a Groq-backed `gpt-oss-20b` L1 evaluator; Jev is **not** the recommended production default.
+The [September Jev assessment](docs/jev-evaluator.md) and [October redesign measurements](docs/evaluation-redesign-2026-10.md) are historical comparisons, not measurements of the current release candidate.
 
 ## Documentation
 
 | Document | Description |
 |---|---|
+| [Purpose and Threat Model](docs/purpose-and-threat-model.md) | Intaris's purpose, scope, and recommended deployment layers |
 | [Quick Start](docs/quickstart.md) | Get running in 5 minutes |
 | [Architecture](docs/architecture.md) | System design, layers, and key decisions |
 | [Evaluation Pipeline](docs/evaluation-pipeline.md) | Classification, LLM evaluation, and decision matrix |

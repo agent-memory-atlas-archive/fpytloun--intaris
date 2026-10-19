@@ -35,7 +35,10 @@ def db(tmp_path):
 
 
 @pytest.fixture
-def session_store(db):
+def session_store(db, monkeypatch):
+    # Original free-form intention and call-10 bootstrap contract. Hybrid
+    # single-profile generation is covered by test_single_intention*.
+    monkeypatch.setenv("EVALUATION_POLICY_VERSION", "legacy")
     return SessionStore(db)
 
 
@@ -59,6 +62,37 @@ def mock_llm():
     llm = MagicMock()
     llm.generate.return_value = "Implementing a login feature with OAuth2"
     return llm
+
+
+def test_legacy_intention_keeps_immutable_assignment_after_summary_refresh(
+    db, session_store, mock_llm
+):
+    session_store.create(
+        user_id="owner",
+        session_id="original-budget",
+        intention="Do not modify production.",
+    )
+    session_store.update_session(
+        "original-budget",
+        user_id="owner",
+        intention="Generated summary: maintain deployment.",
+    )
+    _insert_tool_call(db, "owner", "original-budget")
+    generate_intention(
+        llm=mock_llm,
+        db=db,
+        session_store=session_store,
+        user_id="owner",
+        session_id="original-budget",
+    )
+    content = mock_llm.generate.call_args.args[0][1]["content"]
+    from intaris.sanitize import wrap_with_boundary
+
+    assert wrap_with_boundary("Do not modify production.", "context") in content
+    assert (
+        wrap_with_boundary("Generated summary: maintain deployment.", "context")
+        not in content
+    )
 
 
 def _make_barrier(db, llm, timeout_ms=500, poll_timeout_ms=500):
@@ -712,7 +746,7 @@ class TestGenerateIntention:
             db,
             "user-1",
             "sess-1",
-            "User message: Ok I allow to push ainews into origin:main. Try again",
+            "User message: Ok I allow to push the sample repository into origin:main. Try again",
             call_id="call-r2",
         )
 
@@ -722,17 +756,23 @@ class TestGenerateIntention:
             session_store=session_store,
             user_id="user-1",
             session_id="sess-1",
-            context="I can push ainews into origin/main for you if you want.",
+            context="I can push the sample repository into origin/main for you if you want.",
         )
 
         messages = mock_llm.generate.call_args[0][0]
         system_prompt = messages[0]["content"]
         user_prompt = messages[1]["content"]
-        assert "Ok I allow to push ainews into origin:main. Try again" in user_prompt
+        assert (
+            "Ok I allow to push the sample repository into origin:main. Try again"
+            in user_prompt
+        )
         assert user_prompt.index("Latest user message") < user_prompt.index(
             "Prior session state"
         )
-        assert "I can push ainews into origin/main for you if you want." in user_prompt
+        assert (
+            "I can push the sample repository into origin/main for you if you want."
+            in user_prompt
+        )
         assert "keep at most four active goals" in system_prompt
         assert "Preserve active subscopes" in system_prompt
         assert "fade out only" in system_prompt
@@ -927,7 +967,7 @@ class TestEvaluatorDecisionContext:
             session_id="sess-1",
             agent_id=None,
             tool="mcptodoist_find-projects",
-            args_redacted={"query": "cognis"},
+            args_redacted={"query": "sample"},
             classification="write",
             evaluation_path="llm",
             decision="escalate",
@@ -1031,7 +1071,7 @@ class TestEvaluatorDecisionContext:
             session_id="sess-1",
             agent_id=None,
             tool="mcptodoist_find-projects",
-            args_redacted={"query": "cognis"},
+            args_redacted={"query": "sample"},
             classification="write",
             evaluation_path="llm",
             decision="escalate",
@@ -1081,7 +1121,7 @@ class TestEvaluatorDecisionContext:
             session_id="sess-1",
             agent_id=None,
             tool="mcptodoist_find-projects",
-            args_redacted={"query": "cognis"},
+            args_redacted={"query": "sample"},
             classification="write",
             evaluation_path="llm",
             decision="escalate",
@@ -2006,7 +2046,7 @@ class TestIntentionSourceColumn:
             '"reasoning": "Safe", "decision": "approve"}'
         )
         working_directory = (
-            "/Users/fpytloun/src/lumilens/beskar/.worktrees/feat-bisync-edge-server-ha"
+            "/Users/testuser/src/examplecorp/service/.worktrees/feat-worker-ha"
         )
         session_store.create(
             user_id="user-1",
@@ -2016,8 +2056,8 @@ class TestIntentionSourceColumn:
             policy={
                 "allow_paths": [
                     "/tmp/*",
-                    "/Users/fpytloun/*",
-                    "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                    "/Users/testuser/*",
+                    "/Users/testuser/src/examplecorp/service/ansible/*",
                 ]
             },
         )
@@ -2041,15 +2081,15 @@ class TestIntentionSourceColumn:
         assert '"working_directory_allowed_by_policy": true' in user_prompt
         assert '"working_directory_denied_by_policy": false' in user_prompt
         assert f'"working_directory": "{working_directory}"' in user_prompt
-        assert '"/Users/fpytloun/*"' in user_prompt
-        assert '"/Users/fpytloun/src/lumilens/beskar/ansible/*"' not in user_prompt
+        assert '"/Users/testuser/*"' in user_prompt
+        assert '"/Users/testuser/src/examplecorp/service/ansible/*"' not in user_prompt
 
         session = session_store.get("sess-policy-cwd", user_id="user-1")
         assert session["policy"] == {
             "allow_paths": [
                 "/tmp/*",
-                "/Users/fpytloun/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                "/Users/testuser/*",
+                "/Users/testuser/src/examplecorp/service/ansible/*",
             ]
         }
 
@@ -2176,7 +2216,7 @@ class TestIntentionSourceColumn:
             '{"aligned": true, "risk": "low", '
             '"reasoning": "Safe", "decision": "approve"}'
         )
-        target = "/home/riker/src/cognis/.worktrees/fix/tests/test_agent.py"
+        target = "/home/tester/src/app/.worktrees/fix/tests/test_agent.py"
         patch = f"""*** Begin Patch
 *** Update File: {target}
 @@
@@ -2187,7 +2227,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-target",
             intention="Apply the requested source change",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/tester/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2222,14 +2262,14 @@ class TestIntentionSourceColumn:
             '{"aligned": false, "risk": "high", '
             '"reasoning": "Denied path", "decision": "deny"}'
         )
-        target = "/home/riker/.ssh/config"
+        target = "/home/tester/.ssh/config"
         session_store.create(
             user_id="user-1",
             session_id="sess-policy-denied-target",
             intention="Apply the requested source change",
             policy={
-                "allow_paths": ["/home/riker/*"],
-                "deny_paths": ["/home/riker/.ssh/*"],
+                "allow_paths": ["/home/tester/*"],
+                "deny_paths": ["/home/tester/.ssh/*"],
             },
         )
         evaluator = Evaluator(
@@ -2271,7 +2311,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-relative-target",
             intention="Apply the requested source change",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/tester/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2312,7 +2352,7 @@ class TestIntentionSourceColumn:
             user_id="user-1",
             session_id="sess-policy-mixed-targets",
             intention="Apply the requested source changes",
-            policy={"allow_paths": ["/home/riker/*"]},
+            policy={"allow_paths": ["/home/tester/*"]},
         )
         evaluator = Evaluator(
             llm=llm,
@@ -2329,7 +2369,7 @@ class TestIntentionSourceColumn:
             args={
                 "patchText": (
                     "*** Begin Patch\n"
-                    "*** Update File: /home/riker/src/app.py\n"
+                    "*** Update File: /home/tester/src/app.py\n"
                     "@@\n-old\n+new\n"
                     "*** Update File: ../other.py\n"
                     "@@\n-old\n+new\n"
@@ -2398,14 +2438,14 @@ class TestIntentionSourceColumn:
         session_store.update_session(
             "sess-1",
             user_id="user-1",
-            policy={"allow_paths": ["/tmp/*", "/home/user/src/cognis/*"]},
+            policy={"allow_paths": ["/tmp/*", "/home/user/src/sample/*"]},
         )
 
         session = session_store.get("sess-1", user_id="user-1")
         assert session["intention"] == "Initial"
         assert session["details"] == {"source": "cognis"}
         assert session["policy"] == {
-            "allow_paths": ["/tmp/*", "/home/user/src/cognis/*"]
+            "allow_paths": ["/tmp/*", "/home/user/src/sample/*"]
         }
 
 

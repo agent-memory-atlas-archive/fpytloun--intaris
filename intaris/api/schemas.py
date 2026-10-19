@@ -4,14 +4,26 @@ from __future__ import annotations
 
 from typing import Any, Literal  # noqa: TC003
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic_core import PydanticCustomError
+
+from intaris.workflow_scope import WorkflowStep
 
 # ── Evaluate ──────────────────────────────────────────────────────────
 
 
-class EvaluateRequest(BaseModel):
+class EvaluationExtensions(BaseModel):
+    evaluation_policy_version: Literal["legacy", "hybrid_v1"] | None = None
+    logical_call_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_policy_revision: int | None = Field(default=None, ge=1)
+    expected_policy_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    controller_context: dict[str, str] | None = None
+
+
+class EvaluateRequest(EvaluationExtensions):
     """Request to evaluate a tool call for safety."""
 
+    process_scope: dict[str, Any] | None = None
     session_id: str = Field(..., description="Session identifier")
     agent_id: str | None = Field(None, description="Agent identifier")
     tool: str = Field(..., description="Tool name (e.g., 'bash', 'edit')")
@@ -30,24 +42,25 @@ class EvaluateRequest(BaseModel):
         ),
     )
 
-    @model_validator(mode="after")
-    def _validate_payload_sizes(self) -> EvaluateRequest:
-        """Reject oversized args and context dicts to limit injection surface."""
+    @field_validator("args", "context")
+    @classmethod
+    def _validate_payload_sizes(
+        cls, value: dict | None, info: ValidationInfo
+    ) -> dict | None:
+        """Keep existing limits, reporting the failing field and exact size."""
         import json
 
-        if self.args:
-            raw_args = json.dumps(self.args, separators=(",", ":"), default=str)
-            if len(raw_args) > 65536:
-                raise ValueError(
-                    f"args dict exceeds 64 KB limit ({len(raw_args)} bytes)"
-                )
-        if self.context is not None:
-            raw_ctx = json.dumps(self.context, separators=(",", ":"), default=str)
-            if len(raw_ctx) > 8192:
-                raise ValueError(
-                    f"context dict exceeds 8 KB limit ({len(raw_ctx)} bytes)"
-                )
-        return self
+        if value is None:
+            return value
+        size = len(json.dumps(value, separators=(",", ":"), default=str))
+        limit = 65536 if info.field_name == "args" else 8192
+        if size > limit:
+            raise PydanticCustomError(
+                f"{info.field_name}_too_large",
+                "Serialized {field} exceeds limit ({size} > {limit} characters)",
+                {"field": info.field_name, "size": size, "limit": limit},
+            )
+        return value
 
 
 class EvaluateResponse(BaseModel):
@@ -100,12 +113,18 @@ class EvaluateResponse(BaseModel):
 
 
 class SessionPolicy(BaseModel):
+    read_only_required: bool | None = Field(default=None, strict=True)
+    minimum_outcome: Literal["deny", "escalate", "approve"] | None = None
     """Typed session policy with known keys only.
 
     Prevents arbitrary JSON keys from being serialized into LLM prompts,
     which could be used for prompt injection attacks.
     """
 
+    evaluation_policy_version: Literal["legacy", "hybrid_v1"] | None = None
+    profile: Literal["strict", "balanced", "bounded_autonomy"] | None = None
+    rules: list[dict[str, Any]] | None = None
+    intention_gate: Literal["disabled", "jev"] | None = None
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = Field(
         None, description="Maximum evaluated enforcement severity; request minimum wins"
     )
@@ -149,7 +168,25 @@ class IntentionRequest(BaseModel):
     """Request to declare a session intention."""
 
     session_id: str = Field(..., description="Session identifier")
-    intention: str = Field(..., max_length=500, description="Declared session purpose")
+    expected_policy_revision: int | None = Field(default=None, ge=0)
+    intention: str | None = Field(
+        None, max_length=500, description="Declared session purpose"
+    )
+    workflow_step: WorkflowStep | None = None
+
+    @model_validator(mode="after")
+    def validate_declaration(self):
+        if self.workflow_step is None:
+            if self.intention is None:
+                raise ValueError("intention is required for session creation")
+        elif self.workflow_step.session_id != self.session_id or (
+            self.model_fields_set - {"session_id", "workflow_step"}
+        ):
+            raise ValueError(
+                "workflow_step must be declaration-only for the same session"
+            )
+        return self
+
     title: str | None = Field(
         None,
         max_length=120,
@@ -158,7 +195,7 @@ class IntentionRequest(BaseModel):
     details: dict[str, Any] | None = Field(
         None, description="Session details (repo, branch, constraints)"
     )
-    policy: SessionPolicy | dict[str, Any] | None = Field(
+    policy: dict[str, Any] | SessionPolicy | None = Field(
         None, description="Session policy (custom rules)"
     )
     parent_session_id: str | None = Field(
@@ -175,6 +212,15 @@ class IntentionRequest(BaseModel):
         compatibility with the classifier and evaluator.
         """
         if isinstance(self.policy, dict):
+            from intaris.policy_activation import default_version
+
+            if (
+                self.policy.get("evaluation_policy_version", default_version())
+                == "hybrid_v1"
+            ):
+                unknown = set(self.policy) - set(SessionPolicy.model_fields)
+                if unknown:
+                    raise ValueError(f"Unknown hybrid policy fields: {sorted(unknown)}")
             validated = SessionPolicy(**self.policy)
             self.policy = validated.model_dump(exclude_none=True)
         elif isinstance(self.policy, SessionPolicy):
@@ -186,6 +232,14 @@ class IntentionResponse(BaseModel):
     """Response from intention declaration."""
 
     ok: bool = True
+    declaration_digest: str | None = Field(default=None, exclude_if=lambda v: v is None)
+    admission_revision: int | None = Field(default=None, exclude_if=lambda v: v is None)
+    policy_revision: int | None = Field(default=None, exclude_if=lambda v: v is None)
+    state_revision: int | None = Field(default=None, exclude_if=lambda v: v is None)
+    policy_hash: str | None = Field(default=None, exclude_if=lambda v: v is None)
+    active_policy: dict[str, Any] | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
 
 class SessionResponse(BaseModel):
@@ -196,8 +250,14 @@ class SessionResponse(BaseModel):
     agent_id: str | None = None
     title: str | None = None
     intention: str
+    intention_profile: dict[str, Any] | None = None
     details: dict[str, Any] | None = None
     policy: dict[str, Any] | None = None
+    policy_revision: int = 1
+    state_revision: int = 1
+    policy_hash: str | None = None
+    active_policy: dict[str, Any] | None = None
+    advisory_clauses: list[dict[str, Any]] | None = None
     total_calls: int = 0
     approved_count: int = 0
     denied_count: int = 0
@@ -210,6 +270,63 @@ class SessionResponse(BaseModel):
     last_alignment: str | None = None
     created_at: str
     updated_at: str
+
+    @field_validator("intention_profile", mode="before")
+    @classmethod
+    def _present_intention_profile(cls, value):
+        """Expose the read-only view without changing persisted evidence bytes."""
+        import json
+
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                return None
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            return None
+        sources = value.get("sources") or []
+        validation = value.get("validation") or {}
+        current = value.get("current", [])
+        if (
+            not isinstance(sources, list)
+            or not isinstance(validation, dict)
+            or not isinstance(current, list)
+            or not all(
+                isinstance(item, dict)
+                and all(
+                    isinstance(item.get(k), str) for k in ("kind", "quote", "status")
+                )
+                and isinstance(item.get("source_ref", ""), str)
+                for item in value["items"]
+            )
+        ):
+            return None
+        numbers = {
+            source["ref"]: index
+            for index, source in enumerate(sources, 1)
+            if isinstance(source, dict) and isinstance(source.get("ref"), str)
+        }
+        return {
+            "version": value.get("version"),
+            "available": value.get("available", False),
+            "items": [
+                {
+                    **{
+                        k: item[k]
+                        for k in ("kind", "quote", "status", "approves")
+                        if k in item
+                    },
+                    "msg": numbers.get(item.get("source_ref"), item.get("msg")),
+                }
+                for item in value["items"]
+                if isinstance(item, dict)
+            ],
+            "current": current,
+            "validation": {
+                k: validation.get(k, [] if k == "drop_reasons" else 0)
+                for k in ("dropped", "dropped_current", "drop_reasons")
+            },
+        }
 
 
 # ── Decision ──────────────────────────────────────────────────────────
@@ -277,6 +394,7 @@ class AuditRecord(BaseModel):
     judge_reasoning: str | None = None
     judge_decision: str | None = None
     judge_risk: str | None = None
+    evaluation_metadata: dict[str, Any] | None = None
 
 
 class AuditListResponse(BaseModel):
@@ -323,16 +441,18 @@ class SessionUpdateRequest(BaseModel):
     """Request to update session fields (intention, details, policy)."""
 
     intention: str | None = Field(None, max_length=500, description="Updated intention")
+    expected_policy_revision: int | None = Field(default=None, ge=1)
     details: dict[str, Any] | None = Field(None, description="Updated session details")
-    policy: SessionPolicy | dict[str, Any] | None = Field(
+    policy: dict[str, Any] | SessionPolicy | None = Field(
         None, description="Updated session policy"
     )
 
     @model_validator(mode="after")
     def _normalize_policy(self) -> SessionUpdateRequest:
         if isinstance(self.policy, dict):
-            validated = SessionPolicy(**self.policy)
-            self.policy = validated.model_dump(exclude_none=True)
+            # Keep raw keys until the store knows the persisted session version.
+            # Legacy normalization still happens at the API boundary below.
+            SessionPolicy(**self.policy)
         elif isinstance(self.policy, SessionPolicy):
             self.policy = self.policy.model_dump(exclude_none=True)
         return self

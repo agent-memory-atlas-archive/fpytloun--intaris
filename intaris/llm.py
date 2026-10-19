@@ -12,13 +12,29 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
+from contextvars import ContextVar
+from email.utils import parsedate_to_datetime
 from typing import Any
 
-from openai import BadRequestError, OpenAI
+import httpx
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    BadRequestError,
+    OpenAI,
+    UnprocessableEntityError,
+)
 
+from intaris import model_retry
 from intaris.config import LLMConfig
 
 logger = logging.getLogger(__name__)
+
+# Output cap for small structured (JSON) calls. Reasoning models (gpt-oss)
+# count reasoning tokens against max_tokens, so a cap sized for the JSON
+# alone truncates the answer and fails upstream validation.
+STRUCTURED_OUTPUT_MAX_TOKENS = 4096
 
 _RETRY_AFTER_SECONDS_RE = re.compile(
     r"(?:try again in|retry after)\s+([0-9]+(?:\.[0-9]+)?)s",
@@ -48,19 +64,28 @@ class LLMClient:
     Reuses a single HTTP connection pool across calls. Supports structured
     outputs (json_schema) with automatic fallback to plain JSON mode for
     providers that don't support it.
+
+    Every call retries transient provider failures in
+    ``_call_with_transient_retries`` (the SDK's own retries are disabled so
+    there is one policy, bounded by ``model_retry.evaluation_deadline``).
     """
 
     def __init__(
         self,
         config: LLMConfig,
         *,
-        transient_retries: int = 0,
-        max_retry_after_seconds: float = 15.0,
+        transient_retries: int = model_retry.MAX_RETRIES,
+        on_protocol_mismatch: Callable[[str], Exception] | None = None,
     ):
+        # Only the managed evaluation client sets this: Cognis rejects a chat
+        # request to a System One route before dispatch, which must not be
+        # retried or "fixed" by parameter fallbacks.
+        self._on_protocol_mismatch = on_protocol_mismatch
         self._client = OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
             timeout=config.timeout_ms / 1000.0,
+            max_retries=0,
         )
         self._model = config.model
         self._temperature = config.temperature
@@ -71,8 +96,54 @@ class LLMClient:
         # Maps param name -> fix action. Populated on first BadRequestError.
         self._param_fixes: dict[str, str] = {}
         self._closed = False
-        self._transient_retries = max(0, transient_retries)
-        self._max_retry_after_seconds = max(0.0, max_retry_after_seconds)
+        self._transient_retries = min(
+            model_retry.MAX_RETRIES, max(0, transient_retries)
+        )
+        self._generation_metrics: ContextVar[dict | None] = ContextVar(
+            "generation_metrics", default=None
+        )
+        self._output_format: ContextVar[dict | None] = ContextVar(
+            "output_format", default=None
+        )
+        from intaris.input_budget import CapacityCache
+
+        self._input_capacity = CapacityCache()
+        self._input_view: ContextVar[dict | None] = ContextVar(
+            "input_view", default=None
+        )
+
+    @property
+    def output_format(self) -> dict | None:
+        """Actual last transport format, isolated per execution context."""
+        return self._output_format.get()
+
+    @property
+    def profile_response_mode(self) -> str:
+        """Observed managed analysis route prefers JSON object + local validation."""
+        return (
+            "json_object" if self._model == "routes/intaris_analysis" else "json_schema"
+        )
+
+    @property
+    def judge_response_mode(self) -> str:
+        """The managed Judge route has observed strict-schema rejections."""
+        return "json_object" if self._model == "routes/intaris_judge" else "json_schema"
+
+    @property
+    def generation_metrics(self) -> dict | None:
+        """Last single-attempt metrics, isolated per execution context."""
+        return self._generation_metrics.get()
+
+    @property
+    def routing_identity(self) -> dict[str, Any]:
+        """Non-secret effective request settings for caller-owned caches."""
+        return {
+            "model": self._model,
+            "base_url": str(self._client.base_url),
+            "reasoning_effort": self._reasoning_effort,
+            "temperature": self._temperature,
+            "timeout_ms": self._timeout_ms,
+        }
 
     def close(self) -> None:
         """Close the underlying HTTP client.
@@ -94,6 +165,8 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int = 16384,
         reasoning_effort: str | None = None,
+        single_attempt: bool = False,
+        response_mode: str | None = None,
     ) -> str:
         """Generate a chat completion, returning the content string.
 
@@ -108,7 +181,37 @@ class LLMClient:
         Returns:
             The raw content string from the LLM response.
         """
+        with model_retry.model_call_deadline(self._timeout_ms / 1000.0):
+            return self._generate(
+                messages,
+                json_schema=json_schema,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                single_attempt=single_attempt,
+                response_mode=response_mode,
+            )
+
+    def _generate(
+        self,
+        messages,
+        *,
+        json_schema=None,
+        temperature=None,
+        max_tokens=16384,
+        reasoning_effort=None,
+        single_attempt=False,
+        response_mode=None,
+    ):
         temp = temperature if temperature is not None else self._temperature
+        self._output_format.set(None)
+
+        if single_attempt:
+            return self._single_call(
+                messages, json_schema, temp, max_tokens, reasoning_effort, response_mode
+            )
+        if response_mode is not None:
+            raise ValueError("response_mode requires single_attempt")
 
         if json_schema and self._supports_structured is not False:
             try:
@@ -126,13 +229,13 @@ class LLMClient:
                 return result
             except LLMTemporaryError:
                 raise
-            except BadRequestError as exc:
+            except (BadRequestError, UnprocessableEntityError) as exc:
                 recovered = _recover_failed_generation(exc, json_schema)
                 if recovered is not None:
                     self._supports_structured = True
                     return recovered
 
-                if _is_schema_validation_error(exc):
+                if is_output_validation_error(exc):
                     logger.warning(
                         "Structured output failed schema validation for model %s; "
                         "retrying in JSON mode.",
@@ -160,6 +263,74 @@ class LLMClient:
             reasoning_effort=reasoning_effort,
         )
 
+    def embed(self, texts: list[str]) -> Any:
+        """Generate embeddings with the same transport retry policy."""
+        with model_retry.model_call_deadline(self._timeout_ms / 1000.0):
+            return self._call_with_transient_retries(
+                {"model": self._model, "input": texts},
+                max_attempts=self._transient_retries + 1,
+                operation="embedding",
+            )
+
+    def _single_call(
+        self, messages, schema, temperature, max_tokens, effort, mode=None
+    ):
+        """One logical attempt (transient failures still retry); unsupported
+        formats fall back on the next update."""
+        response_format = (
+            {"type": "json_schema", "json_schema": schema}
+            if schema and self._supports_structured is not False
+            else None
+        )
+        if mode is not None:
+            if mode not in {"json_schema", "json_object"} or not schema:
+                raise ValueError("Explicit response mode requires a schema")
+            response_format = (
+                {"type": "json_schema", "json_schema": schema}
+                if mode == "json_schema"
+                else {"type": "json_object"}
+            )
+        params = self._build_params(
+            messages, response_format, temperature, max_tokens, effort
+        )
+        metrics = {
+            "model": self._model,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "latency_ms": None,
+            "calls": 1,
+        }
+        self._generation_metrics.set(metrics)
+        start = time.monotonic()
+        try:
+            response = self._call_with_transient_retries(
+                params,
+                max_attempts=self._transient_retries + 1,
+                metrics=metrics,
+            )
+            if response.usage is not None:
+                metrics.update(
+                    prompt_tokens=response.usage.prompt_tokens,
+                    completion_tokens=response.usage.completion_tokens,
+                )
+            if schema and (response_format or {}).get("type") == "json_schema":
+                self._supports_structured = True
+            return _clean_response(response.choices[0].message.content or "")
+        except BadRequestError as exc:
+            self._raise_protocol_mismatch(exc)
+            # Cache only a format incompatibility, not arbitrary invalid parameters.
+            body = getattr(exc, "body", {}) or {}
+            error = body.get("error", body)
+            if (
+                isinstance(error, dict)
+                and error.get("param") == "response_format"
+                and not is_output_validation_error(exc)
+            ):
+                self._supports_structured = False
+            raise
+        finally:
+            metrics["latency_ms"] = round((time.monotonic() - start) * 1000)
+
     def _call(
         self,
         messages: list[dict[str, str]],
@@ -184,9 +355,7 @@ class LLMClient:
             reasoning_effort=reasoning_effort,
         )
 
-        # Retry loop for parameter incompatibilities and transient provider
-        # issues. Background analysis clients opt into the latter; request-path
-        # clients keep zero transient retries to preserve latency budgets.
+        # Parameter repairs and transient retries share the generation budget.
         max_retries = 3
         response = None
         transient_attempts = self._transient_retries + 1
@@ -277,36 +446,163 @@ class LLMClient:
         params: dict[str, Any],
         *,
         max_attempts: int,
+        metrics: dict | None = None,
+        operation: str = "chat",
     ) -> Any:
-        """Execute a chat completion with optional transient retry handling."""
-        for attempt in range(1, max_attempts + 1):
+        """Execute a chat completion, retrying transient provider failures.
+
+        The single retry owner for this transport: connection errors,
+        timeouts, 429 and 500/502/503/504 retry with full-jitter backoff
+        (retry-after honored up to the cap); 4xx validation errors never do.
+        A retry starts only when it can finish within the evaluation deadline.
+        """
+        if operation == "chat":
+            self._input_view.set(None)
+            capacity = self.input_capacity()
+            output_key = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in params
+                else "max_tokens"
+            )
+            if capacity.max_output_tokens and type(params.get(output_key)) is int:
+                params[output_key] = min(params[output_key], capacity.max_output_tokens)
+            from intaris.input_budget import ContextInsufficientError, fit
+
             try:
-                return self._client.chat.completions.create(**params)
-            except BadRequestError:
+                fitted, view = fit(params, capacity)
+            except ContextInsufficientError as exc:
+                self._input_view.set(exc.diagnostics)
+                if exc.diagnostics["input_ceiling_tokens"] is not None:
+                    raise
+                # An unknown-capacity byte fallback is not a known model limit.
+                # Retry metadata, never inference; refit the unmodified request.
+                capacity = self.input_capacity(refresh=True)
+                if capacity.max_output_tokens and type(params.get(output_key)) is int:
+                    params[output_key] = min(
+                        params[output_key], capacity.max_output_tokens
+                    )
+                try:
+                    fitted, view = fit(params, capacity)
+                except ContextInsufficientError as recovered:
+                    self._input_view.set(recovered.diagnostics)
+                    raise
+                view["capacity_recovered"] = True
+                logger.info(
+                    "Model input capacity recovered before inference "
+                    "(bytes=%s, input_ceiling_tokens=%s)",
+                    view["bytes"],
+                    view["input_ceiling_tokens"],
+                )
+            params = fitted
+            self._input_view.set(view)
+        for attempt in range(1, max_attempts + 1):
+            timeout = model_retry.retry_timeout(
+                0, self._timeout_ms / 1000.0, first_attempt=attempt == 1
+            )
+            if timeout is None:
+                raise LLMTemporaryError("Model call deadline exhausted.")
+            if metrics is not None:
+                metrics["calls"] = attempt
+            try:
+                # The SDK's own retries stay off even on an injected client.
+                client = self._client.with_options(
+                    max_retries=0,
+                    **({"timeout": timeout} if timeout is not None else {}),
+                )
+                call = (
+                    client.embeddings.create
+                    if operation == "embedding"
+                    else client.chat.completions.create
+                )
+                response = call(**params)
+                self._record_output_format(params)
+                return response
+            except BadRequestError as exc:
+                from intaris.input_budget import capacity_rejection
+
+                if capacity_rejection(getattr(exc, "body", None)):
+                    self._input_capacity.invalidate()
+                self._raise_protocol_mismatch(exc)
                 raise
             except Exception as exc:
                 normalized = normalize_llm_error(exc)
+                from intaris.input_budget import capacity_rejection
+
+                if capacity_rejection(getattr(exc, "body", None)):
+                    self._input_capacity.invalidate()
                 if normalized is None:
                     raise
                 if attempt >= max_attempts:
                     raise normalized from exc
-
-                delay = normalized.retry_after_seconds or 1.0
-                delay = min(delay, self._max_retry_after_seconds)
-                if delay <= 0:
+                delay = model_retry.backoff_delay(
+                    attempt, normalized.retry_after_seconds
+                )
+                timeout = model_retry.retry_timeout(delay, self._timeout_ms / 1000.0)
+                if timeout is None:
+                    logger.warning(
+                        "Transient LLM failure for model %s (%s); no retry, "
+                        "the evaluation deadline leaves no room (attempt %d/%d)",
+                        self._model,
+                        type(exc).__name__,
+                        attempt,
+                        max_attempts,
+                    )
                     raise normalized from exc
-
                 logger.warning(
-                    "Transient LLM failure for model %s, retrying in %.2fs (%d/%d): %s",
+                    "Transient LLM failure for model %s (%s), retrying in %.2fs "
+                    "(attempt %d/%d)",
                     self._model,
+                    type(exc).__name__,
                     delay,
                     attempt,
                     max_attempts,
-                    normalized.user_message,
                 )
                 time.sleep(delay)
 
         raise RuntimeError("unreachable")
+
+    def input_capacity(self, *, refresh=False):
+        """Discover capacity; a fallback rejection permits one bounded refresh."""
+
+        def probe(timeout):
+            response = self._client.with_options(
+                max_retries=0, timeout=timeout
+            ).models.retrieve(self._model, extra_query={"operation": "chat"})
+            return response.model_dump()
+
+        return self._input_capacity.resolve(
+            (
+                str(getattr(self._client, "base_url", None)),
+                self._model,
+                getattr(self._client, "api_key", None),
+                "chat",
+            ),
+            probe,
+            refresh=refresh,
+            timeout_seconds=2.0 if refresh else 0.2,
+        )
+
+    @property
+    def input_view(self):
+        return self._input_view.get()
+
+    def _raise_protocol_mismatch(self, exc: BadRequestError) -> None:
+        if self._on_protocol_mismatch is None:
+            return
+        from intaris.evaluator_backend import is_protocol_mismatch
+
+        if is_protocol_mismatch(exc.status_code, getattr(exc, "body", None)):
+            raise self._on_protocol_mismatch("chat") from exc
+
+    def _record_output_format(self, params: dict) -> None:
+        response_format = params.get("response_format") or {}
+        self._output_format.set(
+            {
+                "type": response_format.get("type", "text"),
+                "strict": response_format.get("type") == "json_schema"
+                and response_format.get("json_schema", {}).get("strict") is True,
+            }
+        )
 
     def _build_params(
         self,
@@ -417,15 +713,16 @@ def normalize_llm_error(exc: Exception) -> LLMTemporaryError | None:
     headers = getattr(response, "headers", None)
     type_name = type(exc).__name__
     message = str(exc)
-    lower_msg = message.lower()
 
     retry_after = _parse_retry_after_seconds(headers, body, message)
-
-    if (
-        status_code == 429
-        or "ratelimit" in type_name.lower()
-        or ("rate limit" in lower_msg and "429" in lower_msg)
+    if isinstance(status_code, int) and not model_retry.is_transient_status(
+        status_code, body
     ):
+        # 4xx validation/auth errors (and 501 etc.) are never transient,
+        # whatever their message says.
+        return None
+
+    if status_code == 429 or "ratelimit" in type_name.lower():
         user_message = (
             "LLM provider is temporarily rate limited. Please try again shortly."
         )
@@ -435,19 +732,23 @@ def normalize_llm_error(exc: Exception) -> LLMTemporaryError | None:
             original_exception=exc,
         )
 
-    if (
-        "timeout" in type_name.lower()
-        or "timed out" in lower_msg
-        or "connection" in type_name.lower()
-        or "connection" in lower_msg
-    ):
+    if isinstance(
+        exc,
+        (
+            APIConnectionError,
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            ConnectionError,
+            TimeoutError,
+        ),
+    ) or type_name in {"APIConnectionError", "APITimeoutError"}:
         return LLMTemporaryError(
             "LLM provider is temporarily unavailable. Please try again.",
             retry_after_seconds=retry_after,
             original_exception=exc,
         )
 
-    if isinstance(status_code, int) and status_code >= 500:
+    if model_retry.is_transient_status(status_code, body):
         return LLMTemporaryError(
             "LLM provider returned a temporary server error. Please try again.",
             retry_after_seconds=retry_after,
@@ -511,6 +812,12 @@ def _parse_retry_after_value(value: str) -> float | None:
     except ValueError:
         pass
 
+    try:
+        retry_at = parsedate_to_datetime(text)
+        return max(0.0, retry_at.timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError):
+        pass
+
     match = _RETRY_AFTER_SECONDS_RE.search(text)
     if match:
         try:
@@ -521,8 +828,11 @@ def _parse_retry_after_value(value: str) -> float | None:
     return None
 
 
-def _is_schema_validation_error(error: BadRequestError) -> bool:
-    """Return True when the provider rejected malformed structured output."""
+def is_output_validation_error(error: Exception) -> bool:
+    """Return True when the provider rejected malformed JSON/structured output.
+
+    Managed routes report this as 422 ``upstream_json_validate_failed``.
+    """
     error_body = getattr(error, "body", None)
     if not isinstance(error_body, dict):
         return False
@@ -534,7 +844,7 @@ def _is_schema_validation_error(error: BadRequestError) -> bool:
     code = str(provider_error.get("code", ""))
     message = str(provider_error.get("message", ""))
     return (
-        code == "json_validate_failed"
+        code.endswith("json_validate_failed")
         or "Generated JSON does not match the expected schema" in message
     )
 
@@ -612,11 +922,11 @@ def _matches_schema(value: Any, schema: dict[str, Any]) -> bool:
 
 
 def _recover_failed_generation(
-    error: BadRequestError,
+    error: APIStatusError,
     schema: dict[str, Any],
 ) -> str | None:
     """Recover provider-reported failed_generation JSON when repairable."""
-    if not _is_schema_validation_error(error):
+    if not is_output_validation_error(error):
         return None
 
     error_body = getattr(error, "body", None)

@@ -26,6 +26,7 @@ from intaris.api.schemas import (
     EventReadResponse,
     SessionEvent,
 )
+from intaris.events.errors import ERROR_HEADER
 from intaris.events.idempotency import EventAppendIdempotencyStore
 from intaris.events.store import VALID_EVENT_TYPES
 
@@ -47,6 +48,7 @@ def _get_event_store(request: Request):
         raise HTTPException(
             status_code=404,
             detail="Event store is not enabled. Set EVENT_STORE_ENABLED=true.",
+            headers={ERROR_HEADER: "recording_disabled"},
         )
     return event_store
 
@@ -64,6 +66,7 @@ def _validate_session_exists(request: Request, user_id: str, session_id: str) ->
         raise HTTPException(
             status_code=404,
             detail=f"Session {session_id} not found.",
+            headers={ERROR_HEADER: "session_not_found"},
         )
 
 
@@ -293,11 +296,13 @@ def _validate_idempotency_key(session_id: str, idempotency_key: str) -> None:
                 "Invalid idempotency_key. Use up to 256 characters from "
                 "[a-zA-Z0-9._:@-]."
             ),
+            headers={ERROR_HEADER: "invalid_idempotency_key"},
         )
     if not idempotency_key.startswith(f"{session_id}:"):
         raise HTTPException(
             status_code=400,
             detail="idempotency_key must start with the current session_id",
+            headers={ERROR_HEADER: "invalid_idempotency_key"},
         )
 
 
@@ -340,7 +345,11 @@ async def append_events(
         events = [events]
 
     if not events:
-        raise HTTPException(status_code=400, detail="No events provided.")
+        raise HTTPException(
+            status_code=400,
+            detail="No events provided.",
+            headers={ERROR_HEADER: "empty_batch"},
+        )
 
     # Limit batch size to prevent memory exhaustion
     _MAX_BATCH_SIZE = 1000
@@ -348,6 +357,7 @@ async def append_events(
         raise HTTPException(
             status_code=400,
             detail=f"Too many events ({len(events)}). Max {_MAX_BATCH_SIZE} per request.",
+            headers={ERROR_HEADER: "batch_too_large"},
         )
 
     # Validate event types
@@ -359,6 +369,7 @@ async def append_events(
                     f"Invalid event type: {event.type!r}. "
                     f"Valid types: {', '.join(sorted(VALID_EVENT_TYPES))}"
                 ),
+                headers={ERROR_HEADER: "invalid_event_type"},
             )
 
     # Validate session exists
@@ -383,11 +394,11 @@ async def append_events(
                 existing,
                 stale_after=_IDEMPOTENCY_STALE_AFTER,
             ):
-                idempotency_store.delete(ctx.user_id, session_id, idempotency_key)
-                claimed_idempotency, existing = idempotency_store.claim(
-                    ctx.user_id,
-                    session_id,
-                    idempotency_key,
+                # Age cannot prove whether the append happened before a crash.
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency key append outcome is uncertain",
+                    headers={ERROR_HEADER: "append_uncertain"},
                 )
             if not claimed_idempotency:
                 if existing and existing.get("status") == "completed":
@@ -403,6 +414,7 @@ async def append_events(
                 raise HTTPException(
                     status_code=409,
                     detail="idempotency key is already in progress",
+                    headers={ERROR_HEADER: "append_in_progress"},
                 )
 
     # Convert to dicts for the event store
@@ -417,10 +429,14 @@ async def append_events(
             source=source,
         )
     except Exception as e:
-        if idempotency_store is not None and claimed_idempotency:
-            idempotency_store.delete(ctx.user_id, session_id, idempotency_key or "")
+        # An exception can follow a partial append. Retain the claim rather than
+        # permitting an unsafe replay; cancellation also leaves it pending.
         logger.exception("Failed to append events for %s/%s", ctx.user_id, session_id)
-        raise HTTPException(status_code=500, detail=f"Failed to append events: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to append events: {e}",
+            headers={ERROR_HEADER: "append_uncertain"},
+        )
 
     response = EventAppendResponse(
         count=len(seqs),

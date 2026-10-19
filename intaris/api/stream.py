@@ -230,7 +230,9 @@ async def stream_websocket(websocket: WebSocket) -> None:
     else:
         msg_user_id = None
 
-    user_id = _authenticate_token(websocket, token, fallback_user_id=msg_user_id)
+    user_id = await asyncio.to_thread(
+        _authenticate_token, websocket, token, fallback_user_id=msg_user_id
+    )
     if user_id is None:
         await websocket.close(code=4001, reason="Authentication failed")
         return

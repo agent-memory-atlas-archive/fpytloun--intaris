@@ -283,3 +283,134 @@ class TestJWTAuth:
             result = _authenticate_token(MagicMock(), token)
 
         assert result == "ws-user@example.com"
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _jwks_dict(public_key: object, kid: str = "test-key") -> dict:
+    jwk = json.loads(ECAlgorithm.to_jwk(public_key))
+    jwk["use"] = "sig"
+    jwk["kid"] = kid
+    return {"keys": [jwk]}
+
+
+class TestJWKSKeyCache:
+    def _cache(self, clock: _FakeClock):
+        from intaris.auth import JWKSKeyCache
+
+        return JWKSKeyCache("http://jwks.invalid/jwks.json", clock=clock)
+
+    def test_failed_fetch_backs_off_instead_of_refetching(self, tmp_path):
+        import pytest
+        from jwt import InvalidTokenError
+
+        clock = _FakeClock()
+        cache = self._cache(clock)
+        fetch = MagicMock(side_effect=TimeoutError("down"))
+        cache._client.fetch_data = fetch
+
+        for _ in range(20):
+            with pytest.raises(InvalidTokenError):
+                cache.get_key("test-key")
+        assert fetch.call_count == 1
+
+        clock.now += 31
+        with pytest.raises(InvalidTokenError):
+            cache.get_key("test-key")
+        assert fetch.call_count == 2
+
+    def test_serves_last_known_keys_while_endpoint_fails(self, tmp_path):
+        private_key, _ = _make_keypair(tmp_path)
+        clock = _FakeClock()
+        cache = self._cache(clock)
+        fetch = MagicMock(return_value=_jwks_dict(private_key.public_key()))
+        cache._client.fetch_data = fetch
+
+        key = cache.get_key("test-key")
+        assert fetch.call_count == 1
+
+        fetch.side_effect = TimeoutError("down")
+        clock.now += 301  # cache TTL expired
+        assert cache.get_key("test-key") is key
+        assert cache.get_key("test-key") is key
+        assert fetch.call_count == 2
+
+    def test_stale_keys_rejected_after_max_age(self, tmp_path):
+        import pytest
+        from jwt import InvalidTokenError
+
+        private_key, _ = _make_keypair(tmp_path)
+        clock = _FakeClock()
+        cache = self._cache(clock)
+        cache._client.fetch_data = MagicMock(
+            return_value=_jwks_dict(private_key.public_key())
+        )
+        cache.get_key("test-key")
+
+        cache._client.fetch_data.side_effect = TimeoutError("down")
+        clock.now += 3601
+        with pytest.raises(InvalidTokenError):
+            cache.get_key("test-key")
+
+    def test_unknown_kid_refresh_is_rate_limited(self, tmp_path):
+        import pytest
+        from jwt import InvalidTokenError
+
+        private_key, _ = _make_keypair(tmp_path)
+        clock = _FakeClock()
+        cache = self._cache(clock)
+        fetch = MagicMock(return_value=_jwks_dict(private_key.public_key()))
+        cache._client.fetch_data = fetch
+        cache.get_key("test-key")
+
+        for _ in range(10):
+            with pytest.raises(InvalidTokenError):
+                cache.get_key("other-kid")
+        assert fetch.call_count == 1
+
+        clock.now += 11
+        with pytest.raises(InvalidTokenError):
+            cache.get_key("other-kid")
+        assert fetch.call_count == 2
+
+    def test_rotated_key_accepted_after_refresh(self, tmp_path):
+        old_key, _ = _make_keypair(tmp_path)
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        clock = _FakeClock()
+        from intaris.auth import CognisJWTValidator
+
+        validator = CognisJWTValidator(jwks_url="http://jwks.invalid/jwks.json")
+        cache = validator._jwks_cache
+        cache._clock = clock
+        fetch = MagicMock(return_value=_jwks_dict(old_key.public_key()))
+        cache._client.fetch_data = fetch
+        cache.get_key("test-key")
+
+        fetch.return_value = _jwks_dict(new_key.public_key())
+        clock.now += 11
+        token = _make_jwt(new_key, sub="bob@example.com", aud=["intaris"])
+        assert validator.validate(token).user_id == "bob@example.com"
+        assert fetch.call_count == 2
+
+
+def test_concurrent_validator_creation_shares_one_instance():
+    from concurrent.futures import ThreadPoolExecutor
+
+    import intaris.auth as auth
+
+    auth._validator = None
+    auth._validator_config = None
+    url = "http://jwks.invalid/concurrent.json"
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        validators = list(
+            pool.map(lambda _: auth.get_jwt_validator("", url), range(64))
+        )
+    assert len({id(v) for v in validators}) == 1
+    auth._validator = None
+    auth._validator_config = None

@@ -44,13 +44,18 @@ class IntarisClient:
         api_key: str,
         user_id: str,
         agent_id: str,
+        *,
+        timeout_s: float = 30.0,
+        request_retries: int = 2,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.attempts: list[dict[str, Any]] = []
+        self.request_retries = request_retries
         self.user_id = user_id
         self.agent_id = agent_id
         self._client = httpx.Client(
             base_url=self.base_url,
-            timeout=30.0,
+            timeout=timeout_s,
             headers={
                 "X-API-Key": api_key,
                 "X-User-Id": user_id,
@@ -71,7 +76,7 @@ class IntarisClient:
         *,
         json: dict[str, Any] | list[dict[str, Any]] | None = None,
         params: dict[str, Any] | None = None,
-        retries: int = 2,
+        retries: int | None = None,
     ) -> dict[str, Any]:
         """Send an HTTP request and return the parsed JSON body.
 
@@ -81,6 +86,8 @@ class IntarisClient:
         """
         import time as _time
 
+        retries = self.request_retries if retries is None else retries
+
         # Strip None values from query params
         if params:
             params = {k: v for k, v in params.items() if v is not None}
@@ -89,9 +96,18 @@ class IntarisClient:
         last_exc: IntarisError | None = None
 
         for attempt in range(1 + retries):
+            attempt_record: dict[str, Any] = {
+                "method": method,
+                "path": path,
+                "attempt": attempt + 1,
+            }
+            self.attempts.append(attempt_record)
+            started = _time.monotonic()
             try:
                 resp = self._client.request(method, url, json=json, params=params)
             except httpx.TransportError as exc:
+                attempt_record["latency_ms"] = (_time.monotonic() - started) * 1000
+                attempt_record["error"] = type(exc).__name__
                 if attempt < retries:
                     delay = 2**attempt
                     logger.warning(
@@ -107,6 +123,8 @@ class IntarisClient:
                     continue
                 raise IntarisError(0, str(exc), f"{self.base_url}{path}") from exc
 
+            attempt_record["status"] = resp.status_code
+            attempt_record["latency_ms"] = (_time.monotonic() - started) * 1000
             # Retry on 429 (rate limit) and 500+ (server error)
             if resp.status_code in (429,) or resp.status_code >= 500:
                 try:
@@ -203,6 +221,7 @@ class IntarisClient:
         *,
         intention: str | None = None,
         details: dict[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Update session intention and/or details.
 
@@ -213,6 +232,8 @@ class IntarisClient:
             payload["intention"] = intention
         if details is not None:
             payload["details"] = details
+        if policy is not None:
+            payload["policy"] = policy
 
         return self._request("PATCH", f"/api/v1/session/{session_id}", json=payload)
 
@@ -239,6 +260,7 @@ class IntarisClient:
         *,
         context: dict[str, Any] | None = None,
         intention_pending: bool = False,
+        minimum_outcome: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a tool call for safety.
 
@@ -253,6 +275,8 @@ class IntarisClient:
             payload["context"] = context
         if intention_pending:
             payload["intention_pending"] = True
+        if minimum_outcome is not None:
+            payload["minimum_outcome"] = minimum_outcome
 
         return self._request("POST", "/api/v1/evaluate", json=payload)
 
@@ -266,6 +290,7 @@ class IntarisClient:
         content: str,
         *,
         context: str | None = None,
+        from_events: bool = False,
     ) -> dict[str, Any]:
         """Submit agent reasoning or user message text.
 
@@ -277,8 +302,15 @@ class IntarisClient:
         }
         if context is not None:
             payload["context"] = context
+        if from_events:
+            payload["content"] = ""
+            payload["from_events"] = True
 
         return self._request("POST", "/api/v1/reasoning", json=payload)
+
+    def submit_user_message(self, session_id: str, content: str) -> dict[str, Any]:
+        """Record benchmark-owned user evidence using the existing hook format."""
+        return self.submit_reasoning(session_id, "User message: " + content)
 
     def submit_checkpoint(
         self,
@@ -452,6 +484,18 @@ class IntarisClient:
             json=events,
         )
 
+    def read_recorded_events(self, session_id: str, seq: int) -> dict[str, Any]:
+        """Read a returned durable sequence through the existing public API."""
+        return self._request(
+            "GET",
+            f"/api/v1/session/{session_id}/events",
+            params={"seqs": str(seq)},
+        )
+
+    def flush_recorded_events(self, session_id: str) -> dict[str, Any]:
+        """Flush appended history through the existing public event endpoint."""
+        return self._request("POST", f"/api/v1/session/{session_id}/events/flush")
+
     # ------------------------------------------------------------------
     # Info
     # ------------------------------------------------------------------
@@ -498,3 +542,14 @@ class IntarisClient:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    def fork_tenant(self, user_id: str) -> IntarisClient:
+        """Open a separately owned client for tenant/cache isolation probes."""
+        return IntarisClient(
+            self.base_url,
+            self._client.headers["X-API-Key"],
+            user_id,
+            self.agent_id,
+            timeout_s=60,
+            request_retries=0,
+        )

@@ -309,7 +309,7 @@ class TestResolveLastUserMessage:
                             "id": "part-a",
                             "type": "text",
                             "messageID": "msg-a",
-                            "text": "I can push ainews to origin/main for you.",
+                            "text": "I can push the sample repository to origin/main for you.",
                         }
                     },
                 },
@@ -329,4 +329,7 @@ class TestResolveLastUserMessage:
         assert result is not None
         user_content, assistant_context = result
         assert user_content == "ok do it"
-        assert assistant_context == "I can push ainews to origin/main for you."
+        assert (
+            assistant_context
+            == "I can push the sample repository to origin/main for you."
+        )

@@ -552,9 +552,10 @@ class S3EventBackend:
         self._chunk_cache_ttl = max(0.0, config.s3_chunk_cache_ttl)
         self._cache_lock = threading.Lock()
         self._chunk_cache: dict[
-            tuple[str, str], tuple[float, list[tuple[int, int, str]]]
+            tuple[str, str], tuple[float, tuple[tuple[int, int, str], ...]]
         ] = {}
         self._object_versions: dict[str, str] = {}
+        self._chunk_cache_chunks = 0
         self._write_prefix_cache: dict[tuple[str, str], str] = {}
         self._chunk_cache_hits = 0
         self._chunk_cache_misses = 0
@@ -618,10 +619,10 @@ class S3EventBackend:
         session_id: str,
         *,
         force_refresh: bool = False,
-    ) -> list[tuple[int, int, str]]:
+    ) -> tuple[tuple[int, int, str], ...]:
         """List chunk objects sorted by start sequence.
 
-        Returns list of (start_seq, end_seq, key) tuples.
+        Returns an immutable snapshot of (start_seq, end_seq, key) tuples.
         """
         cache_key = (user_id, session_id)
         now = time.monotonic()
@@ -633,7 +634,7 @@ class S3EventBackend:
                 and now - cached[0] <= self._chunk_cache_ttl
             ):
                 self._chunk_cache_hits += 1
-                return list(cached[1])
+                return cached[1]
             self._chunk_cache_misses += 1
 
         chunks: list[tuple[int, int, str]] = []
@@ -670,20 +671,25 @@ class S3EventBackend:
                 continuation_token = response.get("NextContinuationToken")
 
         chunks.sort(key=lambda c: c[0])
+        snapshot = tuple(chunks)
         with self._cache_lock:
             previous = self._chunk_cache.get(cache_key)
             if previous is not None:
+                self._chunk_cache_chunks -= len(previous[1])
                 for _, _, key in previous[1]:
                     self._object_versions.pop(key, None)
-            self._chunk_cache[cache_key] = (now, list(chunks))
+            self._chunk_cache[cache_key] = (now, snapshot)
+            self._chunk_cache_chunks += len(snapshot)
             self._object_versions.update(discovered_versions)
             self._trim_caches_locked()
-        return chunks
+        return snapshot
 
     def _trim_caches_locked(self) -> None:
         """Bound process-local metadata caches. Must hold ``_cache_lock``."""
         while len(self._chunk_cache) > self._cache_max_entries:
-            _, chunks = self._chunk_cache.pop(next(iter(self._chunk_cache)))
+            cache_key = next(iter(self._chunk_cache))
+            _, chunks = self._chunk_cache.pop(cache_key)
+            self._chunk_cache_chunks -= len(chunks)
             for _, _, key in chunks:
                 self._object_versions.pop(key, None)
         while len(self._write_prefix_cache) > self._cache_max_entries:
@@ -783,7 +789,9 @@ class S3EventBackend:
                 chunks = [item for item in cached[1] if item[2] != key]
                 chunks.append(chunk)
                 chunks.sort(key=lambda item: item[0])
-                self._chunk_cache[cache_key] = (cached[0], chunks)
+                snapshot = tuple(chunks)
+                self._chunk_cache[cache_key] = (cached[0], snapshot)
+                self._chunk_cache_chunks += len(snapshot) - len(cached[1])
 
     def read(
         self,
@@ -986,6 +994,7 @@ class S3EventBackend:
         with self._cache_lock:
             cached = self._chunk_cache.pop((user_id, session_id), None)
             if cached is not None:
+                self._chunk_cache_chunks -= len(cached[1])
                 for _, _, key in cached[1]:
                     self._object_versions.pop(key, None)
             self._write_prefix_cache.pop((user_id, session_id), None)
@@ -997,6 +1006,7 @@ class S3EventBackend:
             for key in [key for key in self._chunk_cache if key[0] == user_id]:
                 cached = self._chunk_cache.pop(key, None)
                 if cached is not None:
+                    self._chunk_cache_chunks -= len(cached[1])
                     for _, _, object_key in cached[1]:
                         self._object_versions.pop(object_key, None)
                 self._write_prefix_cache.pop(key, None)
@@ -1060,6 +1070,7 @@ class S3EventBackend:
                 "bytes_read_total": self._bytes_read,
                 "bytes_written_total": self._bytes_written,
                 "chunk_cache_entries": len(self._chunk_cache),
+                "chunk_cache_chunks": self._chunk_cache_chunks,
                 "write_prefix_cache_entries": len(self._write_prefix_cache),
             }
         result["operation_latency"] = {

@@ -538,6 +538,33 @@
                   <div class="text-sm" x-text="session.intention"></div>
                 </div>
 
+                <!-- Controller-validated intention, read-only -->
+                <template x-if="session.intention_profile">
+                  <div class="mb-3">
+                    <div class="text-xs text-muted mb-2">Intention evidence</div>
+                    <div x-show="!session.intention_profile.available" class="text-xs text-muted mb-2">Rich intention unavailable; recorded items are historical evidence.</div>
+                    <ul class="space-y-2">
+                      <template x-for="(item, index) in session.intention_profile.items" :key="index">
+                        <li class="border-l border-brand-border pl-3">
+                          <div class="flex flex-wrap items-center gap-2 text-xs mb-1">
+                            <span class="badge" :class="intentionKindBadgeClass(item.kind)" x-text="item.kind"></span>
+                            <span class="text-muted" x-text="item.status"></span>
+                            <span class="text-secondary" x-show="session.intention_profile.current.includes(index)">Current task</span>
+                          </div>
+                          <blockquote class="text-sm whitespace-pre-wrap break-words" x-text="item.quote"></blockquote>
+                          <div class="text-xs text-secondary mt-1" x-show="item.kind === 'approval' && item.approves">Approves: <span x-text="item.approves"></span></div>
+                        </li>
+                      </template>
+                    </ul>
+                    <div class="text-xs text-muted mt-2" x-show="session.intention_profile.validation.dropped || session.intention_profile.validation.dropped_current">
+                      <span x-text="session.intention_profile.validation.dropped + ' dropped items; ' + session.intention_profile.validation.dropped_current + ' dropped current selections'"></span>
+                      <template x-for="(drop, index) in session.intention_profile.validation.drop_reasons" :key="index">
+                        <span class="ml-2 font-mono" x-text="'#' + drop.item + ': ' + drop.code"></span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+
                 <!-- Details (if present) -->
                 <template x-if="session.details">
                   <div class="mb-3">
@@ -550,7 +577,38 @@
                 <template x-if="session.policy">
                   <div class="mb-3">
                     <div class="text-xs text-muted mb-1">Policy</div>
-                    <pre class="text-xs bg-brand-elevated rounded p-2 overflow-x-auto" x-text="JSON.stringify(session.policy, null, 2)"></pre>
+                    <details>
+                      <summary class="text-xs text-secondary cursor-pointer">Raw policy</summary>
+                      <pre class="text-xs bg-brand-elevated rounded p-2 overflow-x-auto mt-1" x-text="JSON.stringify(session.policy, null, 2)"></pre>
+                    </details>
+                  </div>
+                </template>
+
+                <template x-if="session.active_policy">
+                  <div class="mb-4">
+                    <div class="text-xs text-muted mb-2">Active profile: <span class="font-medium text-primary" x-text="session.active_policy.profile"></span></div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div class="min-w-0">
+                        <div class="text-xs text-muted mb-1">Compiled rules</div>
+                        <div x-show="!session.active_policy.rules.length" class="text-xs text-muted">No compiled rules</div>
+                        <template x-for="rule in session.active_policy.rules" :key="rule.id">
+                          <div class="mb-2">
+                            <div class="text-xs font-mono break-words" x-text="rule.effect + ' · ' + rule.id"></div>
+                            <pre class="text-xs bg-brand-elevated rounded p-2 overflow-x-auto" x-text="JSON.stringify(rule.when, null, 2)"></pre>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="min-w-0">
+                        <div class="text-xs text-muted mb-1">Advisory operator clauses</div>
+                        <div x-show="!(session.advisory_clauses || []).length" class="text-xs text-muted">No advisory clauses</div>
+                        <template x-for="clause in (session.advisory_clauses || [])" :key="clause.id">
+                          <div class="mb-2">
+                            <div class="text-xs font-mono break-words" x-text="clause.effect + ' · ' + clause.id"></div>
+                            <p class="text-sm whitespace-pre-wrap break-words" x-text="clause.text"></p>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
                   </div>
                 </template>
 
@@ -1145,6 +1203,13 @@
                 </template>
 
                 <!-- Reasoning -->
+                <template x-if="evaluationTags(expandedRecord).length">
+                  <div class="flex flex-wrap gap-2 mb-3">
+                    <template x-for="tag in evaluationTags(expandedRecord)" :key="tag">
+                      <span class="badge badge-fast text-xs" x-text="tag"></span>
+                    </template>
+                  </div>
+                </template>
                 <template x-if="expandedRecord?.reasoning">
                   <div class="mb-3">
                     <div class="text-xs text-muted mb-1">Reasoning</div>
@@ -1342,11 +1407,24 @@
                 </div>
               </template>
 
-              <!-- Reasoning -->
-              <div class="text-sm bg-brand-elevated rounded p-3 mb-3" x-text="item.reasoning" x-show="item.reasoning"></div>
+              <!-- Structured Judge headline; never parse reasoning prose -->
+              <template x-if="judgePresentation(item)">
+                <div class="mb-3">
+                  <div class="text-sm font-medium" x-text="'User would ' + judgePresentation(item).userWould + ' · ' + judgePresentation(item).basis"></div>
+                  <div class="text-sm mt-1" x-show="judgePresentation(item).question" x-text="judgePresentation(item).question"></div>
+                  <template x-for="cite in judgePresentation(item).cites" :key="cite.index">
+                    <blockquote class="text-sm border-l border-brand-border pl-3 mt-2 whitespace-pre-wrap break-words">
+                      <span class="text-xs text-muted" x-text="'[' + cite.index + '] '"></span><span x-text="cite.text"></span>
+                    </blockquote>
+                  </template>
+                  <div class="text-xs text-muted mt-1" x-show="judgePresentation(item).operatorIds.length" x-text="'Operator clauses: ' + judgePresentation(item).operatorIds.join(', ')"></div>
+                </div>
+              </template>
+              <div class="text-xs text-muted mb-3" x-show="evaluatorAbstentions(item).length" x-text="'Evaluator unsure about: ' + evaluatorAbstentions(item).join(', ')"></div>
+              <div class="text-sm bg-brand-elevated rounded p-3 mb-3" x-text="item.reasoning" x-show="!judgePresentation(item) && item.reasoning"></div>
 
               <!-- Judge Reasoning (advisory mode deferred) -->
-              <template x-if="item.judge_reasoning">
+              <template x-if="item.judge_reasoning && !judgePresentation(item)">
                 <div class="mb-3">
                   <div class="text-xs text-muted mb-1">Judge Recommendation</div>
                   <div class="text-sm bg-purple-500/10 border border-purple-500/20 rounded p-3" x-text="item.judge_reasoning"></div>

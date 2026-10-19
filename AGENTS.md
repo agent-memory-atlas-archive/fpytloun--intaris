@@ -11,6 +11,22 @@
 - **Repository**: https://github.com/fpytloun/intaris
 - **Part of**: Cognara platform (Cognis controller, Intaris guardrails, Mnemory memory)
 
+## Public content hygiene
+
+- Treat source, tests, fixtures, tools and documentation as public content.
+  Use synthetic organizations, accounts, executor names and infrastructure targets.
+  Use reserved example domains for invented addresses.
+- Never copy private operational hostnames, deployment topology, personal paths,
+  production record IDs or raw captured payloads into tracked public files.
+  Preserve regression properties such as path depth, string length, scope
+  relationships and protocol syntax when anonymizing fixtures.
+- Keep private evidence outside the repository. Public reports describe results
+  and limitations, not private storage locations or session identifiers.
+- `.gitea/` is private deployment automation and must be excluded from every
+  public release tree and outgoing public commit. Preserve it privately.
+- Scan the complete projected public tree before publication, not just its diff.
+  Legitimate public package identities, project URLs and licensing contacts stay.
+
 ## Architecture
 
 ```
@@ -190,7 +206,7 @@ The middleware sets three ContextVars (`_session_user_id`, `_session_agent_id`, 
 | `INTARIS_API_KEY` | Single shared API key (auth only, no user binding) |
 | `INTARIS_API_KEYS` | JSON dict mapping API keys to user_ids (`{"key": "user", "key2": "*"}`) |
 | `RATE_LIMIT` | Max evaluations per session per minute (default 60, 0 = no limit) |
-| `EVALUATOR_BACKEND` | Tool-call evaluator backend: `llm` (default) or `jev` |
+| `EVALUATOR_BACKEND` | Tool-call evaluator backend: `llm`, `jev`, or `auto` (default with `COGNIS_INFERENCE_URL`, else `llm`). `auto` selects per call from the Cognis `routes/intaris_evaluation` operations metadata (`intaris/evaluator_backend.py`; see docs/configuration.md) |
 | `JEV_API_KEY` | TypeSafe API key required when `EVALUATOR_BACKEND=jev` (falls back to `TYPESAFE_API_KEY`) |
 | `JEV_MODEL` | Pinned Jev model (default `jev-1.13.0`) |
 | `JEV_BASE_URL` | TypeSafe API base URL (default `https://api.typesafe.ai`) |
@@ -691,6 +707,14 @@ The evaluator maintains an in-memory cache of approved path prefixes per session
 - `deny_paths` always checked BEFORE the cache (deny wins over approval)
 - Periodic sweep removes entries for dead sessions
 - New prefixes already covered by a broader cached prefix are skipped
+
+### Approved workspace edits (write scopes)
+
+The same evaluator owner keeps approved **write scopes** per session (`_approved_edit_scopes`, same lock, clear and sweep). When the evaluator model, the Judge or a human approves an `edit`, `write`, `multiedit` or `apply_patch` call whose every target is determinable from the arguments, the scope is recorded: the working directory for targets inside it, otherwise the target's parent directory. A later covered call whose targets all lie inside a recorded scope is approved without the evaluator or the Judge (legacy and hybrid), audited as `approved_workspace_edit` with `approved_workspace_scopes`.
+
+- Scopes are bound to `(policy_revision, state_revision)`; any authorization-revision change (new user message, policy change, and the other writers in `docs/hybrid-authorization-revisions.md`) resets them. The first edit after the next user message goes to the model again.
+- Never skipped: strict profile, plan mode / `read_only_required`, a `minimum_outcome` floor, prose restrictions (hybrid advisory clauses, legacy `deny_policies`), credential/secret/`.env` targets, `.git/`, CI/CD and deploy config (`.github/workflows`, `.gitlab-ci.yml`, `Jenkinsfile`, `deploy`/`k8s`/`helm` directories), `deny_paths` matches, human denials of the exact call or a target, and (hybrid) any open obligation other than the routine intent assessment (deny/require-approval rules, tool preferences, external effects).
+- `bash` is never covered.
 
 ### LLM context injection
 

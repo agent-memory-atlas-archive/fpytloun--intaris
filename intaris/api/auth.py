@@ -13,6 +13,7 @@ Both the session store and JTI tracker are backed by the database
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import threading
@@ -260,7 +261,7 @@ async def exchange_token(
 
     # Validate the exchange JWT
     try:
-        claims = validator.decode_claims(body.token)
+        claims = await asyncio.to_thread(validator.decode_claims, body.token)
     except Exception as e:
         logger.info("Exchange token rejected: %s", e)
         raise HTTPException(status_code=401, detail="Invalid or expired token")

@@ -122,7 +122,9 @@ class TestTaskQueue:
     def test_complete_task(self, task_queue):
         task_queue.enqueue("summary", "user-1", session_id="sess-1")
         task = task_queue.claim_next()
-        task_queue.complete(task["id"], {"summary_id": "sum-1"})
+        task_queue.complete(
+            task["id"], {"summary_id": "sum-1"}, claim_token=task["claim_token"]
+        )
 
         stats = task_queue.get_queue_stats()
         assert stats.get("completed", 0) == 1
@@ -131,7 +133,7 @@ class TestTaskQueue:
     def test_fail_task_retries(self, task_queue):
         task_queue.enqueue("summary", "user-1", session_id="sess-1")
         task = task_queue.claim_next()
-        task_queue.fail(task["id"], "LLM timeout")
+        task_queue.fail(task["id"], "LLM timeout", claim_token=task["claim_token"])
 
         stats = task_queue.get_queue_stats()
         # Should be back to pending (retry)
@@ -153,7 +155,9 @@ class TestTaskQueue:
                     )
                 task = task_queue.claim_next()
             assert task is not None, f"No task to claim on attempt {i + 1}"
-            task_queue.fail(task["id"], f"Error {i + 1}")
+            task_queue.fail(
+                task["id"], f"Error {i + 1}", claim_token=task["claim_token"]
+            )
 
         stats = task_queue.get_queue_stats()
         assert stats.get("failed", 0) == 1
@@ -162,6 +166,11 @@ class TestTaskQueue:
         task_queue.enqueue("summary", "user-1", session_id="sess-1")
         task_queue.claim_next()  # Now running
 
+        with task_queue._db.cursor() as cur:
+            cur.execute(
+                "UPDATE analysis_tasks SET heartbeat_at = ?",
+                ("2000-01-01T00:00:00+00:00",),
+            )
         count = task_queue.reset_stale_running()
         assert count == 1
 
@@ -208,7 +217,10 @@ class TestTaskQueue:
                 (old, task["id"]),
             )
 
-        assert task_queue.touch_heartbeat(task["id"]) is True
+        assert (
+            task_queue.touch_heartbeat(task["id"], claim_token=task["claim_token"])
+            is True
+        )
 
         with task_queue._db.cursor() as cur:
             cur.execute(
@@ -230,7 +242,7 @@ class TestTaskQueue:
     def test_cancel_duplicate_ignores_completed(self, task_queue):
         task_queue.enqueue("summary", "user-1", session_id="sess-1")
         task = task_queue.claim_next()
-        task_queue.complete(task["id"])
+        task_queue.complete(task["id"], claim_token=task["claim_token"])
         assert task_queue.cancel_duplicate("summary", "user-1", "sess-1") is False
 
     def test_cancel_duplicate_scopes_analysis_by_agent(self, task_queue):
@@ -248,7 +260,7 @@ class TestTaskQueue:
     def test_recently_completed_scopes_analysis_by_agent(self, task_queue):
         task_queue.enqueue("analysis", "user-1", agent_id="agent-a")
         task = task_queue.claim_next()
-        task_queue.complete(task["id"])
+        task_queue.complete(task["id"], claim_token=task["claim_token"])
 
         assert (
             task_queue.recently_completed("analysis", "user-1", agent_id="agent-a")
@@ -290,7 +302,7 @@ class TestTaskQueue:
         # Create and complete a task
         task_queue.enqueue("summary", "user-1", session_id="sess-1")
         task = task_queue.claim_next()
-        task_queue.complete(task["id"])
+        task_queue.complete(task["id"], claim_token=task["claim_token"])
 
         # Backdate the completed_at to 10 days ago
         with task_queue._db.cursor() as cur:
@@ -672,7 +684,7 @@ class TestBackgroundWorkerLLMCache:
         worker = self._make_worker(db)
         asyncio.run(worker.stop())  # Should not raise
 
-    def test_create_analysis_llm_enables_transient_retries(self, monkeypatch, db):
+    def test_create_analysis_llm_uses_default_transient_retries(self, monkeypatch, db):
         from intaris.config import LLMConfig
 
         worker = self._make_worker(db)
@@ -709,8 +721,8 @@ class TestBackgroundWorkerLLMCache:
         client = worker._create_llm_client("analysis")
 
         assert isinstance(client, _FakeClient)
-        assert created[0][1]["transient_retries"] == 2
-        assert created[0][1]["max_retry_after_seconds"] == 15.0
+        # Every LLMClient retries transient failures by default.
+        assert created[0][1] == {}
 
     def test_intention_update_skips_when_no_llm(self, db, session_store):
         """Intention update returns skipped when LLM client is unavailable."""
@@ -846,19 +858,17 @@ class TestSessionActivity:
 
         task = {
             "id": "task-1",
+            "claim_token": "claim-1",
             "task_type": "summary",
             "user_id": "user-1",
             "session_id": "sess-1",
             "agent_id": "agent-a",
             "payload": {},
         }
-        claims = [task, None]
 
-        def _claim_next():
-            next_task = claims.pop(0)
-            if next_task is None:
-                worker._running = False
-            return next_task
+        async def _claim_next(_queue):
+            worker._running = False
+            return task
 
         async def _fake_summary(_task):
             return {"status": "skipped", "reason": "Insufficient data in window"}
@@ -866,14 +876,14 @@ class TestSessionActivity:
         async def _fake_sleep(_seconds):
             return None
 
-        async def _fake_heartbeat(_task_id):
+        async def _fake_heartbeat(_task_id, _claim_token):
             await asyncio.Event().wait()
 
         monkeypatch.setattr(worker, "_execute_summary_task", _fake_summary)
         monkeypatch.setattr(worker, "_task_heartbeat_loop", _fake_heartbeat)
-        monkeypatch.setattr(worker._task_queue, "claim_next", _claim_next)
+        monkeypatch.setattr(worker._queue_wakeup, "claim", _claim_next)
         monkeypatch.setattr(
-            worker._task_queue, "complete", lambda *_args, **_kwargs: None
+            worker._task_queue, "complete", lambda *_args, **_kwargs: True
         )
         monkeypatch.setattr(worker._task_queue, "get_queue_stats", lambda: {})
         monkeypatch.setattr("intaris.background.asyncio.sleep", _fake_sleep)
@@ -905,19 +915,17 @@ class TestSessionActivity:
 
         task = {
             "id": "task-3",
+            "claim_token": "claim-3",
             "task_type": "summary",
             "user_id": "user-1",
             "session_id": "sess-3",
             "agent_id": "agent-a",
             "payload": {},
         }
-        claims = [task, None]
 
-        def _claim_next():
-            next_task = claims.pop(0)
-            if next_task is None:
-                worker._running = False
-            return next_task
+        async def _claim_next(_queue):
+            worker._running = False
+            return task
 
         async def _fake_summary(_task):
             return {"status": "skipped", "reason": "No LLM client configured"}
@@ -925,13 +933,13 @@ class TestSessionActivity:
         async def _fake_sleep(_seconds):
             return None
 
-        async def _fake_heartbeat(_task_id):
+        async def _fake_heartbeat(_task_id, _claim_token):
             await asyncio.Event().wait()
 
         monkeypatch.setattr(worker, "_execute_summary_task", _fake_summary)
         monkeypatch.setattr(worker, "_task_heartbeat_loop", _fake_heartbeat)
-        monkeypatch.setattr(worker._task_queue, "claim_next", _claim_next)
-        monkeypatch.setattr(worker._task_queue, "fail", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(worker._queue_wakeup, "claim", _claim_next)
+        monkeypatch.setattr(worker._task_queue, "fail", lambda *_args, **_kwargs: True)
         monkeypatch.setattr(worker._task_queue, "get_queue_stats", lambda: {})
         monkeypatch.setattr("intaris.background.asyncio.sleep", _fake_sleep)
 
@@ -1846,7 +1854,7 @@ class TestNotificationTruncation:
         defaults = dict(
             event_type="escalation",
             call_id="call-1",
-            session_id="ses_30eb5beb6ffeL3KPjUyF0Zkei1",
+            session_id="ses_syntheticNotification001",
             user_id="user-1",
             agent_id="test-agent",
             tool="mcp_bash",
@@ -1917,7 +1925,7 @@ class TestNotificationTruncation:
         """Full session_id is shown in denial messages."""
         from intaris.notifications.providers import PushoverProvider
 
-        session_id = "ses_30eb5beb6ffeL3KPjUyF0Zkei1"
+        session_id = "ses_syntheticNotification001"
         n = self._make_notification(
             event_type="denial",
             session_id=session_id,
@@ -1932,7 +1940,7 @@ class TestNotificationTruncation:
         """Full session_id is shown in summary alert messages."""
         from intaris.notifications.providers import Notification, PushoverProvider
 
-        session_id = "ses_30eb5beb6ffeL3KPjUyF0Zkei1"
+        session_id = "ses_syntheticNotification001"
         n = Notification(
             event_type="summary_alert",
             call_id="",
@@ -1978,7 +1986,7 @@ class TestNotificationTruncation:
         n = Notification(
             event_type="summary_alert",
             call_id="",
-            session_id="ses_30eb5beb6ffeL3KPjUyF0Zkei1",
+            session_id="ses_syntheticNotification001",
             user_id="user-1",
             agent_id="test-agent",
             tool=None,
@@ -2054,7 +2062,7 @@ class TestNotificationTruncation:
         """Full session_id is shown in Slack escalation blocks."""
         from intaris.notifications.providers import SlackProvider
 
-        session_id = "ses_30eb5beb6ffeL3KPjUyF0Zkei1"
+        session_id = "ses_syntheticNotification001"
         n = self._make_notification(session_id=session_id)
         blocks = SlackProvider._build_escalation_blocks(n)
 
@@ -2072,7 +2080,7 @@ class TestNotificationTruncation:
         """Full session_id is shown in Slack denial blocks."""
         from intaris.notifications.providers import SlackProvider
 
-        session_id = "ses_30eb5beb6ffeL3KPjUyF0Zkei1"
+        session_id = "ses_syntheticNotification001"
         n = self._make_notification(
             event_type="denial",
             session_id=session_id,

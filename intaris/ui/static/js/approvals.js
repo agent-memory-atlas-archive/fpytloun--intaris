@@ -100,6 +100,8 @@ function approvalsTab() {
     _handleWsMessage(data) {
       if (data.type === 'evaluated' && data.decision === 'escalate') {
         this._scheduleLoad();
+      } else if (data.type === 'judge_reviewed') {
+        this._scheduleLoad();
       } else if (data.type === 'evaluated' && data.decision === 'deny') {
         this._scheduleLoadDenials();
       } else if (data.type === 'decided') {

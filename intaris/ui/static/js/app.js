@@ -145,6 +145,61 @@ function recordAssistantContext(record) {
   return typeof context === 'string' && context.trim() ? context : '';
 }
 
+/** Read structured decision evidence only; reasoning text is not a protocol. */
+function judgePresentation(record) {
+  const stages = record?.evaluation_metadata?.stages;
+  if (!Array.isArray(stages)) return null;
+  const stage = [...stages].reverse().find(s => s.stage === 'judge' && s.classification?.user_would);
+  if (!stage) return null;
+  const answer = stage.classification;
+  const sources = Array.isArray(stage.citation_sources) ? stage.citation_sources : [];
+  return {
+    userWould: answer.user_would,
+    basis: answer.basis,
+    question: answer.question || '',
+    cites: (Array.isArray(answer.cites) ? answer.cites : []).map(index => {
+      const source = sources.find(row => row.index === index);
+      return { index, text: source?.text || 'Quoted source unavailable' };
+    }),
+    operatorIds: Array.isArray(answer.operator_policy_ids) ? answer.operator_policy_ids : [],
+  };
+}
+
+function evaluatorAbstentions(record) {
+  const stages = record?.evaluation_metadata?.stages;
+  if (!Array.isArray(stages)) return [];
+  return [...new Set(stages.filter(s => s.stage === 'l1').flatMap(s =>
+    Object.entries(s.abstentions || {}).filter(([, unsure]) => unsure === true).map(([field]) => field)
+  ))];
+}
+
+function evaluationTags(record) {
+  const metadata = record?.evaluation_metadata;
+  if (!metadata) return [];
+  const observations = metadata.policy_evidence?.observations || {};
+  const tags = [];
+  const effects = observations.effects?.value || [];
+  if (Array.isArray(effects) && effects.includes('disclose') && observations.secret_argument?.value) {
+    tags.push('disclose · secret argument');
+  }
+  const heuristic = observations.name_heuristic_effect?.value;
+  if (heuristic) tags.push(heuristic + ' · verb heuristic');
+  const projection = metadata.l1_projection || metadata.context_input?.l1_projection;
+  if (projection) tags.push('L1 · ' + projection);
+  const waived = metadata.final_policy_result?.waived_operator_clause_ids;
+  if (Array.isArray(waived)) {
+    waived.forEach(id => tags.push('Operator cap waived · ' + id));
+  }
+  return tags;
+}
+
+function intentionKindBadgeClass(kind) {
+  if (kind === 'approval') return 'badge-approve';
+  if (kind === 'restriction' || kind === 'revocation') return 'badge-deny';
+  if (kind === 'uncertain') return 'badge-escalate';
+  return 'badge-fast';
+}
+
 function stableJson(value) {
   function sortValue(input) {
     if (Array.isArray(input)) return input.map(sortValue);

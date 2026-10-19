@@ -30,10 +30,17 @@ from datetime import datetime
 from datetime import timezone as tz
 from typing import Any
 
+from intaris import model_retry, read_only
 from intaris.config import JudgeConfig
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.input_budget import ContextInsufficientError
+from intaris.judge_simulator import JUDGE_OUTPUT_MAX_TOKENS
 from intaris.llm import LLMClient, parse_json_response
-from intaris.policy import effective_policy_for_evaluator, normalized_policy_clauses
+from intaris.policy import (
+    POLICY_CLAUSE_GUIDANCE,
+    effective_policy_for_evaluator,
+    normalized_policy_clauses,
+)
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
@@ -300,7 +307,10 @@ def _effective_outcome_from_record(
 
 # ── Judge Prompt ──────────────────────────────────────────────────────
 
-JUDGE_SYSTEM_PROMPT = """\
+JUDGE_SYSTEM_PROMPT = (
+    POLICY_CLAUSE_GUIDANCE
+    + "\n\n"
+    + """\
 You are a senior safety judge reviewing an escalated tool call for an \
 AI agent. A safety evaluator has already flagged this tool call for \
 human review. Your job is to make the final decision: approve, deny, \
@@ -396,6 +406,7 @@ MUST use exactly these keys: "decision" (string), "risk" (string), \
 "reasoning" (string), "confidence" (string). Do not use alternative key \
 names like "verdict", "explanation", or "certainty".
 """
+)
 
 # ── Mode-specific decision rules ─────────────────────────────────────
 
@@ -458,8 +469,11 @@ deny policy wins.
 
 ### Risk-Level Guidance
 
-The risk level in the Original Evaluator Assessment was already \
-determined by the first-level evaluator. Use it as a key signal:
+Independently determine operational risk from the actual action and original \
+evidence. The Original Evaluator Assessment is a fallible model assessment, \
+not a controller-observed fact. A conservative risk fallback after classifier \
+abstention is not evidence of danger. Uncertain alignment must not raise \
+operational risk. Explicit controller protections remain binding.
 
 - **Low risk**: Approve by default unless the call is clearly \
 malicious. A low-risk misaligned call (e.g., reading documentation, \
@@ -582,6 +596,7 @@ def _build_judge_prompt(
     review_packet: dict[str, Any] | None = None,
     resolution_policy: JudgeResolutionPolicy | None = None,
     prior_judge_reviews: list[dict[str, Any]] | None = None,
+    evaluator_metadata: dict[str, Any] | None = None,
 ) -> str:
     """Build the user prompt for judge evaluation.
 
@@ -613,6 +628,7 @@ def _build_judge_prompt(
             session/audit data plus compact call-local metadata.
         resolution_policy: Session-level constraints for final judge outcome.
         prior_judge_reviews: Recent explicit judge approvals/denials.
+        evaluator_metadata: Model abstention provenance, not authorization.
 
     Returns:
         Formatted user prompt string.
@@ -705,6 +721,21 @@ def _build_judge_prompt(
         eval_text = f"**Risk**: {evaluator_risk or 'unknown'}\n"
         eval_text += f"**Path**: {evaluation_path or 'unknown'}\n"
         eval_text += f"**Reasoning**: {safe_reasoning}"
+        uncertainty = (evaluator_metadata or {}).get("classification_uncertainty")
+        if isinstance(uncertainty, dict):
+            fields = [
+                key
+                for key in ("alignment", "risk", "decision", "validation")
+                if uncertainty.get(key) is True
+            ]
+            eval_text += "\n**Classifier abstained on**: " + ", ".join(fields)
+            if uncertainty.get("risk_is_fallback") is True:
+                eval_text += (
+                    "\n**Risk basis**: conservative fallback, not observed danger. "
+                    "Independently assess operational risk."
+                )
+            else:
+                eval_text += "\n**Risk basis**: confident model classification."
         sections.append(
             f"## Original Evaluator Assessment\n"
             f"{wrap_with_boundary(eval_text, 'context')}"
@@ -818,7 +849,7 @@ def _build_judge_prompt(
             line = (
                 f"- [{decision_label}] "
                 f"{record.get('tool', '?')}: "
-                f"{_truncate(str(record.get('args_redacted', '')), 150)}"
+                f"{_legacy_history_arguments(record)}"
             )
             if record.get("reasoning"):
                 line += f" — {_truncate(record['reasoning'], 80)}"
@@ -844,7 +875,7 @@ def _build_judge_prompt(
             risk = record.get("judge_risk") or record.get("risk") or "unknown"
             line = (
                 f"- [judge:{decision}/{risk}] {record.get('tool', '?')}: "
-                f"{_truncate(str(record.get('args_redacted', '')), 120)}"
+                f"{_legacy_history_arguments(record)}"
             )
             if record.get("judge_reasoning"):
                 line += f" — {_truncate(str(record['judge_reasoning']), 100)}"
@@ -866,7 +897,11 @@ def _build_judge_prompt(
         )
 
     # Current tool call (the escalated call)
+    from intaris.evaluation_context import without_attached_context
+
     safe_tool = sanitize_for_prompt(tool)
+    # The attached evaluate context is rendered once in the review packet.
+    args_redacted = without_attached_context(args_redacted)
     args_str = sanitize_for_prompt(
         json.dumps(args_redacted, indent=2, default=str) if args_redacted else "{}"
     )
@@ -880,10 +915,26 @@ def _build_judge_prompt(
 
 
 def _truncate(text: str, max_len: int) -> str:
-    """Truncate text to max_len, adding ellipsis if needed."""
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
+    """Preserve available evidence; final transport capacity owns model-view loss."""
+    from intaris.redactor import redact
+
+    return str(redact(text))
+
+
+def _legacy_history_arguments(record: dict[str, Any]) -> str:
+    """Bound ordinary history; keep complete human-approved action scope."""
+    from intaris.evaluation_context import compact_records
+
+    # Judge resolutions also populate user_decision. Preserve unknown legacy
+    # decision provenance conservatively, but never treat Judge output as human.
+    protected = (
+        record.get("user_decision") is not None and record.get("resolved_by") != "judge"
+    )
+    row = compact_records([record], chars=600, full_args=protected)[0]
+    rendered = str(row.get("args", {}))
+    if not protected and len(rendered) > 2000:
+        return rendered[:2000] + "… [ordinary history arguments omitted]"
+    return rendered
 
 
 def _append_context_line(
@@ -970,7 +1021,19 @@ def _build_review_packet(
         if context is None:
             context = args.get("context")
     if isinstance(context, dict):
-        packet["current_call_context"] = context
+        # Sections rendered below are excluded here so each appears once.
+        packet["current_call_context"] = {
+            key: value
+            for key, value in context.items()
+            if key
+            not in {
+                "tool",
+                "skill",
+                "loaded_skills",
+                "recent_outcomes",
+                "raw_task_sources",
+            }
+        }
         tool_metadata = context.get("tool")
         if isinstance(tool_metadata, dict):
             packet["current_tool_metadata"] = tool_metadata
@@ -979,6 +1042,16 @@ def _build_review_packet(
             packet["resolved_skill"] = skill_metadata
 
     policy_clauses = normalized_policy_clauses(session.get("policy"))
+    from intaris.evaluation_context import INSTRUCTIONS, runtime_view
+
+    if isinstance(context, dict):
+        packet["runtime_context"] = {
+            "instructions": INSTRUCTIONS,
+            # Tool metadata is already current_tool_metadata.
+            "evidence": {k: v for k, v in runtime_view(context).items() if k != "tool"},
+        }
+        if context.get("raw_task_sources"):
+            packet["raw_task_sources"] = context["raw_task_sources"]
     if policy_clauses:
         packet["policy_clauses"] = policy_clauses
 
@@ -1086,6 +1159,7 @@ async def resolve_with_side_effects(
     event_bus: Any | None = None,
     notification_dispatcher: Any | None = None,
     metrics: Any | None = None,
+    hybrid_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve an escalation or denial with all side effects.
 
@@ -1146,7 +1220,7 @@ async def resolve_with_side_effects(
             pass
 
     # Step 1: Resolve the escalation (atomic DB update)
-    audit_store.resolve_escalation(
+    resolved = audit_store.resolve_escalation(
         call_id=call_id,
         user_decision=user_decision,
         user_note=user_note,
@@ -1155,6 +1229,7 @@ async def resolve_with_side_effects(
         judge_reasoning=judge_reasoning,
         judge_decision=judge_decision,
         judge_risk=judge_risk,
+        **({"hybrid_metadata": hybrid_metadata} if hybrid_metadata is not None else {}),
     )
 
     # Look up the full record for downstream processing
@@ -1163,6 +1238,11 @@ async def resolve_with_side_effects(
         record = audit_store.get_by_call_id(call_id, user_id=user_id)
     except ValueError:
         pass
+    if record is not None:
+        # Carry the resolution-time authorization revision to path learning.
+        record["resolution_revision"] = (
+            resolved.get("resolution_revision") if isinstance(resolved, dict) else None
+        )
 
     # Log and count judge overrides
     if is_judge_override:
@@ -1450,6 +1530,18 @@ class JudgeReviewer:
 
         start_time = time.monotonic()
         timeout_seconds = max(getattr(self._llm, "_timeout_ms", 0) / 1000.0, 0.001)
+        before = await asyncio.to_thread(
+            self._audit.get_by_call_id, call_id, user_id=user_id
+        )
+        if (before.get("evaluation_metadata") or {}).get(
+            "evaluation_policy_version"
+        ) == "hybrid_v1":
+            # Hybrid review owns assessment/repair calls plus an independent
+            # authorization call, not one model call. The request deadline wins.
+            remaining = model_retry.remaining_seconds()
+            timeout_seconds = (
+                max(remaining, 0.001) if remaining is not None else timeout_seconds * 4
+            )
         fallback_reasoning: str | None = None
         fallback_event_type: str | None = None
 
@@ -1472,6 +1564,8 @@ class JudgeReviewer:
             logger.warning("Judge review timed out for call_id=%s", call_id)
             if self._metrics:
                 self._metrics.judge_errors_total += 1
+        except ContextInsufficientError:
+            raise
         except ValueError as e:
             logger.info("Judge review skipped for call_id=%s: %s", call_id, e)
         except Exception:
@@ -1535,8 +1629,23 @@ class JudgeReviewer:
             self._audit.get_by_call_id, call_id, user_id=user_id
         )
 
+        # Operator-bound evaluations deliberately contain no model assessment.
+        # This applies to background/proxy review as well as the HTTP route.
+        if (record.get("evaluation_metadata") or {}).get("operator_bound"):
+            return
+        if record.get("decision") == "deny" and record.get("outcome_override") in {
+            "request.read_only_unproven",
+            "request.read_only_required",
+        }:
+            return
+
+        # A deny floor fixes the outcome; no Judge answer could change it.
+        if record.get("minimum_outcome") == "deny":
+            return
         # Request floors are human-only, including background review entry points.
-        if record.get("minimum_outcome") in {"deny", "escalate"}:
+        if record.get("minimum_outcome") == "escalate" and not (
+            (record.get("evaluation_metadata") or {}).get("judge_required")
+        ):
             return
 
         # Guard: only review tool_call escalations
@@ -1632,7 +1741,9 @@ class JudgeReviewer:
                 parent_session = await asyncio.to_thread(
                     self._sessions.get, parent_session_id, user_id=user_id
                 )
-                parent_intention = parent_session.get("intention")
+                from intaris.evaluation_context import parent_scope_evidence
+
+                parent_intention = parent_scope_evidence(parent_session)
 
                 # Fetch parent reasoning records time-bounded to child's
                 # creation time. This gives the judge visibility into the
@@ -1676,6 +1787,7 @@ class JudgeReviewer:
 
         # Build judge prompt
         user_prompt = _build_judge_prompt(
+            evaluator_metadata=record.get("evaluation_metadata"),
             intention=session.get("intention", ""),
             policy=session.get("policy"),
             recent_history=recent_history,
@@ -1703,7 +1815,344 @@ class JudgeReviewer:
             prior_judge_reviews=prior_judge_reviews,
         )
 
+        metadata = record.get("evaluation_metadata") or {}
+        if metadata.get("evaluation_policy_version") == "hybrid_v1":
+            from datetime import timedelta
+
+            from intaris import judge_simulator
+            from intaris.hybrid import PolicyResult, evaluate_policy, validate_rules
+            from intaris.hybrid_runtime import finalize_result
+            from intaris.policy_evidence import Evidence
+
+            if record.get("evaluation_path") == "alignment":
+                return  # Parent/child acknowledgment belongs to a human.
+            if any(
+                stage.get("stage") == "judge" for stage in metadata.get("stages", [])
+            ):
+                return
+            if session.get("latest_user_evidence"):
+                from intaris.authorization import presented_latest_user_evidence
+
+                user_prompt += "\nLatest user evidence (client-supplied provenance):\n"
+                user_prompt += json.dumps(presented_latest_user_evidence(session))
+            state = Evidence.model_validate(metadata["policy_evidence"])
+            prior_result = PolicyResult.model_validate(metadata["policy_result"])
+            from intaris.intention_profile import snapshot
+
+            captured = await asyncio.to_thread(
+                snapshot, self._audit._db, session, event_store=self._event_store
+            )
+            artifact = metadata.get("task_context")
+            if not artifact:
+                artifact = captured
+            last_assistant = next(
+                (
+                    r.get("reasoning", "")
+                    for r in recent_history
+                    if (r.get("args_redacted") or {}).get("role") == "assistant"
+                ),
+                "",
+            )
+            if self._event_store is not None:
+                from intaris.events.resolve import _extract_assistant_text
+
+                events = await asyncio.to_thread(
+                    self._event_store.read_tail,
+                    user_id,
+                    session_id,
+                    100,
+                    event_types={"message", "assistant_message", "part"},
+                    before_ts=record["timestamp"],
+                )
+                for event in reversed(events):
+                    text = _extract_assistant_text(
+                        event.get("type"), event.get("data") or {}
+                    )
+                    if text:
+                        last_assistant = text
+                        break
+            from intaris.authorization import latest_exchange
+
+            # Clients record the agent's preceding message with the user's
+            # reply; it lets a short confirmation resolve to its proposal.
+            exchange = await asyncio.to_thread(latest_exchange, self._audit, session)
+            if exchange and exchange["agent_last_message"]:
+                last_assistant = exchange["agent_last_message"]
+            question = judge_simulator.request(
+                record,
+                session,
+                state,
+                prior_result,
+                artifact,
+                latest_assistant=last_assistant,
+                latest_user=(exchange or {}).get("user_reply", ""),
+                reason=metadata.get("agent_reason"),
+                human_decisions=await asyncio.to_thread(
+                    self._audit.get_user_decisions,
+                    session_id,
+                    user_id=user_id,
+                    limit=judge_simulator.HUMAN_DECISION_LIMIT,
+                ),
+                outcomes=judge_simulator.allowed_outcomes(
+                    record.get("maximum_outcome")
+                ),
+            )
+            answer, diagnostics = await asyncio.to_thread(
+                judge_simulator.classify, self._llm, question
+            )
+            if diagnostics.get("response_origin") == "assessment_failed":
+                # An unavailable assessment is not an adverse model judgment.
+                # Keep the pending action unresolved even in unattended mode.
+                revised = {
+                    **metadata,
+                    "stages": [
+                        *metadata.get("stages", []),
+                        {
+                            "stage": "judge",
+                            "classification": answer.model_dump(),
+                            **diagnostics,
+                        },
+                    ],
+                }
+                await asyncio.to_thread(
+                    self._audit.set_hybrid_review,
+                    call_id,
+                    user_id=user_id,
+                    metadata=revised,
+                    reasoning=judge_simulator.user_explanation(
+                        answer, artifact, "escalate", record
+                    ),
+                    risk=record.get("risk"),
+                )
+                return
+            assessment = answer.model_dump()
+            answers = assessment
+            review = judge_simulator.receipt(
+                state,
+                prior_result,
+                answer,
+                question["citable"],
+            )
+            state = state.model_copy(
+                update={
+                    "review": review,
+                }
+            )
+            active = metadata["active_policy"]
+            policy_result = evaluate_policy(
+                validate_rules(active["rules"]),
+                state,
+                active["profile"],
+                assessed=True,
+            )
+            # Explicit answers and references must address every material prior
+            # obligation. A generic updated within_scope cannot erase a conflict.
+            unaddressed = [
+                item
+                for item in prior_result.outstanding_obligations
+                if item.requirement != "human" and item.id not in review.obligation_ids
+            ]
+            if unaddressed and policy_result.outcome == "approve":
+                policy_result = policy_result.model_copy(
+                    update={
+                        "outcome": "escalate",
+                        "outstanding_obligations": unaddressed,
+                    }
+                )
+            facts = state.comparison()
+            final = finalize_result(
+                policy_result,
+                maximum=record.get("maximum_outcome"),
+                minimum=record.get("minimum_outcome"),
+                judge_allowed=resolution_policy.allowed_decisions,
+                judge_uncertain=resolution_policy.on_uncertain,
+                overlay=metadata.get("overlay"),
+                mutation=facts.get("mutation", "unclear"),
+            )
+            decision = final.decision
+            # Advisory uncertainty stays with the human; auto does not invent approval.
+            revised = dict(metadata)
+            if metadata.get("task_context"):
+                from intaris.hybrid import digest
+
+                revised["context_input"] = {
+                    **metadata["context_input"],
+                    "judge_invoked": True,
+                    "judge_prompt_digest": digest(question["messages"]),
+                }
+            revised["stages"] = [
+                *metadata.get("stages", []),
+                {
+                    "stage": "judge",
+                    "classification": assessment,
+                    "profile": active["profile"],
+                    "citation_sources": question["citation_sources"],
+                    "cleared_obligations": [
+                        o.id
+                        for o in prior_result.outstanding_obligations
+                        if o.id
+                        not in {v.id for v in policy_result.outstanding_obligations}
+                    ],
+                    "confirmed_obligations": [
+                        o.id for o in policy_result.outstanding_obligations
+                    ],
+                    **diagnostics,
+                },
+            ]
+            revised["facts"] = facts
+            revised["policy_evidence"] = state.model_dump()
+            revised["policy_result"] = policy_result.model_dump()
+            revised["final_policy_result"] = final.model_dump(mode="json")
+            revised["outstanding_obligations"] = [
+                item.model_dump(mode="json") for item in final.outstanding_obligations
+            ]
+            revised["obligation_disposition"] = final.disposition
+            revised["review_binding"] = {
+                key: metadata.get(key)
+                for key in (
+                    "action_digest",
+                    "policy_revision",
+                    "state_revision",
+                    "mode_identity",
+                )
+            }
+            revised["review_answers"] = answers
+            revised["mandatory_rule_ids"] = policy_result.mandatory_rule_ids
+            revised["human_approval_required"] = bool(
+                policy_result.mandatory_rule_ids
+                or record.get("minimum_outcome") == "escalate"
+            )
+            if decision == "approve":
+                admitted = datetime.now(tz.utc)
+                revised["admission"] = {
+                    "admitted_at": admitted.isoformat(),
+                    "dispatch_deadline": (admitted + timedelta(seconds=5)).isoformat(),
+                }
+            else:
+                revised["admission"] = None
+            reasoning = read_only.explanation(
+                decision,
+                metadata.get("overlay"),
+                state.value("mutation", "unclear"),
+                state.value("effects", []),
+            ) or judge_simulator.user_explanation(
+                answer,
+                artifact,
+                decision,
+                record,
+                triggers=[o.id for o in final.outstanding_obligations],
+                finalization=final.model_dump(mode="json"),
+            )
+            if decision == "escalate":
+                await asyncio.to_thread(
+                    self._audit.set_hybrid_review,
+                    call_id,
+                    user_id=user_id,
+                    metadata=revised,
+                    reasoning=reasoning,
+                    risk=answer.risk,
+                )
+                if self._event_bus is not None:
+                    self._event_bus.publish(
+                        {
+                            "type": "judge_reviewed",
+                            "user_id": user_id,
+                            "session_id": session_id,
+                            "agent_id": record.get("agent_id"),
+                            "call_id": call_id,
+                        }
+                    )
+                return
+            await resolve_with_side_effects(
+                call_id=call_id,
+                user_id=user_id,
+                user_decision=decision,
+                resolved_by="judge",
+                judge_decision=decision,
+                judge_reasoning=reasoning,
+                judge_risk=answer.risk,
+                hybrid_metadata=revised,
+                audit_store=self._audit,
+                evaluator=self._evaluator,
+                intention_barrier=self._intention_barrier,
+                alignment_barrier=self._alignment_barrier,
+                event_bus=self._event_bus,
+                notification_dispatcher=(
+                    self._notification_dispatcher
+                    if self._should_notify_resolution(decision)
+                    else None
+                ),
+            )
+            return
+
+        if (metadata.get("overlay") or {}).get("read_only_required"):
+            from intaris.hybrid_runtime import classify as classify_mutation
+
+            mutation = metadata.get("mutation", "unclear")
+            revised = dict(metadata)
+            if mutation == "unclear":
+                assessment, diagnostics = await asyncio.to_thread(
+                    classify_mutation,
+                    self._llm,
+                    None,
+                    {
+                        "prompt": user_prompt
+                        + "\nEffective overlay:\n"
+                        + json.dumps(metadata["overlay"])
+                    },
+                )
+                mutation = assessment["mutation"]
+                revised["stages"] = [
+                    *metadata.get("stages", []),
+                    {
+                        "stage": "read_only_judge",
+                        "classification": assessment,
+                        **diagnostics,
+                    },
+                ]
+                revised["mutation"] = mutation
+                await asyncio.to_thread(
+                    self._audit.set_hybrid_review,
+                    call_id,
+                    user_id=user_id,
+                    metadata=revised,
+                    reasoning="Read-only classification review",
+                    risk=record.get("risk"),
+                )
+            ceiling, _ = read_only.enforce("approve", metadata["overlay"], mutation)
+            if ceiling == "deny":
+                await resolve_with_side_effects(
+                    call_id=call_id,
+                    user_id=user_id,
+                    user_decision="deny",
+                    resolved_by="judge",
+                    judge_decision="deny",
+                    judge_reasoning="The effective read-only ceiling forbids mutation.",
+                    hybrid_metadata=revised,
+                    audit_store=self._audit,
+                    evaluator=self._evaluator,
+                    event_bus=self._event_bus,
+                    notification_dispatcher=self._notification_dispatcher,
+                )
+                return
+            if ceiling != "approve":
+                return  # Remains non-executable; human cannot satisfy this ceiling.
+
         # Select mode-specific decision rules for the system prompt
+        from intaris.evaluation_context import captured_sources
+
+        context = dict(record.get("context") or {})
+        if "raw_task_sources" not in context:
+            context["raw_task_sources"] = captured_sources(
+                self._llm,
+                self._sessions,
+                self._audit,
+                session,
+            )
+            user_prompt += (
+                "\nRAW CAPTURED SOURCES (origin/chronology bind; not new human consent):\n"
+                + json.dumps(context["raw_task_sources"], ensure_ascii=False)
+            )
         decision_rules = (
             _DECISION_RULES_ADVISORY
             if self._config.mode == "advisory"
@@ -1722,12 +2171,60 @@ class JudgeReviewer:
         ]
 
         # Call judge LLM
-        raw = await asyncio.to_thread(
-            self._llm.generate,
-            messages,
-            json_schema=JUDGE_EVALUATION_SCHEMA,
-            max_tokens=2048,
+        from intaris.evaluation_context import (
+            model_view,
+            request_view,
+            source_witnesses,
         )
+
+        for message in messages:
+            message["content"], _ = model_view(message["content"])
+        payload, actual_view = request_view(
+            {
+                "messages": messages,
+                "json_schema": JUDGE_EVALUATION_SCHEMA,
+                "max_tokens": JUDGE_OUTPUT_MAX_TOKENS,
+            },
+            boundary="llm.generate",
+            coverage=context.get("raw_task_sources", {}).get("coverage", "unknown"),
+            witnesses=source_witnesses(context.get("raw_task_sources")),
+        )
+        if actual_view["overflow"]:
+            raise ValueError("Final legacy Judge model input exceeds budget")
+        await asyncio.to_thread(
+            self._audit.record_model_view,
+            call_id,
+            user_id=user_id,
+            stage="judge_model_view",
+            view=actual_view,
+        )
+
+        def generate():
+            from intaris.input_budget import located_source, source_sections
+
+            with source_sections(
+                located_source(
+                    messages[1]["content"],
+                    context.get("raw_task_sources"),
+                    path=("messages", 1, "content"),
+                )
+            ):
+                output = self._llm.generate(
+                    payload["messages"],
+                    json_schema=payload["json_schema"],
+                    max_tokens=payload["max_tokens"],
+                )
+            return output, getattr(self._llm, "input_view", None)
+
+        raw, wire_view = await asyncio.to_thread(generate)
+        if isinstance(wire_view, dict):
+            await asyncio.to_thread(
+                self._audit.record_model_view,
+                call_id,
+                user_id=user_id,
+                stage="judge_model_view",
+                view={**actual_view, **wire_view, "boundary": "provider_request"},
+            )
         result = parse_json_response(
             raw,
             expected_keys={"decision", "reasoning", "risk", "confidence"},

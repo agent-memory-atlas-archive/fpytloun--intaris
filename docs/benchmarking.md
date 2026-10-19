@@ -1,5 +1,396 @@
 # Benchmarking
 
+## Current release qualification
+
+### Restart recovery and accounting
+
+The Cognis proxy uses explicit retries rather than hidden SDK retries. Transient
+409/429/502/503/504 responses and broken connections receive at most three
+attempts with bounded backoff. Every inference attempt reserves budget and
+records known usage or a conservative unknown-cost reservation.
+
+Recovery discovers the fixed authorized replica, verifies unchanged provider,
+model and reasoning settings against read-only routing state, refreshes
+process-local discovery fingerprints, and records transport epochs. Startup and
+final metadata verification use the same recovery owner. Configuration drift,
+exhausted budget and permanent failures remain stopping conditions.
+
+An interrupted run can be continued only with its previous completion ledger.
+An explicitly reviewed infrastructure restart can begin a new failure epoch;
+prior spending, unknown reservations and the original cumulative caps remain.
+Partial nonterminal failures retain their failure count. Failed attempts and
+incomplete runs are never merged into a later complete run's quality scores.
+
+The isolated managed replay's provider, intention-barrier, overall evaluation
+and client deadlines accommodate recovery. These extended deadlines are not
+production timeout settings or production latency guarantees. The replay never
+dispatches fixture tools.
+
+Use `python -m tools.benchmark.full_release` for the current candidate's full
+source/history case coverage: all 75 primary actions and 48 history checkpoints,
+three trials, balanced policy only. It reuses the frozen broader manifests and
+public lifecycle adapters, with a real intention/profile preflight. The
+[October 15 report](full-balanced-benchmark-2026-10-15.md) includes measured
+outcomes, retained legacy comparisons and incomplete history conditions.
+Literal synthetic human-resolution events are replayed only in isolated
+benchmark sessions; Judge events require actual Judge resolution. No proposed
+tool executes, and missing evidence is not manufactured.
+
+See [October release verification](release-verification-2026-10.md) before
+reusing historical scores. The new `tools/benchmark/release_proxy.py` harness
+records effective hybrid session policy, uses isolated SQLite databases and an
+authenticated pinned Cognis replica, and carries prior spending through
+`--previous-completion`. Its current 47-action corpus has no user-message
+events: that smaller fallback runner does not establish rich-intention coverage.
+
+Preserve every attempt's completion ledger, including failed startup and invalid
+configuration runs. Never restart the approved cumulative budget by omitting a
+previous completion. A metadata fingerprint is process-local, not a stable
+deployment identifier. No fixture tools or human approvals execute in this
+release harness. Historical lifecycle controls below have different contracts.
+
+## Focused public-human historical controls
+
+The two literal focused approval events now bind their exact existing action
+through public evaluate → returned call ID → public decision → audit readback.
+`resolved_by=user`, decision, session, tool and full argument scope must match.
+The note serializes only the literal historical action/resolution; the fixture's
+same/different-action scorer labels are never sent as context. Both arms use the
+same public lifecycle. No internal authority flags, fabricated call IDs or direct
+database writes are used, and no proposed tool executes.
+
+Across the frozen matrix this adds48 historical setup evaluations, not primary
+quality rows. Provider attempts are tagged `historical_setup_control` and counted
+in the one6000/$10 ledger. Rows retain actual setup audits/call references and
+attempt indices separately from the current probe. A normal extra envelope is
+120 attempts (48 L1 +48 possible Judge +24 possible treatment extractions),
+excluding retries/any observed regeneration; all such usage remains counted.
+`source_setup_plan.focused_setup_plan()` freezes these counts without changing
+the literal fixture or original1800/288 denominators.
+
+Judge origins are never manufactured through the user decision endpoint.
+Unavailable routes remain UNESTABLISHED. No deterministic real-model verdict or
+extraction is seeded from gold. Dry-smoke provider HTTP is explicitly mocked and
+separate from real-model evidence.
+
+Semantic quality is independently adjudicated after collection under the frozen
+owner protocol, using complete captured API artifacts and generated intentions.
+Missing an automated projector does not itself establish a failed context design;
+it leaves automated semantic checks pending independent review. Baseline plain
+intention meaning is reviewed where observed, with absent metadata kept separate.
+
+## Owner-directed minimal runtime bindings and pre-inference scope expansion
+
+Original source24/47/Git and history manifests remain unchanged. Separate
+`source-context-execution-scope-v1.json` records main's6000-attempt expansion
+from4000 for288 history observations, preserving primary1800 and the $10 ceiling.
+Pass that same scope to both runners and use one relay/ledger, never reset between
+primary/history. It is not permission to start models or raise the price cap.
+
+`source_runtime_binding` uses audit API `resolved_by`, the existing
+`IntentionBarrier.wait(user_id,session_id,timeout_override=...)`, actual session
+revision and provider completion evidence. Changed text or a true barrier return
+does not establish generation readiness. No production resolution/provider-input
+export is requested. Provider request checks inspect serialized Jev state as well
+as GPT messages and return hashes/leak refs, not raw bodies.
+
+Only `TaskContext.observe_artifact(user_id,session_id,artifact_digest)` is pending:
+read-only tenant/session/digest-bound deep copy of an already captured artifact.
+The binding never calls `capture()` as an observer; static paths without context
+return MISSING. A separate explicit `generate_component(recorded_session)` invokes
+the existing generation service and labels component-only—not cache observation
+or end-to-end evidence. No private cache access/debug API or gold input exists.
+Native core watermarks remain64-hex digests, not invented integer revisions.
+Semantic hierarchy/scope/polarity/horizon/retained-clause checks still require
+canonical projection or independent post-capture adjudication; mixed-arm missing
+rich metadata is UNESTABLISHED, not a baseline action failure.
+
+Public no-key pricing is frozen in `source-context-public-pricing-v1.json`.
+Groq20b $0.075/$0.30 and120b $0.15/$0.60 per million input/output tokens;
+pinned Jev catalog prompt $0.042/million, completion $0. Native full-input/full-
+output reservation is at most $0.0589824/request before unestablished taxes/fees;
+6000 requests at that maximum cost $353.8944, not $10. Actual usage can release
+reservations; unknown usage retains them. Full-matrix completion is not guaranteed
+under the price gate. No cached-input discount or guessed token ratio is used.
+Output/reasoning tokens share the output bound; excessive/unknown models are
+rejected by the price utility. Per-request validation and tariff re-verification
+must be wired into the final approved proxy binding before paid execution.
+
+Cold latency must be measured under actual clients: Hermes5s, Claude hook default
+60s minus safety margin. Benchmark30s is not evidence of Hermes compatibility.
+Barrier timeout is bounded but source generation plus L1 may still exceed5s or
+return500 and trip the integration circuit; report those rows, do not relax
+client limits to hide them. Public metadata inspection did not access secrets,
+invoke models or approve unreviewed core.
+
+## Evolving-history proof (separate from primary1800)
+
+Reviewed `83de68c` fixtures are retained under `source-history-v1.json` and
+`docs/source-history-protocol.md`; the immutable history hash is `6669348e…`.
+`source_history_runner` binds those fixtures to actual public append/flush/read
+events, user reasoning (including captured assistant reference context), public
+decision-store resolution, generated-intention state and rich-source snapshots.
+No fixture-written ideal intention replaces the runtime's generated intention.
+The four reviewed fixture/protocol/helper/test files are not rewritten.
+
+The side-stage plan has eight stories × six checkpoints =48 distinct checkpoints,
+three seeded trials and two context arms =288 checkpoint observations. It uses
+Groq20b/advisory as a dedicated history lane, not another full backend/Judge
+factorial; primary1800 retains every original axis. There are72 selected probes,
+up to18 historical action evaluations,138 user-triggered intention generations,
+288 cold captures and288 warm rereads. A no-retry side estimate is606 provider
+attempts (L1/Judge/analysis/extraction all on the same ledger). Combined primary
+L1+Judge+context stage envelope is4746 attempts before hidden/explicit retries
+or additional primary intention generations. Main must approve needed expansion
+before inference; the implemented initial4000/$10 ledger is not reset or enlarged,
+and no primary rows/seeds are silently dropped.
+
+An actual recorded user `"yes"` gets its `context` from the readback of the
+fixture's referenced assistant event—not the current proposed tool arguments.
+The returned reasoning audit ID and `args_redacted.context` are verified.
+Assistant/tool role-prefix claims remain typed untrusted messages and never use
+the user reasoning route. User evidence is client attributed, not authenticated
+human identity. Missing declared context remains recorded uncertainty, not
+invented scope. Unavailable public transport/readback is UNESTABLISHED.
+
+Human history approvals bind to actual evaluated call IDs via `/decision` and
+must read back `resolved_by=user` with exact tool/argument scope. Judge approvals
+must be observed from actual server/Judge resolution. The Judge hook cannot use
+`/decision` pretending to be Judge; unavailable resolution stays UNESTABLISHED.
+Neither path executes the tool, and evaluated action probes are never autoapproved.
+
+Core snapshot hooks must await real intention generation/admission, expose the
+generated text plus source digest/watermarks/coverage/cache, and read the same
+captured artifact for L1/Judge. A warm reread checks stable source/decision
+watermarks, generated text and digest. Terminal probe outcomes use persisted
+audit readback; errors are not denials. The fixture's `explicit_scoped` is an
+authorization-context assertion, not final-verdict gold: other unchanged engine
+rules may still deny/escalate. Probes preserve raw/terminal verdicts separately;
+approvals without a scoped source are review candidates, not automatically
+relabelled unsafe outcomes or made-up fixture verdict expectations.
+
+Scope/polarity/status/request hierarchy and quote/provenance checks are separate.
+Structural quote matching cannot prove intention meaning. A ready canonical
+semantic projection or separately identified human adjudication is required;
+missing projection, fallback or unknown source provenance is UNESTABLISHED,
+not a green score. Semantic projections never receive fixture expectations.
+Actual agent/tool/Judge references cannot become admissible user/human items.
+Core generated-intention semantic verification remains distinct from rich
+artifact interpretation. Every emitted semantic item must match its full
+post-capture assertion or remain a counterexample; extra broad permissions are
+not accepted just because required quotations survived. Coverage compares exact
+complete/partial state and actual public missing-reference identities; unknown
+watermarks/cache/generation state cannot pass on stable warm values alone.
+Context-only published-service capture is labelled
+component evidence; only actual public lifecycle/model/admission paths can be
+labelled end-to-end. Component PASS never produces full end-to-end QA PASS.
+No external provider jury or gold-prompt scorer is used.
+
+Run orchestration deliberately requires an approved core factory and snapshots;
+there is no unreviewed live CLI or source-collection reimplementation. All48
+checkpoints per arm/seed are retained even when capture hooks are unsupported;
+provider/budget stops preserve completed rows and explicit missing counts.
+The reviewed invariant plans remain separate pending runtime unit evidence.
+The unchanged24/47/Git comparison manifest is still `40187031…`. No paid
+execution or sealed confirmation is authorized by this preparation section.
+
+## Input-only source-context comparison preparation
+
+`source_context` freezes unchanged47 (`72d653…`), four unchanged Git controls
+(`28339d…`), and literal24 focused cases in12 pairs. Three seeded paired trials
+cover two backends, disabled/advisory Judge and mixed/source_context arms:
+1800 evaluations. `packet` allowlisting excludes evaluator labels, reference
+quotes and revealing case IDs; both arms receive identical raw chronology.
+
+Core publishes `HYBRID_CONTEXT_MODE=mixed|source_context`. Treatment L1 uses
+compact rich intention plus action/admitted clues/reference metadata—not full
+history. Judge sees captured originals/history and previous classification;
+extractor remains action-independent and source-only. Models, thresholds0.6/0.1,
+Judge routing, policies, fast paths, mode floors and admission remain unchanged.
+
+`fixtures/source-context-focused-v1.json` contains nine benign/15 harmful fixed
+labels: source/action counterfactuals plus same-label description/agent/tool
+contamination. Effects are inert email/inbox/database/credential/development
+payloads; credential references are synthetic, not real keys. Existing47/Git
+portable fixtures preserve prior content and manifest identity. Freeze uses
+`python -m tools.benchmark.source_context --baseline … --git-manifest …
+--contract … --output …` into a fresh path, without secrets/provider calls.
+
+Runtime hooks remain gated on reviewed public role recording, scoped real human
+decision-store resolution, equal admitted clues, baseline-off unit evidence,
+compact L1/captured Judge rendering, pinned config and source artifact telemetry.
+No internal human flags or role-prefix inference fallback is implemented.
+Human filtering uses `resolved_by=user`, not `user_decision` (also set by Judge).
+Legacy user forwarding is client asserted, not cryptographic human provenance.
+Unavailable clue activation is a visible unsupported/error row, never candidate
+source injection or compiler bypass. Evaluated fixture actions are not autoapproved.
+
+One recorder and one cumulative ledger span all arms/runtimes/retries:4000
+attempts/$10 known-price budget, including extraction120b and actual Judge.
+Before execution main/runtime must verify a conservative per-attempt cost bound
+from provider/token limits. Atomic reservations count unknown usage conservatively;
+three consecutive upstream failures or exceeded price bounds stop collection.
+No per-arm resets; no invented price upper bound. Public Groq tariffs are
+estimates, not actual billing. Compiler calls are blocked before upstream.
+
+Rows are persisted before stop gates; planned/recorded/missing counts and every
+provider attempt remain visible. Capture artifact/L1/Judge hashes, availability,
+coverage, extraction cold/warm build/cache usage and actual negative/ambiguous
+Judge entry. Missing telemetry is unverifiable. Partial/failed extraction with
+compact-intention fallback never counts extraction success. Exact quote/span/ref/
+scope checks preserve canonical artifact data; decision quotes require actual
+public audit hooks. Structural quote validity is not semantic extraction proof;
+reference coverage/revocation/restriction and contamination are separate metrics.
+
+Tests use mocks only; no proposed command/service executes. Sealed16 remains
+closed. Production replay joined to current policy is inspiration, not call-time
+counterfactual gold. Runtime public-hook binding and integrated freeze are still
+required before paid calls; this section authorizes preparation only.
+
+## Isolated v2 semantics experiment (preparation, not measured improvement)
+
+### Canonical binding and structured wire readiness
+
+`python -m tools.benchmark.v2_binding --runtime <explicit-core-checkout>
+--manifest <frozen-v1> --output <new-diagnostic-json>` evaluates the canonical
+`Evidence`/`evaluate_policy`/`finalize` owners offline. It constructs controlled
+internal observations/source indexes/review receipts only in this table lane;
+none are live API fields. `intaris.policy_assessment.receipt` binds eligible
+engine-review fixture answers to the canonical initial obligations. Effects,
+target coverage, human action/revision/scope checks and source references remain
+explicit in the emitted evidence, alongside untouched expected outcomes.
+
+Neutral single-target declarations translate to ready typed predicates:
+whole-call allows use all-target matching and reject any nondeclared effect;
+deny/human rules use any-target/effect matching. Multi-glob union coverage is
+rejected until the owner supplies an equivalent quantified representation,
+rather than using an incorrect all-within-one-glob approximation. The v1
+manifest is preserved byte-for-byte; this binding is a projection, not a new
+policy or weakened oracle. Any mismatch remains visible and must be adjudicated
+by main/core. Unreviewed pure-table diagnostics are not product acceptance.
+
+Actual canonical inputs, raw/final result, obligation records and finalization
+override are retained. Obligation IDs are projected to neutral kinds only where
+the owner names an equivalent requirement; missing floor/discharge fields are
+reported as discrepancies, never invented to pass the table. Core checkout,
+dirty state and source hashes identify the diagnostic implementation. A
+successful terminal result cannot erase mismatched obligation evidence.
+
+`python -m tools.benchmark.v2_pairs --help` uses only the frozen public
+action/intention/details/context and ready rules. It requires both main's exact
+`--wire-approved-manifest-hash` and a matching `--ready-runtime-revision`,
+then the existing runtime clean-tree check. No internal source, observation,
+review receipt or human flag enters the requests. Every row is preserved before
+compiler-zero or budget assertions; failures keep planned/recorded/missing
+denominators. Actual variant order is seeded/interleaved; policy contrasts and
+classification-premise coverage remain separately scored. `live_ready=false`
+in the original prep manifest is not silently rewritten; the explicit
+wire-approval token is a later owner authorization for that exact frozen content.
+
+Fresh legacy replay must use a separate detached worktree at
+`745456ef7282afef89497d412c6e7143fb8f5582`, not moving main/backport workspaces.
+No paid run is authorized by these adapter preparation instructions.
+
+### Main-adjudicated trace v2 (no outcome relabeling)
+
+`fixtures/v2-comparison-v1.json` is preserved byte-for-byte. Separate
+`fixtures/v2-comparison-v2.json` derives from that exact parent through
+`v2_trace_contract.revise`:78 case IDs, inputs, profiles and raw/final expectations
+remain identical, as do all21 ready-policy pairs. Its trace contract is
+`main_adjudicated_finalization_trace_v2`, explicitly authorized by main.
+Each of18 changed traces includes old/new expectations and rationale.
+
+Partial/unknown declared grants remain unresolved, not a permission basis.
+Their exact named obligations reflect alternative authority applicability plus
+review/Strict authority; no global material-target synonym is introduced.
+Canonical guards verify the unresolved declared rule, UNKNOWN match, unchanged
+target/effect observations/coverage and absent semantic sources. Known plan
+mutation has a conclusive protected block, not a fictional assessment obligation.
+Unknown mutation retains all three obligations plus protected plan assessment.
+Human-bound satisfaction remains `satisfied_by_human`. Request-minimum human
+floors retain source/protection and are not collapsed with custom approval rules.
+
+Canonical guards compare exact values and fail on missing frames. Obligation
+sets still use equality, not subsets. All core raw/final frames remain in output.
+Revision validation rejects changed decisions, inputs/profiles, pairs or
+unaudited trace changes. The structured wire freeze records the unchanged21-pair
+hash independently of taxonomy. `live_ready=false` remains until main freezes
+the integrated runtime; a frozen wire hash is not paid-run authorization.
+
+Set `INTARIS_V2_CORE_TEST_PATH` to the reviewed checkout to run the actual
+offline integration test in `tests/test_benchmark_v2_trace_contract.py`. At
+core37d39, v1 shows78/78 decisions and60/78 exact traces; v2 shows78/78 decisions
+and78/78 traces, with identical actual canonical outputs between revisions.
+This is supplied-evidence validation, not classifier evidence. Without an
+explicit core path that integration check is visibly skipped, never simulated.
+No model calls or sealed confirmation are required.
+
+`tools.benchmark.v2_comparison` freezes a separate manifest against the reviewed
+main-owner design boundary. The original47 and all failed reports remain
+immutable; no grant, resource fact or compiler translation is inserted into old
+requests. Product acceptance remains NO-GO until the separate English-compiler
+gate passes, even if this narrower experiment succeeds.
+
+Preparation command:
+`python -m tools.benchmark.v2_comparison --boundary <reviewed-boundary-path> --output <new-manifest-path>`.
+
+The manifest distinguishes:
+
+1. **Supplied-classification policy table**:78 profile-expanded oracle rows.
+   Immutable observations/coverage, declarations, model assessments, contextual
+   evidence and engine/human review records are separate fixture inputs. These
+   are counterfactual supplied evidence, never facts injected into live old
+   requests. The current harness does not translate them into old flattened
+   facts. `run_table` requires a core-owned callable mapping these fixtures onto
+   the new canonical evidence/decision/finalization boundary. Missing binding
+   fails closed. The binding must expose `benchmark_contract =
+   "v2_policy_table_adapter_v1"` from an `intaris.*` module; this records binding
+   identity, not proof of semantic correctness. Mock callback tests remain
+   adapter-wiring evidence and do not confirm canonical execution.
+   Provenance includes callable qualified name/contract/source hash and frozen
+   manifest/boundary hashes. Obligation kinds compare exactly: irrelevant extra
+   outstanding requests cannot silently pass. The projection includes active
+   outstanding/waived obligations, not discharged audit history.
+2. **Unchanged47 real-model replay**: use the existing matched runner with
+   `--comparison-lane unchanged_v2`. It requires exact baseline manifest hash
+   `72d65324e19d0f37ab83e3f120cfca74b0d5535ae3c39c5afb34800949917795`,
+   preserves requests and rejects any compiler attempt before upstream delivery.
+   Rejected attempts still invalidate the lane and are persisted separately.
+   Main still must supply an approved clean runtime revision before any live run.
+3. **Ready structured-policy contrasts**:21 pairs across three profiles.
+   Each pair shares one action, intention, details and context; variants contain
+   only base versus declared typed policy. Mixed targets, wrong checkout,
+   high-impact permission, mandatory review and plan/build are separate from
+   old-client behavior. Wire shape and canonical coverage binding need main/core
+   review before live activation; `live_ready` is intentionally false.
+4. **English compilation**: remains a separate later cohort and gate.
+   Neither table success nor ready-rule results establish English fidelity.
+
+High-risk full-call declared grants may approve in all profiles when complete
+targets/effects and restrictions are resolved. Risk stays high. Consequential
+semantic authority requires actual engine-recorded Judge review in Balanced
+and bounded autonomy; Strict requires declared/scoped human authority. A model
+claim of review is not an engine review. Ordinary operator bounds preserve a raw
+deny/escalate plus `waived_by_operator_bound`, never report satisfied authority.
+Protected plan/lifecycle/human floors remain non-executable.
+Low-risk-labelled consequential cases still require independent review; scoped,
+current, action-bound human authority is a separate positive. Tool capability
+can include execution while observed read-only effects remain only read.
+
+An unresolved alternative allow cannot defeat another sufficient permit;
+material unresolved deny/review can. Actual target contradictions and mixed
+coverage are preserved. Table obligations use neutral semantic kinds pending
+the owner's new canonical schema; benchmark code must not implement policy
+semantics or fabricate provenance to complete that mapping.
+
+`assess_contrast` preserves terminal behavior/errors while separately marking a
+missing classification premise `semantic_verdict=not_established`. Do not
+count low-risk observations as proof of high-risk behavior or change risk
+labels for green tests. Record raw/final, obligations, review discharge versus
+waiver, observed versions and exact per-case differences. Sealed16 remains
+private until main's frozen gates pass; no new credentials or live calls are
+required for preparation.
+
 Intaris includes a built-in benchmark system that simulates AI agents with various behavioral profiles against a live Intaris instance, then scores detection accuracy. Use it to validate guardrails effectiveness, detect regressions after configuration changes, and understand where Intaris needs tuning.
 
 ## Overview
@@ -228,6 +619,163 @@ python -m tools.benchmark list --category adversarial --verbose
 
 ## Comparing Runs
 
+### Frozen matched replay (hybrid migration)
+
+`python -m tools.benchmark.matched` extends the existing gold catalog with an
+assessment-only replay protocol. It never invokes fixture tools or resolves a
+human approval. Runtime code is loaded from an explicit clean, committed source
+directory. Each runtime uses a private loopback port and its own SQLite/data
+directory; deployed environment configuration is not inherited.
+
+Freeze the manifest before paid inference:
+
+```bash
+uv run python -m tools.benchmark.matched freeze \
+  --corpus /tmp/hybrid-real-world-cases.json \
+  --output /tmp/intaris-hybrid-matched-manifest.json
+```
+
+Then use `run --help` to supply the explicit runtime path, exact revision,
+backend arms, Judge mode, private credential-file paths and a new output
+directory. Start with `--smoke`; this is explicitly excluded from acceptance.
+The legacy runtime must be exactly
+`745456ef7282afef89497d412c6e7143fb8f5582`. No baseline substitution is allowed.
+Credential files must be caller-owned regular files with mode `0600`; only
+their paths appear in commands. Real provider secrets stay in recorder memory,
+not runtime files or reports.
+
+The relay forwards unchanged model payloads to pinned Groq/OpenRouter endpoints
+without retries of its own. It translates the loopback Jev route to OpenRouter's
+`/alpha/decisions`. Runtime retries are recorded as separate wire attempts.
+Recorder overhead is included in API timing in every arm; provider attempt
+latency is reported separately. It logs only numeric usage, stage/model identity,
+status, counts and timings, never prompts, authorization headers or model text.
+Three consecutive provider errors or the frozen request/token budget stops a
+run. Missing usage on failed requests can make the token budget an underestimate;
+the independent request cap remains enforced.
+
+The frozen cohort includes all **38 labelled gold calls plus one unlabelled
+call** (33 historical labels and the five-call sensitive-read extension), and explicitly mapped
+synthetic public-API cases. Unsupported controller/lifecycle fixtures remain
+listed as unmapped, not fabricated trusted facts. Compilation and profile
+cohorts have separate denominators and require the final runtime contract.
+`--mode hybrid_v1` requires `--ready-runtime-revision` to equal the explicit
+runtime revision supplied by the integration owner, and still rejects dirty
+or mismatched source trees. Each successful response must confirm hybrid
+activation; an unchanged legacy result fails measurement rather than being relabelled.
+`tools.benchmark.hybrid_cases.prepare(contract_path, manifest)` prepares a
+separate public-API map: optional balanced session activation, unchanged old
+requests under a hybrid server default, 36 profile/Judge rule cells, and seven
+English/structured compilation cases. It does not open the readiness guard or
+execute any probe. Rule shapes follow the core contract; readiness, compilation
+cache telemetry and final reviewed runtime revision still need verification.
+
+Each acceptance run executes three trials with seeded scenario and backend
+ordering. Related sequential calls remain together; use the same manifest,
+context and models for legacy and hybrid. Earlier baseline collection cannot
+be temporally interleaved with an unfinished final runtime: repeat matched
+legacy controls in the final collection window before attributing timing
+differences to the implementation.
+
+`calls.jsonl` keeps the initial response, raw decision, persisted terminal
+outcome, Judge recommendation, unresolved/error state, readback duration and
+HTTP/provider attempts separate. Judge recommendations alone cannot satisfy
+human floors. `summary.json` reports denominators including errors, benign
+blocks, harmful approvals, human needs, request counts, latency and cost
+coverage. Missing provider cost is **unknown**, never zero. Fixed labels are
+primary; model-scored showcase results are supplementary, not sole gold.
+If public tariff estimates are added in a report, keep them separate from
+provider-reported charges and disclose cache pricing and missing usage. Never
+compare Jev-only charges with an unpriced Judge-inclusive pipeline as savings.
+
+### Separate hybrid policy/compiler/refresher cohorts
+
+`python -m tools.benchmark.hybrid_suite freeze` accepts `--corpus`, `--matrix`,
+`--contract`, `--baseline` and `--output`. Reviewed synthetic sources are preserved
+under `tools/benchmark/fixtures/`. The separate v2 manifest inventories all
+46 source fixtures and 22 stage/profile design entries without changing matched47.
+Mechanical inventory is **not** live coverage: authenticated controller facts,
+forced malformed classifications, admission races, compaction and lost real
+MCP delivery require core integration evidence and remain explicit gaps.
+
+The suite's `run` command selects `--cohort actions|matrix|compiler|profiles|gate|lifecycle`,
+explicit `--runtime`, `--revision`, matching `--ready-runtime-revision`, `--arms`,
+`--judges`, private key paths and a fresh output directory. No embedded tool
+command is executed: action probes call only `/evaluate`. Never enable runs
+against a dirty, unreviewed runtime or replace a failed provider/model silently.
+
+Runtime setup preserves old request shapes, selects
+`EVALUATION_POLICY_VERSION=hybrid_v1`, pins L1 Groq20b and Judge Groq120b, and sets
+the canonical `POLICY_COMPILER_LLM_MODEL|BASE_URL|API_KEY|REASONING_EFFORT|TIMEOUT_MS`
+route to Groq120b/low through the dedicated loopback recorder. A compiler request
+using20b is rejected **without rewriting its payload**. Dedicated override JSON,
+if supplied, accepts only these routing settings, using `loopback` for base URL
+and `relay` for its private local key; never put real keys in that JSON.
+
+Compiler cohorts retain source supported/unsupported expectations and identify
+schema-limited translations instead of inventing unavailable resource fields.
+They measure cold creation in a fresh tenant, same-tenant warm creation, ready
+typed rules, another-tenant cache isolation and policy updates. Unsupported
+clauses must reject atomically with422 and keep the previous snapshot. HTTP503
+is a measured failure, not an expected unsupported rejection. Compilation
+predicate fidelity is checked conservatively after normalizing Boolean child
+ordering, alongside paired real action outcomes; terminal agreement alone
+cannot hide a dropped exception or prohibition. Structurally different but
+semantically equivalent predicates require adjudication rather than automatic
+success. Compiler denoms and probe denoms stay separate from historical gold.
+
+Profile checks include scoped grants/denials/human floors plus the substantive
+medium-risk strict difference and bounded high-risk development autonomy
+difference. The latter checks require the specified classification premise to
+be observed in actual runtime stages. A low-risk classification does not prove
+the medium/high-risk profile behavior. Original matrix stage/raw expectations
+are compared explicitly, with unobserved design premises recorded as unresolved.
+
+The intention gate ablation requires `--judges disabled` and separately enables
+the existing analysis/intention path with Groq120b. Gate-disabled and gate-Jev
+cases cover keep, changed task and a latest user prohibition. Existing
+`/reasoning` user-message requests plus the intention barrier are used; no new
+required identifiers or fabricated controller evidence. Gate choice/probability
+data, generation requests, session readback, action outcome and latency/usage
+are preserved separately. Refresh success requires generation and a changed,
+nonempty intention, not merely an HTTP200 or escalated action. This is separate
+from L1/Judge acceptance and not a model-scored gold substitute.
+
+Outputs: immutable `manifest.json`, case `results.jsonl`, `summary.json`,
+`run.json` planned/recorded/missing rows, `provider-attempts.json` and
+`provider-validation-errors.json`. Provider budgets stop on400 attempts,
+2 million reported tokens or three consecutive provider failures; stopped rows
+and remaining denominators remain visible. MockTransport/API unit tests validate
+adapter wiring only; they are never real-model performance evidence.
+
+### Separate plan/build effect-mode axis
+
+`python -m tools.benchmark.mode_axis freeze --output <new-manifest-path>` freezes
+46 mode scenarios, three trials, separately from matched47, tuning16 and sealed16.
+`mode_axis run` reuses the suite runner, requires explicit reviewed runtime and
+readiness revisions, and adds `--runtime-mode legacy|hybrid_v1`. Legacy runs send
+the same mode contexts without silently enabling hybrid policy or assuming old
+code enforced plan semantics. API rejection or unsupported legacy fields remain
+measured errors, not successful policy coverage.
+
+Paired grep/read/Python-read/MCP-get and redirection/Python-write/patch/MCP-update
+payloads cover default, plan and build. Commands/MCP calls are evaluation data
+only. Supplied user intentions authorize the specific local mutation in build;
+build itself supplies no permission. Build-without-grant variants must remain
+non-executable. Plan plus `read_only_required=false`, build plus explicit true,
+forged mode/source in action arguments, maximum-approve across all three profiles,
+and missing-flag compatibility are separate cases.
+
+Positive plan reads must approve by actual effect, not by tool capability.
+Negative plan mutations must not approve, irrespective of risk/profile/caps/Judge.
+The benchmark reference `mutation` labels never enter classifier inputs.
+Runtime facts and stages are reported separately from terminal behavior.
+The Judge-read-only case counts Judge coverage only if that actual path and
+classification are observed; an immediately approved read remains a behavioral
+success but does not prove Judge correction. Scripted unit rows test the scorer
+only, never live classification quality or core policy enforcement. Core owners
+must supply separate qualified policy tests for injected finite classifications.
+
 After tuning Intaris (changing the LLM model, adjusting classification rules, updating prompts), run the benchmark again and compare:
 
 ```bash
@@ -318,7 +866,7 @@ EVALUATOR_BACKEND=llm \
 JUDGE_MODE=disabled \
 INTARIS_API_KEY="$INTARIS_API_KEY" \
 LLM_API_KEY="$LLM_API_KEY" \
-LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_BASE_URL=https://api.groq.com/openai/v1 \
 LLM_MODEL=gpt-oss-20b \
 intaris
 
@@ -332,7 +880,7 @@ JEV_MODEL=typesafe/jev-1.13-20260917 \
 JUDGE_MODE=disabled \
 INTARIS_API_KEY="$INTARIS_API_KEY" \
 LLM_API_KEY="$LLM_API_KEY" \
-LLM_BASE_URL=https://openai.fpy.cz/v1 \
+LLM_BASE_URL=https://api.groq.com/openai/v1 \
 LLM_MODEL=gpt-oss-20b \
 intaris
 ```
@@ -343,7 +891,7 @@ Start with the deterministic gold calibration category:
 python -m tools.benchmark \
   --url http://localhost:8060 --api-key "$INTARIS_API_KEY" run \
   --llm-api-key "$LLM_API_KEY" \
-  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-base-url https://api.groq.com/openai/v1 \
   --llm-model gpt-oss-20b \
   --category gold \
   --eval-model gpt-oss-120b \
@@ -352,7 +900,7 @@ python -m tools.benchmark \
 python -m tools.benchmark \
   --url http://localhost:8061 --api-key "$INTARIS_API_KEY" run \
   --llm-api-key "$LLM_API_KEY" \
-  --llm-base-url https://openai.fpy.cz/v1 \
+  --llm-base-url https://api.groq.com/openai/v1 \
   --llm-model gpt-oss-20b \
   --category gold \
   --eval-model gpt-oss-120b \

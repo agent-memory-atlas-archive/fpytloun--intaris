@@ -137,6 +137,7 @@ class TaskQueue:
         agent_id: str | None = None,
         payload: dict[str, Any] | None = None,
         priority: int = 0,
+        next_attempt_at: str | None = None,
     ) -> str:
         """Insert a new task into the queue.
 
@@ -162,7 +163,7 @@ class TaskQueue:
             payload=payload,
         )
 
-        with self._db.cursor() as cur:
+        with self._db.cursor(notify_analysis=True) as cur:
             cur.execute(
                 """
                 INSERT INTO analysis_tasks
@@ -179,7 +180,7 @@ class TaskQueue:
                     task_agent_id,
                     priority,
                     json.dumps(payload) if payload else None,
-                    now,
+                    next_attempt_at or now,
                     now,
                 ),
             )
@@ -205,7 +206,7 @@ class TaskQueue:
         task_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         payload = json.dumps({"trigger": "bootstrap"})
-        with self._db.cursor() as cur:
+        with self._db.cursor(notify_analysis=True) as cur:
             cur.execute(
                 """
                 INSERT INTO analysis_tasks
@@ -307,6 +308,7 @@ class TaskQueue:
                 SET status = 'running',
                     started_at = ?,
                     heartbeat_at = ?,
+                    claim_token = ?,
                     completed_at = NULL
                 WHERE id = (
                     SELECT id FROM analysis_tasks AS t
@@ -333,7 +335,7 @@ class TaskQueue:
                   AND status = 'pending'
                 RETURNING *
                 """,
-                (now, now, now, now),
+                (now, now, str(uuid.uuid4()), now, now),
             )
             row = cur.fetchone()
 
@@ -341,7 +343,9 @@ class TaskQueue:
             return None
         return _task_row_to_dict(row)
 
-    def complete(self, task_id: str, result: dict[str, Any] | None = None) -> None:
+    def complete(
+        self, task_id: str, result: dict[str, Any] | None = None, *, claim_token: str
+    ) -> bool:
         """Mark a task as completed.
 
         Args:
@@ -349,7 +353,7 @@ class TaskQueue:
             result: Optional result data.
         """
         now = datetime.now(timezone.utc).isoformat()
-        with self._db.cursor() as cur:
+        with self._db.cursor(notify_analysis=True) as cur:
             cur.execute(
                 """
                 UPDATE analysis_tasks
@@ -357,12 +361,19 @@ class TaskQueue:
                     result = ?,
                     completed_at = ?,
                     heartbeat_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running' AND claim_token = ?
                 """,
-                (json.dumps(result) if result else None, now, now, task_id),
+                (
+                    json.dumps(result) if result else None,
+                    now,
+                    now,
+                    task_id,
+                    claim_token,
+                ),
             )
+            return cur.rowcount == 1
 
-    def touch_heartbeat(self, task_id: str) -> bool:
+    def touch_heartbeat(self, task_id: str, *, claim_token: str) -> bool:
         """Update the heartbeat timestamp for a running task."""
         now = datetime.now(timezone.utc).isoformat()
         with self._db.cursor() as cur:
@@ -370,13 +381,13 @@ class TaskQueue:
                 """
                 UPDATE analysis_tasks
                 SET heartbeat_at = ?
-                WHERE id = ? AND status = 'running'
+                WHERE id = ? AND status = 'running' AND claim_token = ?
                 """,
-                (now, task_id),
+                (now, task_id, claim_token),
             )
             return cur.rowcount > 0
 
-    def fail(self, task_id: str, error: str) -> None:
+    def fail(self, task_id: str, error: str, *, claim_token: str) -> bool:
         """Record a task failure with retry logic.
 
         Increments retry_count. If max_retries exceeded, marks as failed.
@@ -388,15 +399,16 @@ class TaskQueue:
         """
         now = datetime.now(timezone.utc)
 
-        with self._db.cursor() as cur:
+        with self._db.cursor(notify_analysis=True) as cur:
             # Get current retry state
             cur.execute(
-                "SELECT retry_count, max_retries FROM analysis_tasks WHERE id = ?",
-                (task_id,),
+                "SELECT retry_count, max_retries FROM analysis_tasks "
+                "WHERE id = ? AND status = 'running' AND claim_token = ?",
+                (task_id, claim_token),
             )
             row = cur.fetchone()
             if row is None:
-                return
+                return False
 
             retry_count = row[0] + 1
             max_retries = row[1]
@@ -411,7 +423,7 @@ class TaskQueue:
                         result = ?,
                         completed_at = ?,
                         heartbeat_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
                     """,
                     (
                         retry_count,
@@ -419,6 +431,7 @@ class TaskQueue:
                         now.isoformat(),
                         now.isoformat(),
                         task_id,
+                        claim_token,
                     ),
                 )
                 logger.warning(
@@ -442,14 +455,16 @@ class TaskQueue:
                         next_attempt_at = ?,
                         started_at = NULL,
                         heartbeat_at = NULL,
+                        claim_token = NULL,
                         completed_at = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
                     """,
                     (
                         retry_count,
                         json.dumps({"error": error}),
                         next_attempt.isoformat(),
                         task_id,
+                        claim_token,
                     ),
                 )
                 logger.info(
@@ -460,89 +475,85 @@ class TaskQueue:
                     backoff_seconds,
                     error[:200],
                 )
+            return cur.rowcount == 1
 
-    def reset_stale_running(self, max_age_minutes: int = 0) -> int:
+    def reset_stale_running(self, max_age_minutes: int = 10) -> int:
         """Reset tasks stuck in 'running' state back to 'pending'.
 
-        Called on startup (max_age_minutes=0 resets all) and periodically
-        by the worker loop (max_age_minutes>0 resets only tasks stuck
-        longer than the threshold).
+        Startup and periodic recovery use the same positive stale age.
+        The conditional UPDATE arbitrates heartbeat/reclaim races and
+        revokes ownership before another worker can claim.
 
         Args:
             max_age_minutes: Only reset tasks whose heartbeat (or initial
                 started_at fallback) is older than this many minutes.
-                0 = reset all running tasks (startup behavior).
+                Must be positive, including on startup.
 
         Returns:
             Number of tasks reset.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        if max_age_minutes > 0:
-            cutoff = (
-                datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
-            ).isoformat()
-            with self._db.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, task_type, user_id, session_id, retry_count,
-                           started_at, heartbeat_at
-                    FROM analysis_tasks
-                    WHERE status = 'running'
-                      AND COALESCE(heartbeat_at, started_at, next_attempt_at) < ?
-                    ORDER BY COALESCE(heartbeat_at, started_at, next_attempt_at) ASC
-                    LIMIT 5
-                    """,
-                    (cutoff,),
-                )
-                sample_rows = [dict(row) for row in cur.fetchall()]
-                cur.execute(
-                    """
-                    UPDATE analysis_tasks
-                    SET status = 'pending',
-                        next_attempt_at = ?,
-                        started_at = NULL,
-                        heartbeat_at = NULL,
-                        completed_at = NULL
-                    WHERE status = 'running'
-                      AND COALESCE(heartbeat_at, started_at, next_attempt_at) < ?
-                    """,
-                    (now, cutoff),
-                )
-                count = cur.rowcount
-        else:
-            with self._db.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, task_type, user_id, session_id, retry_count,
-                           started_at, heartbeat_at
-                    FROM analysis_tasks
-                    WHERE status = 'running'
-                    ORDER BY COALESCE(heartbeat_at, started_at, next_attempt_at) ASC
-                    LIMIT 5
-                    """
-                )
-                sample_rows = [dict(row) for row in cur.fetchall()]
-                cur.execute(
-                    """
-                    UPDATE analysis_tasks
-                    SET status = 'pending',
-                        next_attempt_at = ?,
-                        started_at = NULL,
-                        heartbeat_at = NULL,
-                        completed_at = NULL
-                    WHERE status = 'running'
-                    """,
-                    (now,),
-                )
-                count = cur.rowcount
+        if max_age_minutes <= 0:
+            raise ValueError("Recovery requires a positive stale age")
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(minutes=max_age_minutes)).isoformat()
+        with self._db.cursor(notify_analysis=True) as cur:
+            cur.execute(
+                """
+                UPDATE analysis_tasks
+                SET status = 'pending',
+                    next_attempt_at = ?,
+                    started_at = NULL,
+                    heartbeat_at = NULL,
+                    claim_token = NULL,
+                    completed_at = NULL
+                WHERE status = 'running'
+                  AND COALESCE(heartbeat_at, started_at, next_attempt_at) <= ?
+                """,
+                (now.isoformat(), cutoff),
+            )
+            count = cur.rowcount
         if count > 0:
             logger.warning(
-                "Reset %d stale running tasks to pending (max_age=%dm, sample=%s)",
+                "Reset %d stale running tasks to pending (max_age=%dm)",
                 count,
                 max_age_minutes,
-                sample_rows,
             )
         return count
+
+    def next_wakeup(self) -> tuple[float | None, float | None]:
+        """Read earliest eligible pending deadline and running lease expiry.
+
+        Summary blocking matches claim_next. Future summaries do not block
+        analysis until due; running summaries block until completion/recovery.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    MIN(CASE WHEN t.status = 'pending' AND NOT (
+                        t.task_type = 'analysis' AND EXISTS (
+                            SELECT 1 FROM analysis_tasks s
+                            WHERE s.task_type = 'summary'
+                              AND (s.status = 'running' OR (
+                                  s.status = 'pending' AND s.next_attempt_at <= ?))
+                              AND s.user_id = t.user_id
+                              AND COALESCE(s.agent_id, '') = COALESCE(t.agent_id, '')
+                        )
+                    ) THEN t.next_attempt_at END) AS pending_due,
+                    MIN(CASE WHEN t.status = 'running'
+                        THEN COALESCE(t.heartbeat_at, t.started_at, t.next_attempt_at)
+                    END) AS running_heartbeat
+                FROM analysis_tasks t WHERE t.status IN ('pending', 'running')
+                """,
+                (now,),
+            )
+            row = cur.fetchone()
+        due = datetime.fromisoformat(str(row[0])).timestamp() if row[0] else None
+        expiry = (
+            datetime.fromisoformat(str(row[1])).timestamp() + 600 if row[1] else None
+        )
+        return due, expiry
 
     def cancel_duplicate(
         self,
@@ -706,6 +717,9 @@ class BackgroundWorker:
         self._task_queue = task_queue or TaskQueue(db)
         self._session_store = SessionStore(db)
         self._tasks: list[asyncio.Task] = []
+        self._queue_stats_task: asyncio.Task | None = None
+        self._queue_wakeup = db.analysis_wakeup()
+        self._queue_recovered_seen = 0
         self._running = False
         self.metrics = Metrics()
         # Analyzer readiness flag — controls whether automatic summary
@@ -766,12 +780,15 @@ class BackgroundWorker:
         catchup — catchup runs in the first worker loop iteration so the
         server can accept requests immediately.
         """
+        if self._running:
+            return
         self._running = True
         self._catchup_event = asyncio.Event()
         loop_count = 0
 
         worker_count = 0
         if self._config.enabled:
+            await self._queue_wakeup.start()
             # Launch parallel worker loops (atomic claim prevents double-processing)
             worker_count = self._config.worker_count
             for i in range(worker_count):
@@ -781,6 +798,12 @@ class BackgroundWorker:
                     )
                 )
             loop_count += worker_count
+            self._tasks.append(
+                asyncio.create_task(
+                    self._resilient_loop("queue_metrics", self._queue_metrics_loop)
+                )
+            )
+            loop_count += 1
 
             # Launch idle sweeper and periodic scheduler
             self._tasks.append(
@@ -833,6 +856,31 @@ class BackgroundWorker:
             ", event_store_flusher" if self._event_store is not None else "",
         )
 
+    async def _queue_metrics_loop(self) -> None:
+        """Sample queue depth once per process, not once per idle worker."""
+        while self._running:
+            # Retain outstanding work across cancellation/restart. Python threads
+            # cannot be killed; a new sampler must join, not duplicate, this query.
+            if self._queue_stats_task is None:
+                self._queue_stats_task = asyncio.create_task(
+                    asyncio.to_thread(self._task_queue.get_queue_stats)
+                )
+            pending = self._queue_stats_task
+            try:
+                stats = await asyncio.shield(pending)
+            finally:
+                if pending.done():
+                    self._queue_stats_task = None
+            if not self._running:
+                return
+            self.metrics.task_queue_depth = stats.get("pending", 0)
+            self.metrics.last_worker_poll = self._queue_wakeup.last_check_at
+            self.metrics.stale_task_resets_total += (
+                self._queue_wakeup.recovered_total - self._queue_recovered_seen
+            )
+            self._queue_recovered_seen = self._queue_wakeup.recovered_total
+            await asyncio.sleep(10)
+
     async def stop(self) -> None:
         """Cancel all background loops.
 
@@ -851,6 +899,16 @@ class BackgroundWorker:
             except asyncio.TimeoutError:
                 logger.warning("Background tasks did not stop within 5s timeout")
         self._tasks.clear()
+        await self._queue_wakeup.stop()
+        if self._queue_stats_task is not None:
+            # Bounded shutdown wait; keep ownership if the DB is still busy.
+            await asyncio.wait({self._queue_stats_task}, timeout=5.0)
+            if self._queue_stats_task.done():
+                try:
+                    self._queue_stats_task.result()
+                except Exception:
+                    logger.exception("Queue metrics query failed during shutdown")
+                self._queue_stats_task = None
 
         # Close cached analysis LLM clients after all tasks have stopped.
         # Note: asyncio.to_thread() work may still be running if the 5s
@@ -923,27 +981,9 @@ class BackgroundWorker:
             await self._startup_catchup()
         # Workers that arrive after set() skip straight through
 
-        stale_check_counter = 0
-
         while self._running:
+            task = await self._queue_wakeup.claim(self._task_queue)
             self.metrics.last_worker_poll = datetime.now(timezone.utc).isoformat()
-
-            # Periodically reset tasks stuck in 'running' state.
-            # Every ~50 iterations (~500s / ~8 min) check for tasks
-            # that have been running for more than 10 minutes.
-            stale_check_counter += 1
-            if stale_check_counter >= 50:
-                stale_check_counter = 0
-                reset_count = self._task_queue.reset_stale_running(max_age_minutes=10)
-                self.metrics.stale_task_resets_total += reset_count
-
-            task = self._task_queue.claim_next()
-            if task is None:
-                # Update queue depth metric
-                stats = self._task_queue.get_queue_stats()
-                self.metrics.task_queue_depth = stats.get("pending", 0)
-                await asyncio.sleep(10)
-                continue
 
             task_id = task["id"]
             task_type = task["task_type"]
@@ -957,7 +997,9 @@ class BackgroundWorker:
             )
 
             start_monotonic = time.monotonic()
-            heartbeat_task = asyncio.create_task(self._task_heartbeat_loop(task_id))
+            heartbeat_task = asyncio.create_task(
+                self._task_heartbeat_loop(task_id, task["claim_token"])
+            )
 
             try:
                 if task_type == "summary":
@@ -1042,7 +1084,11 @@ class BackgroundWorker:
                 elif result.get("status") == "skipped" and "No LLM" in skip_reason:
                     raise RuntimeError(f"Task skipped (transient): {skip_reason}")
 
-                self._task_queue.complete(task_id, result)
+                if not self._task_queue.complete(
+                    task_id, result, claim_token=task["claim_token"]
+                ):
+                    logger.warning("Discarding completion of revoked claim %s", task_id)
+                    continue
                 runtime_s = time.monotonic() - start_monotonic
                 logger.info(
                     "Completed %s task %s in %.2fs (status=%s, session=%s, windows=%s, event_enriched=%s)",
@@ -1086,7 +1132,11 @@ class BackgroundWorker:
                     task.get("session_id"),
                     error_message,
                 )
-                self._task_queue.fail(task_id, error_message)
+                if not self._task_queue.fail(
+                    task_id, error_message, claim_token=task["claim_token"]
+                ):
+                    logger.warning("Discarding failure of revoked claim %s", task_id)
+                    continue
                 if task_type == "summary":
                     self.metrics.summaries_failed_total += 1
                 elif task_type == "analysis":
@@ -1111,7 +1161,7 @@ class BackgroundWorker:
                 except asyncio.CancelledError:
                     pass
 
-    async def _task_heartbeat_loop(self, task_id: str) -> None:
+    async def _task_heartbeat_loop(self, task_id: str, claim_token: str) -> None:
         """Keep a running task alive while it executes.
 
         Long analysis tasks can legitimately run for many minutes. This
@@ -1121,7 +1171,7 @@ class BackgroundWorker:
         try:
             while self._running:
                 await asyncio.sleep(60)
-                if self._task_queue.touch_heartbeat(task_id):
+                if self._task_queue.touch_heartbeat(task_id, claim_token=claim_token):
                     self.metrics.task_heartbeat_updates_total += 1
                 else:
                     return
@@ -1206,27 +1256,8 @@ class BackgroundWorker:
                 session_id=session_id,
                 payload=payload,
                 priority=2,
+                next_attempt_at=next_attempt,
             )
-
-            # Update the next_attempt_at for the newly enqueued task
-            # (the enqueue method sets it to now, but we want a delay).
-            # Use subquery for PostgreSQL compatibility (no ORDER BY in UPDATE).
-            with self._db.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE analysis_tasks
-                    SET next_attempt_at = ?
-                    WHERE id = (
-                        SELECT id FROM analysis_tasks
-                        WHERE user_id = ? AND session_id = ?
-                          AND task_type = 'summary'
-                          AND status = 'pending'
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    )
-                    """,
-                    (next_attempt, user_id, session_id),
-                )
 
             self.metrics.summary_parent_recheck_count += 1
 
@@ -1429,11 +1460,7 @@ class BackgroundWorker:
             llm_cfg = cfg.llm_l3_analysis
         else:
             llm_cfg = cfg.llm_analysis
-        client = LLMClient(
-            llm_cfg,
-            transient_retries=2,
-            max_retry_after_seconds=15.0,
-        )
+        client = LLMClient(llm_cfg)
         logger.info(
             "Created cached %s LLM client (model=%s)",
             role,
@@ -1450,6 +1477,7 @@ class BackgroundWorker:
         messages (Claude Code, MCP proxy). User-message-triggered updates
         go through the IntentionBarrier instead.
         """
+        from intaris.config import load_config
         from intaris.intention import generate_intention
 
         user_id = task.get("user_id", "")
@@ -1486,6 +1514,7 @@ class BackgroundWorker:
             session_id=session_id,
             event_bus=self._event_bus,
             intention_source=source,
+            generation=load_config().source_context_generation,
         )
 
         if intention is not None:

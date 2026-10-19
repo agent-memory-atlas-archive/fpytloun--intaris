@@ -64,6 +64,10 @@ _READ_ONLY_TOOLS: set[str] = {
     "status",
     "whoami",
     "version",
+    # Intrinsically observational controller tools, not generic service aliases.
+    "list_directory",
+    "get_current_datetime",
+    "skill_load",
     # Task management tools (metadata only, no side effects)
     "todoread",
     "todowrite",
@@ -83,6 +87,10 @@ _READ_ONLY_BASH_COMMANDS: set[str] = {
     "fd",
     "pwd",
     "echo",
+    "printf",
+    "sleep",
+    "true",
+    "false",
     "which",
     "type",
     "file",
@@ -129,6 +137,7 @@ _READ_ONLY_GIT_SUBCOMMANDS: set[str] = {
     "cat-file",
     "name-rev",
     "shortlog",
+    "merge-base",
     "blame",
 }
 
@@ -267,8 +276,14 @@ _SENSITIVE_LITERAL_BASENAMES: set[str] = {
     ".npmrc",
     ".pypirc",
     ".netrc",
+    ".pgpass",
+    ".git-credentials",
     "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
     "id_ed25519",
+    "id_ed25519_sk",
 }
 
 _BENIGN_TEMPLATE_BASENAMES: set[str] = {
@@ -284,6 +299,8 @@ _SENSITIVE_BASENAME_GLOBS: tuple[str, ...] = (
     ".npmrc",
     ".pypirc",
     ".netrc",
+    ".pgpass",
+    ".git-credentials",
     "id_rsa",
     "id_ed25519",
     "*.key",
@@ -295,6 +312,46 @@ _SENSITIVE_BASENAME_GLOBS: tuple[str, ...] = (
 )
 
 _SENSITIVE_SUFFIXES: tuple[str, ...] = (".key",)
+
+# SSH private key names (``id_rsa``, ``id_ed25519_sk``, ``id_rsa.bak``), never
+# the public ``*.pub`` half.
+_PUBLIC_PEM_RE = re.compile(
+    r"cert|crt|chain|bundle|public|(?:^|[._-])(?:pub|ca|root)(?:$|[._-])"
+)
+_SSH_PRIVATE_KEY_RE = re.compile(r"id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?:\..+)?")
+
+# Credential directories under a home directory (matched as path segments so
+# ``~/.ssh``, ``/home/u/.ssh`` and unresolved relative forms all match; the
+# directory itself counts, because grep/glob over it reads its contents).
+_SENSITIVE_HOME_DIRS: tuple[str, ...] = (
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".config/gcloud",
+    ".config/gh",
+)
+
+# Credential files matched on their trailing segments.
+_SENSITIVE_HOME_FILES: tuple[str, ...] = (".docker/config.json",)
+
+# System credential and process-environment locations, matched on segments so
+# resolved, ``..``-relative and /proc/self or /proc/<pid> forms all match.
+_SENSITIVE_SYSTEM_RE = re.compile(
+    r"(?:^|/)(?:etc/(?:g?shadow|sudoers(?:\.d(?:/.*)?)?)"
+    r"|proc/[^/]+/(?:task/[^/]+/)?(?:environ|mem))$"
+)
+
+# The same locations as shell globs, for operands such as /etc/shad* or
+# /proc/*/env* that expand to them.
+_SENSITIVE_SYSTEM_PATHS: tuple[str, ...] = (
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+    "/etc/sudoers.d/*",
+    "/proc/*/environ",
+    "/proc/*/mem",
+)
 
 _ENV_OPTIONS_WITH_SEPARATE_VALUES: set[str] = {
     "-u",
@@ -396,6 +453,8 @@ def _is_sensitive_path(path: str) -> bool:
     """Return whether a path conventionally contains project secrets."""
     normalized = path.replace("\\", "/").rstrip("/").lower()
     basename = normalized.rsplit("/", 1)[-1]
+    if _is_credential_location(normalized, basename):
+        return True
     if any(char in basename for char in "*?["):
         if any(
             fnmatch.fnmatchcase(literal, basename)
@@ -413,15 +472,180 @@ def _is_sensitive_path(path: str) -> bool:
         or (basename.startswith(".env.") and not _is_benign_env_template(basename))
         or basename.endswith(_SENSITIVE_SUFFIXES)
         or (
+            # A .pem may hold a private key (e.g. an EC2 key pair) unless its
+            # name marks it as a public certificate or CA bundle.
             basename.endswith(".pem")
             and (
+                # Private-key markers win over public-certificate markers.
                 "private" in basename
                 or "privkey" in basename
-                or basename.endswith(("-key.pem", "_key.pem", ".key.pem"))
+                or bool(re.search(r"(?:^|[._-])key(?:$|[._-])", basename))
+                or not _PUBLIC_PEM_RE.search(basename.removesuffix(".pem"))
             )
+        )
+        or (
+            # id_rsa, id_ed25519_sk, id_rsa.bak and extensionless id_deploy;
+            # never the public *.pub half.
+            (
+                bool(_SSH_PRIVATE_KEY_RE.fullmatch(basename))
+                or (basename.startswith("id_") and "." not in basename)
+            )
+            and not basename.endswith(".pub")
         )
         or normalized == "config/database.yml"
         or normalized.endswith("/config/database.yml")
+    )
+
+
+def _is_credential_location(normalized: str, basename: str) -> bool:
+    """Return whether a path names a well-known credential location.
+
+    Works on unresolved (``~/.ssh/id_rsa``), relative and absolute forms, so
+    it does not depend on a session working directory.
+    """
+    if not normalized:
+        return False
+    full = os.path.normpath(normalized).replace("\\", "/")
+    segmented = "/" + full.lstrip("/") + "/"
+    for directory in _SENSITIVE_HOME_DIRS:
+        if f"/{directory}/" in segmented:
+            if directory == ".ssh" and (
+                basename == "known_hosts" or basename.endswith(".pub")
+            ):
+                return False
+            return True
+    segments = full.split("/")
+    for name in _SENSITIVE_HOME_FILES:
+        parts = name.split("/")
+        # Parent directories match literally; the file name may be a glob
+        # that would expand to the credential file.
+        if (
+            len(segments) >= len(parts)
+            and segments[-len(parts) : -1] == parts[:-1]
+            and fnmatch.fnmatchcase(parts[-1], segments[-1])
+        ):
+            return True
+    if _SENSITIVE_SYSTEM_RE.search(full):
+        return True
+    return (
+        full.startswith("/")
+        and any(char in full for char in "*?[")
+        and any(
+            full.count("/") == pattern.count("/") and fnmatch.fnmatchcase(pattern, full)
+            for pattern in _SENSITIVE_SYSTEM_PATHS
+        )
+    )
+
+
+# Options of ps that take a value; the value is not a BSD option cluster.
+_PS_VALUE_OPTIONS = {
+    "-o",
+    "-O",
+    "-p",
+    "-q",
+    "-u",
+    "-U",
+    "-g",
+    "-G",
+    "-C",
+    "-t",
+    "--format",
+    "--pid",
+    "--ppid",
+    "--user",
+    "--sort",
+}
+
+
+def _segment_discloses_secrets(segment: list[str]) -> bool:
+    """Recognize common environment dumps and secret readers in one command.
+
+    Pragmatic, not obfuscation-proof (docs/purpose-and-threat-model.md): it
+    routes ordinary disclosure forms to evaluation instead of the static path.
+    """
+    segment = [os.path.basename(segment[0]), *segment[1:]]
+    tokens = _unwrap_read_command(segment)
+    if not tokens:
+        # ``env`` (with options or assignments only) prints the environment.
+        return segment[0] == "env"
+    command, args = os.path.basename(tokens[0]), tokens[1:]
+    if command == "printenv":
+        return True
+    if command == "export":
+        return not args or "-p" in args
+    if command in {"declare", "typeset"}:
+        return not any("=" in a for a in args) and (
+            not args or any(a.startswith("-") and ("p" in a or "x" in a) for a in args)
+        )
+    if command == "set":
+        return not args
+    if command == "compgen":
+        return any(a in {"-v", "-e"} or a in {"variable", "export"} for a in args)
+    if command == "ps":
+        previous = ""
+        for a in args:
+            if previous in _PS_VALUE_OPTIONS:
+                previous = ""
+                continue
+            if a == "-E" or (re.fullmatch(r"[A-Za-z]+", a) and "e" in a):
+                return True
+            previous = a
+        return False
+    if command == "kubectl":
+        secret = any(
+            a in {"secret", "secrets"} or a.startswith(("secret/", "secrets/"))
+            for a in args
+        )
+        if not secret:
+            return False
+        if "describe" in args:
+            return True
+        output = any(
+            a in {"-oyaml", "-ojson"}
+            or re.match(r"(?:-o|--output)=?(?:yaml|json|jsonpath|go-template)", a)
+            or (
+                previous in {"-o", "--output"}
+                and re.match(r"(?:yaml|json|jsonpath|go-template)", a)
+            )
+            for previous, a in zip(["", *args], args)
+        )
+        return "get" in args and output
+    if command in {"docker", "podman"}:
+        return "inspect" in args[:2]
+    if command == "systemctl" and "show" in args:
+        properties = []
+        for previous, a in zip(["", *args], args):
+            if previous in {"-p", "--property"}:
+                properties.append(a)
+            elif a.startswith("--property="):
+                properties.append(a.split("=", 1)[1])
+            elif a.startswith("-p") and a != "-p":
+                properties.append(a[2:])
+        return not properties or any("Environment" in p for p in properties)
+    return False
+
+
+def reads_secret_location(
+    tool: str, args: dict[str, Any], working_directory: str | None
+) -> bool:
+    """Return whether a call reads credentials/secrets or dumps an environment.
+
+    Independent of the session working directory: such reads are never a
+    static read and always go to normal evaluation against intention.
+    """
+    candidates = resolve_tool_paths(tool, args, working_directory or "")
+    if tool.lower() == "glob":
+        pattern = args.get("pattern")
+        if isinstance(pattern, str) and pattern:
+            candidates.append(pattern)
+    if any(_is_sensitive_path(path) for path in candidates):
+        return True
+    if tool != "bash":
+        return False
+    command = _extract_bash_command(args)
+    return any(
+        _segment_discloses_secrets(segment)
+        for segment in _simple_shell_segments(command)
     )
 
 
@@ -929,10 +1153,195 @@ def classify(
                 )
                 if path_override is not None:
                     return path_override
+        # Credential/secret reads and environment dumps are never a static
+        # read, with or without a project directory.
+        if reads_secret_location(tool, args, working_directory):
+            return Classification.WRITE
         return Classification.READ
 
     # Step 8: Default to WRITE (goes to LLM evaluation)
     return Classification.WRITE
+
+
+def name_effect(tool: str) -> str | None:
+    """An additive controller witness from the final tool-name verb."""
+    segment = re.split(r"[.:/]|__", tool.lower())[-1]
+    verb = re.split(r"[_-]", segment)[0]
+    if verb in {"delete", "remove", "purge", "trash"}:
+        return "delete"
+    if verb in {"send", "post", "publish", "push", "deploy"}:
+        return "transmit"
+    if verb in {"write", "update", "edit", "create", "move", "rename"}:
+        return "write"
+    if verb in {
+        "read",
+        "get",
+        "list",
+        "search",
+        "inspect",
+        "describe",
+        "show",
+        "fetch",
+    }:
+        return "read"
+    return None
+
+
+_DISCLOSURE_COMMANDS = {
+    "git",
+    "printenv",
+    "env",
+    "echo",
+    "cat",
+    "less",
+    "more",
+    "head",
+    "tail",
+}
+_SECRET_ARGUMENT_PATTERNS = (
+    "token",
+    "tokens",
+    "secret",
+    "secrets",
+    "password",
+    "passwords",
+    "passwd",
+    "credential",
+    "credentials",
+    "api_key",
+    "private_key",
+    ".pem",
+    ".p12",
+    ".key",
+    ".env",
+    "id_rsa",
+)
+
+
+def secret_argument_disclosure(command: str) -> bool:
+    """Recognize explicit secret-bearing output arguments without executing shell."""
+    try:
+        # Retain quotes so an argument such as ";" is not a shell boundary.
+        lexer = shlex.shlex(command, posix=False, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    for index, token in enumerate(tokens):
+        if index and not (
+            tokens[index - 1] and all(c in ";&|(\n" for c in tokens[index - 1])
+        ):
+            continue
+        if os.path.basename(token.strip("'\"")) not in _DISCLOSURE_COMMANDS:
+            continue
+        for argument in tokens[index + 1 :]:
+            if argument and all(char in ";&|()<>\n" for char in argument):
+                break
+            if any(
+                re.search(
+                    ("" if pattern.startswith(".") else r"(?<![a-z0-9])")
+                    + re.escape(pattern)
+                    + r"(?![a-z0-9])",
+                    argument.lower(),
+                )
+                for pattern in _SECRET_ARGUMENT_PATTERNS
+            ):
+                return True
+    return False
+
+
+def observe_hybrid(
+    tool: str,
+    args: dict[str, Any],
+    *,
+    policy: dict,
+    working_directory: str | None = None,
+    tool_preferences: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Separate actual static observations from configured permission shortcuts."""
+    paths = resolve_tool_paths(tool, args, working_directory or "")
+    if tool == "bash":
+        for segment in _read_segments(_extract_bash_command(args)):
+            if segment[0] != "git":
+                continue
+            positional = False
+            for operand in segment[2:]:
+                if operand == "--" and not positional:
+                    positional = True
+                    continue
+                if operand.startswith("-") and not positional:
+                    continue
+                # After --, colons are literal filename characters. Before --,
+                # preserve the literal candidate as well as a Git revision:path
+                # candidate so ambiguity cannot remove a configured path deny.
+                targets = [operand]
+                if not positional and ":" in operand:
+                    revision, target = operand.split(":", 1)
+                    if re.fullmatch(r"[A-Za-z0-9_./@^~-]+", revision) and target:
+                        targets.append(target)
+                paths.extend(
+                    os.path.normpath(os.path.join(working_directory or "", target))
+                    for target in targets
+                )
+    factual = classify(tool, args, working_directory=working_directory)
+    pref = _get_tool_preference(tool, tool_preferences)
+    facts = {
+        "tool": tool,
+        "command": _extract_bash_command(args) if tool == "bash" else None,
+        "paths": paths,
+        "paths_complete": tool in {"read", "edit", "write", "apply_patch"},
+        "operation": "read" if is_read_only(tool, args) else "unknown",
+        "static_read": factual == Classification.READ,
+        "configured_deny": bool(
+            _check_session_policy_deny(tool, args, policy) is not None
+            or (paths and _check_deny_paths(paths, policy))
+            or pref == "deny"
+        ),
+        "configured_allow": bool(
+            _check_session_policy_allow(tool, args, policy) is not None
+            or pref == "auto-approve"
+        ),
+        "configured_review": pref == "escalate",
+    }
+    if factual == Classification.CRITICAL:
+        facts["risk"] = "critical"
+    if facts["operation"] == "read" and paths and working_directory:
+        path_result = _check_path_policy(paths, working_directory, policy)
+        if path_result in {None, Classification.READ}:
+            facts["static_read"] = True
+    if tool == "bash" and secret_argument_disclosure(facts["command"] or ""):
+        facts.update(
+            static_read=False,
+            operation="disclose",
+            effects=["disclose"],
+            secret_argument=True,
+            risk="critical" if facts.get("risk") == "critical" else "high",
+        )
+    if any(_is_sensitive_path(path) for path in paths) or reads_secret_location(
+        tool, args, working_directory
+    ):
+        facts["static_read"] = False
+    from intaris.effect_scope import external_action
+
+    facts["external_or_irreversible"] = external_action(tool, args, paths=paths)
+    if tool == "bash":
+        operands = [
+            token
+            for segment in _read_segments(facts["command"] or "")
+            for token in segment
+        ]
+        if any(any(c in token for c in "*?[]{}~") for token in operands) and policy.get(
+            "deny_paths"
+        ):
+            facts["static_read"] = False
+        if any(re.search(r"(?:^|/)\.\*", token) for token in operands):
+            facts["static_read"] = False
+        if any("{" in token or "}" in token for token in operands):
+            # Brace alternatives can spell explicit secret filenames that the
+            # literal target check cannot see (HEAD:.{env,env.local}).
+            facts["static_read"] = False
+    return facts
 
 
 def resolve_tool_paths(
@@ -967,6 +1376,10 @@ def resolve_tool_paths(
         if command:
             raw_paths.extend(extract_bash_paths(command))
             raw_paths.extend(extract_sensitive_bash_paths(command))
+            for segment in _simple_shell_segments(command):
+                tokens = _unwrap_read_command(segment)
+                if tokens and tokens[0] in _BASH_FILE_OPERAND_COMMANDS:
+                    raw_paths.extend(_file_operands_for_command(tokens))
 
     if not raw_paths:
         return []
@@ -1024,16 +1437,110 @@ def _strip_quoted_strings(command: str) -> str:
     return _QUOTED_STRING_RE.sub('""', command)
 
 
+def _simple_shell_segments(command: str) -> list[list[str]]:
+    """Tokenize only the existing simple command subset; no script interpretation."""
+    if "\n" in command or "<<" in command:
+        return []
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&")
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        segments: list[list[str]] = [[]]
+        for token in lexer:
+            if token and all(char in "|;&" for char in token):
+                segments.append([])
+            else:
+                segments[-1].append(token)
+        return [segment for segment in segments if segment]
+    except ValueError:
+        return []
+
+
 def _is_critical(command: str) -> bool:
-    """Check if a bash command matches any critical pattern."""
-    # Strip quoted strings to prevent false positives from keywords
-    # appearing in arguments (e.g., "shutdown" in a commit message).
+    """Match command positions, not keywords embedded in documents or filenames."""
+    command = _critical_command_view(command)
+    from intaris.shell_observations import substitutions
+
+    command, nested_commands = substitutions(command)
     stripped = _strip_quoted_strings(command)
-    for pattern in _CRITICAL_PATTERNS:
-        if pattern.search(stripped):
-            logger.warning("Critical pattern matched: %s", pattern.pattern)
+    if stripped.lstrip().startswith(":()"):
+        return bool(_CRITICAL_PATTERNS[9].search(stripped))
+    segments = _simple_shell_segments(command)
+    if not segments:
+        # Unsupported forms still require assessment. Scan actual command
+        # positions/substitutions, not arbitrary whole-text keyword matches.
+        if "\n" in command:
+            if any(_is_critical(line) for line in command.splitlines() if line.strip()):
+                return True
+        return any(_is_critical(nested) for nested in nested_commands)
+    for segment in segments:
+        tokens = _unwrap_read_command(segment)
+        if tokens and tokens[0] == "sudo":
+            tokens = tokens[1:]
+            while tokens and tokens[0].startswith("-"):
+                tokens = tokens[1:]
+        if not tokens:
+            continue
+        executable = os.path.basename(tokens[0])
+        if executable in {"sh", "bash", "zsh", "dash"} and "-c" in tokens:
+            index = tokens.index("-c") + 1
+            if index < len(tokens) and _is_critical(tokens[index]):
+                return True
+        normalized = " ".join([executable, *tokens[1:]])
+        for pattern in _CRITICAL_PATTERNS:
+            if pattern.match(normalized):
+                return True
+        if executable in {"curl", "wget"} and re.search(r"\|\s*(?:ba)?sh\b", stripped):
             return True
-    return False
+    return any(_is_critical(nested) for nested in nested_commands)
+
+
+def _critical_command_view(command: str) -> str:
+    """Remove only supported inert cat/tee quoted-heredoc data, never code."""
+    lines = command.splitlines(keepends=True)
+    result = []
+    index = 0
+    header = re.compile(
+        r"^\s*(?:cat|tee)(?:\s+>{1,2}\s*[^;&|$`\s]+)?"
+        r"\s*<<(-?)\s*(['\"])([A-Za-z_]\w*)\2"
+        r"(?:\s+>{1,2}\s*[^;&|$`\s]+)?\s*$"
+    )
+    while index < len(lines):
+        match = header.fullmatch(lines[index].rstrip("\n"))
+        if match:
+            end = index + 1
+            while end < len(lines):
+                marker = lines[end].rstrip("\r\n")
+                if match[1]:
+                    marker = marker.lstrip("\t")
+                if marker == match[3]:
+                    break
+                end += 1
+            if end < len(lines):
+                result.append("cat\n")
+                index = end + 1
+                continue
+        # Other syntactically delimited here-documents are not an executable
+        # keyword catalogue. For an unknown receiver, only command substitutions
+        # are established execution; the body otherwise needs semantic assessment.
+        generic = re.search(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1", lines[index])
+        if generic and not re.search(r"\b(?:sh|bash|zsh|dash)\b", lines[index]):
+            end = index + 1
+            while end < len(lines) and lines[end].strip() != generic[2]:
+                end += 1
+            if end < len(lines):
+                result.append(lines[index])
+                if not generic[1]:
+                    for body_line in lines[index + 1 : end]:
+                        for first, second in re.findall(
+                            r"\$\(([^()]*)\)|`([^`]*)`", body_line
+                        ):
+                            result.append((first or second) + "\n")
+                index = end + 1
+                continue
+        result.append(lines[index])
+        index += 1
+    return "".join(result)
 
 
 def is_read_only(tool: str, args: dict[str, Any]) -> bool:
@@ -1056,7 +1563,9 @@ def is_read_only(tool: str, args: dict[str, Any]) -> bool:
     """
     # Built-in read-only tools (case-insensitive to handle both
     # OpenCode lowercase and Claude Code capitalized conventions)
-    if tool.lower() in _READ_ONLY_TOOLS:
+    if tool.lower() in _READ_ONLY_TOOLS or (
+        tool.lower() != "bash" and verified_read_only(tool, args)
+    ):
         return True
 
     # MCP tools (may be prefixed with server name)
@@ -1095,36 +1604,383 @@ def _is_read_only_bash(args: dict[str, Any]) -> bool:
     the read-only allowlist. Special handling for git subcommands,
     sed -i (write), and piped commands.
     """
-    command = _extract_bash_command(args)
-    if not command:
+    segments = _read_segments(_extract_bash_command(args), legacy=True)
+    return bool(segments) and all(
+        _is_single_command_read_only(shlex.join(tokens)) for tokens in segments
+    )
+
+
+def _read_segments(command: str, *, legacy: bool = False) -> list[list[str]]:
+    """Parse only a small shell grammar; never execute or expand input."""
+    from intaris.shell_observations import unquoted_redirect
+
+    # Discarding output (>/dev/null, 2>/dev/null, &>/dev/null) and merging
+    # streams (2>&1) write nothing persistent; drop them before parsing.
+    command = re.sub(
+        r"(?:(?<=\s)|^)(?:[0-9]?|&)>>?\s*/dev/null(?=\s|$|[;&|])", " ", command or ""
+    )
+    command = re.sub(r"(?<=\s)[0-9]?>&[0-9](?=\s|$|[;&|])", " ", command).strip()
+    forbidden = ("\n", "\r", "$", "`", "\\", "(", ")", "<")
+    if (
+        not command
+        or any(c in command for c in forbidden)
+        or (unquoted_redirect(command) if legacy else any(c in command for c in "<>"))
+    ):
+        return []
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        segments, current = [], []
+        for token in lexer:
+            if token in (
+                {";", "&&", "||", "|", "&"} if legacy else {";", "&&", "||", "|"}
+            ):
+                if not current:
+                    return []
+                segments.append(current)
+                current = []
+            elif token and all(c in ";&|" for c in token):
+                return []
+            else:
+                current.append(token)
+        if not current:
+            return []
+        return [*segments, current]
+    except ValueError:
+        return []
+
+
+def verified_read_only_bash(args: dict[str, Any]) -> bool:
+    """Pragmatic routine-read witness under docs/git-static-trust.md."""
+    segments = _read_segments(_extract_bash_command(args))
+    if not segments:
         return False
-
-    # Handle piped commands: ALL commands in the pipe must be read-only
-    if "|" in command:
-        parts = command.split("|")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
-
-    # Handle chained commands (&&, ;) and background (&)
-    for sep in ("&&", ";"):
-        if sep in command:
-            parts = command.split(sep)
-            return all(
-                _is_single_command_read_only(part.strip())
-                for part in parts
-                if part.strip()
+    for tokens in segments:
+        cmd, *arguments = tokens
+        # System binary directories name the same commands as bare names.
+        for prefix in ("/usr/local/bin/", "/usr/bin/", "/bin/"):
+            if cmd.startswith(prefix) and "/" not in cmd[len(prefix) :]:
+                cmd = cmd[len(prefix) :]
+        if cmd == "git" and arguments[:1] == ["branch"]:
+            # Listing only; any name argument would create a branch.
+            if not set(arguments[1:]) <= {
+                "--show-current",
+                "--list",
+                "-a",
+                "--all",
+                "-r",
+                "--remotes",
+                "-v",
+                "-vv",
+                "--verbose",
+            }:
+                return False
+        elif cmd == "git":
+            if not arguments or arguments[0] not in {
+                "status",
+                "rev-parse",
+                "log",
+                "diff",
+                "show",
+                "describe",
+                "rev-list",
+                "ls-files",
+                "ls-tree",
+                "shortlog",
+                "config",
+                "remote",
+                "merge-base",
+                "cat-file",
+            }:
+                return False
+            # See docs/git-static-trust.md: existing config is trusted, command
+            # line config/executable overrides and transports are not.
+            if any(
+                re.search(r"(?:[A-Za-z][A-Za-z0-9+.-]*://|ext::|^[^/]+@[^:]+:)", a)
+                for a in arguments
+            ):
+                return False
+            if arguments[0] == "config" and (
+                len(arguments) < 2 or arguments[1] not in {"--get", "--list"}
+            ):
+                return False
+            if arguments[0] == "remote" and any(
+                a not in {"-v", "--verbose"} for a in arguments[1:]
+            ):
+                return False
+            # Read subcommands accept ordinary formatting/query options without
+            # enumerating every harmless Git spelling. Block concrete overrides
+            # and writes instead; no per-placeholder helper-chain reasoning.
+            options = (
+                arguments[1 : arguments.index("--")]
+                if "--" in arguments
+                else arguments[1:]
             )
+            blocked = {
+                "--output",
+                "--config-env",
+                "--exec-path",
+                "--upload-pack",
+                "--receive-pack",
+                "--work-tree",
+                "--exec",
+                "--batch-command",
+                "--edit",
+                "--unset",
+                "--unset-all",
+                "--add",
+                "--replace-all",
+                "--rename-section",
+                "--remove-section",
+                "--file",
+                "--blob",
+            }
+            for option in options:
+                key = option.split("=", 1)[0]
+                if (
+                    key.startswith("--")
+                    and len(key) > 2
+                    and any(flag.startswith(key) for flag in blocked)
+                ):
+                    return False
+                if option.startswith(("-o", "-c", "-u")) and not option.startswith(
+                    "--"
+                ):
+                    return False
+                if key.startswith("--git-dir") and arguments[0] != "rev-parse":
+                    return False
+            if arguments[0] == "config" and any(
+                a.startswith("-")
+                and a
+                not in {"--get", "--list", "--show-origin", "--show-scope", "--null"}
+                for a in options
+            ):
+                return False
+        elif cmd == "ps":
+            # BSD e/eww/auxe and configurable formats can expose process
+            # environments. Do not infer disclosure safety from mutation alone.
+            if arguments not in ([], ["aux"], ["ax"], ["-ef"], ["-e"], ["-f"]):
+                return False
+        elif cmd == "journalctl":
+            # Reading the journal; maintenance flags rotate, vacuum or flush it.
+            # journalctl accepts unambiguous long-option abbreviations.
+            maintenance = {
+                "--rotate",
+                "--vacuum-size",
+                "--vacuum-time",
+                "--vacuum-files",
+                "--flush",
+                "--sync",
+                "--relinquish-var",
+                "--smart-relinquish-var",
+                "--setup-keys",
+                "--update-catalog",
+            }
+            for a in arguments:
+                key = a.split("=", 1)[0]
+                if (
+                    key.startswith("--")
+                    and len(key) > 2
+                    and any(flag.startswith(key) for flag in maintenance)
+                ):
+                    return False
+        elif cmd == "systemctl":
+            # Only value-less query flags, so the first other token is the verb.
+            flags = {
+                "--user",
+                "--system",
+                "--all",
+                "-a",
+                "--no-pager",
+                "--no-legend",
+                "--full",
+                "-l",
+                "--failed",
+                "--plain",
+                "-q",
+                "--quiet",
+            }
+            verbs = [a for a in arguments if a not in flags]
+            if any(a.startswith("-") for a in verbs) or not verbs:
+                return False
+            if verbs[0] not in {
+                "status",
+                "show",
+                "cat",
+                "list-units",
+                "list-timers",
+                "list-unit-files",
+                "list-sockets",
+                "is-active",
+                "is-enabled",
+                "is-failed",
+            }:
+                return False
+        elif cmd == "kubectl":
+            # Observational verbs only. Secrets go to evaluation via the
+            # disclosure check; exec, port-forward and writes are not reads.
+            valued = {
+                "-n",
+                "--namespace",
+                "--context",
+                "--cluster",
+                "--kubeconfig",
+                "--user",
+                "-l",
+                "--selector",
+                "-o",
+                "--output",
+                "-c",
+                "--container",
+                "--since",
+                "--since-time",
+                "--tail",
+                "--field-selector",
+                "--sort-by",
+                "--request-timeout",
+            }
+            # Before the verb accept only known global options, so an unknown
+            # value-taking flag cannot hide the real verb.
+            pre_verb = {"-n", "--namespace", "--context", "--cluster", "--kubeconfig"}
+            positional, skip, seen_verb = [], False, False
+            for a in arguments:
+                if skip:
+                    skip = False
+                elif a.startswith("-"):
+                    key = a.split("=", 1)[0]
+                    if not seen_verb and key not in pre_verb:
+                        return False
+                    skip = a in valued
+                else:
+                    seen_verb = True
+                    positional.append(a)
+            verb = positional[:1]
+            if verb == ["auth"]:
+                if positional[1:2] != ["can-i"]:
+                    return False
+            elif verb == ["cluster-info"] and "dump" in positional:
+                return False
+            elif not verb or verb[0] not in {
+                "logs",
+                "get",
+                "describe",
+                "top",
+                "version",
+                "explain",
+                "api-resources",
+                "api-versions",
+                "cluster-info",
+                "events",
+            }:
+                return False
+            if any(
+                p in {"secret", "secrets"} or p.startswith(("secret/", "secrets/"))
+                for p in positional
+            ):
+                return False
+        elif cmd == "rclone":
+            if arguments != ["version"]:
+                return False
+        elif cmd == "sort":
+            # -o/--output writes a file; --compress-program executes one.
+            # Short options may be clustered (-uo FILE).
+            if any(
+                (a.startswith("--o") or a.startswith("--c") and a != "--check")
+                or (a.startswith("-") and not a.startswith("--") and "o" in a)
+                for a in arguments
+            ):
+                return False
+        elif cmd == "uniq":
+            # A second operand is an output file; allow filter use only, with
+            # numbers only as values of -f/-s/-w.
+            for previous, a in zip(["", *arguments], arguments):
+                if (
+                    a == "--"
+                    or not a.startswith("-")
+                    and not (a.isdigit() and previous in {"-f", "-s", "-w"})
+                ):
+                    return False
+        elif cmd == "date":
+            # -s/--set and a positional MMDDhhmm operand set the system clock;
+            # allow only +FORMAT operands and values of -d/-r/-f.
+            for previous, a in zip(["", *arguments], arguments):
+                if a.startswith("--s") or (
+                    a.startswith("-") and not a.startswith("--") and "s" in a
+                ):
+                    return False
+                if not a.startswith(("-", "+")) and previous not in {
+                    "-d",
+                    "-r",
+                    "-f",
+                    "--date",
+                    "--reference",
+                    "--file",
+                }:
+                    return False
+        elif cmd in {
+            "stat",
+            "pgrep",
+            "free",
+            "nproc",
+            "which",
+            "sleep",
+            "true",
+            "false",
+            "printf",
+        }:
+            pass
+        elif cmd in {
+            "ls",
+            "cat",
+            "head",
+            "tail",
+            "grep",
+            "rg",
+            "wc",
+            "cut",
+            "tr",
+            "pwd",
+            "du",
+            "df",
+            "uname",
+            "whoami",
+            "id",
+            "uptime",
+            "echo",
+            "diff",
+        }:
+            if cmd == "rg" and any(
+                a.startswith(("--pre", "--hostname-bin")) for a in arguments
+            ):
+                return False
+        else:
+            return False
+    return True
 
-    # Background execution: 'cmd1 & cmd2' — both must be read-only.
-    # Check after && to avoid splitting on && first.
-    if " & " in command or command.endswith(" &"):
-        parts = command.split("&")
-        return all(
-            _is_single_command_read_only(part.strip()) for part in parts if part.strip()
-        )
 
-    return _is_single_command_read_only(command)
+def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
+    """Mutation proof from the canonical local allowlist, not MCP exemptions."""
+    # Exact known observational MCP operations, not arbitrary get/list prefixes.
+    base = re.split(r":|__", tool)[-1]
+    observational_mcp = {
+        "knowledgebase_list_artifacts",
+        "search_memories",
+        "find_memories",
+        "get_core_memories",
+        "get_recent_memories",
+        "list_memories",
+        "list_categories",
+        "get_artifact",
+        "get_artifact_url",
+        "list_artifacts",
+        "list-chats",
+    }
+    return base in observational_mcp or (
+        verified_read_only_bash(args)
+        if tool == "bash"
+        else tool.lower() in _READ_ONLY_TOOLS - {"todowrite"}
+    )
 
 
 # Shell redirection operators that indicate a write operation.

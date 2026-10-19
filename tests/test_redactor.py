@@ -284,20 +284,22 @@ class TestFalsePositiveRegression:
     def test_file_path_not_redacted_as_aws_secret(self):
         """File paths must not trigger aws_secret pattern.
 
-        /Users/fpytloun/src/intaris/intaris/api/ is exactly 40 chars of
+        /Users/testuser/src/intaris/intaris/api/ is exactly 40 chars of
         [A-Za-z0-9+/] and was being matched as an AWS secret.
         """
         args = {
-            "prompt": "Read files from /Users/fpytloun/src/intaris/intaris/api/ and return"
+            "prompt": "Read files from /Users/testuser/src/intaris/intaris/api/ and return"
         }
+        assert len(args["prompt"].split()[3]) == 40
         result = redact(args)
         assert result["prompt"] == args["prompt"]
 
     def test_another_40_char_path_not_redacted(self):
         """Other 40-char paths must not trigger aws_secret pattern."""
         args = {
-            "prompt": "Read files from /Users/fpytloun/src/intaris/intaris/mcp/ and return"
+            "prompt": "Read files from /Users/testuser/src/intaris/intaris/mcp/ and return"
         }
+        assert len(args["prompt"].split()[3]) == 40
         result = redact(args)
         assert result["prompt"] == args["prompt"]
 
@@ -446,7 +448,7 @@ class TestFalsePositiveRegression:
         args = {
             "description": "Explore intaris API routes",
             "prompt": (
-                "Read the following files from /Users/fpytloun/src/intaris/intaris/api/ "
+                "Read the following files from /Users/testuser/src/intaris/intaris/api/ "
                 "and return a comprehensive summary of all API endpoints."
             ),
             "subagent_type": "explore",

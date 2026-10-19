@@ -398,7 +398,7 @@ class MCPProxy:
 
     async def _handle_call_tool(
         self, name: str, arguments: dict[str, Any]
-    ) -> list[TextContent]:
+    ) -> list[TextContent] | CallToolResult:
         """Evaluate and forward a tool call to the upstream server.
 
         Flow:
@@ -432,111 +432,63 @@ class MCPProxy:
         # Ensure Intaris session exists.
         session_id = await self._ensure_session(user_id, agent_id)
 
-        # Get tool preferences for the classifier.
-        tool_prefs = await asyncio.to_thread(
-            self._server_store.get_all_tool_preferences,
-            user_id=user_id,
-        )
-
-        evaluator_args = _compact_evaluator_args(arguments)
-
-        # Run safety evaluation (sync evaluator wrapped in to_thread).
-        eval_result = await asyncio.to_thread(
-            self._evaluator.evaluate,
-            user_id=user_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            tool=name,
-            args=evaluator_args,
-            tool_preferences=tool_prefs,
-        )
-
-        decision = eval_result["decision"]
-        call_id = eval_result["call_id"]
-
-        if decision == "deny":
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"Tool call denied by Intaris safety evaluation.\n"
-                        f"Reason: {eval_result.get('reasoning', 'No reason provided')}\n"
-                        f"Call ID: {call_id}"
-                    ),
-                )
-            ]
-
-        if decision == "escalate":
-            # Launch judge review if enabled (fire-and-forget)
-            if self._judge_reviewer is not None and self._judge_reviewer.is_enabled:
-                asyncio.create_task(
-                    self._judge_reviewer.review_and_resolve(
-                        call_id=call_id,
-                        user_id=user_id,
-                        session_id=session_id,
-                        agent_id=agent_id,
-                    )
-                )
-
-            reviewer_label = "review" if self._judge_reviewer else "human approval"
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"This tool call has been escalated for {reviewer_label} "
-                        f"(call_id: {call_id}).\n"
-                        f"Please wait for the approval to be resolved in the "
-                        f"Intaris UI, then retry this exact tool call. "
-                        f"Do not attempt alternative approaches until resolved."
-                    ),
-                )
-            ]
-
-        # Decision is "approve" — forward to upstream.
-        try:
-            server_with_secrets = await asyncio.to_thread(
-                self._server_store.get_server,
-                user_id=user_id,
-                name=server_name,
-                decrypt_secrets=True,
-            )
-        except ValueError:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Error: MCP server '{server_name}' not found",
-                )
-            ]
+        from intaris.api.deps import authorize_controller, get_session_context
+        from intaris.api.schemas import EvaluateRequest, EvaluationExtensions
 
         try:
-            client = await self._conn_mgr.get_or_connect(
-                server_config=server_with_secrets,
-                user_id=user_id,
-            )
+            meta = self._server.request_context.meta
+        except LookupError:
+            meta = None
+        extensions = (meta.model_dump().get("intaris", {}) if meta else {}) or {}
+        allowed = set(EvaluationExtensions.model_fields) | {
+            "context",
+            "minimum_outcome",
+            "approval_call_id",
+        }
+        if not isinstance(extensions, dict) or set(extensions) - allowed:
+            raise ValueError("Unsupported Intaris MCP metadata")
+        # Validate extensions separately: native arguments retain their existing
+        # size contract and are not squeezed through the REST evaluate limit.
+        request = EvaluateRequest(session_id=session_id, tool=name, **extensions)
+        authorize_controller(
+            request.controller_context, session_id, get_session_context()
+        )
+        from intaris.policy_activation import HybridError
 
-            result = await client.call_tool(
-                name=tool_name,
+        try:
+            result = await self.call_tool_rest(
+                user_id=user_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                server_name=server_name,
+                tool_name=tool_name,
                 arguments=arguments,
-                read_timeout_seconds=timedelta(milliseconds=self._timeout_ms),
+                **{key: getattr(request, key) for key in extensions},
             )
-
-            # Convert CallToolResult content to TextContent list.
-            return self._convert_result(result)
-
-        except Exception as exc:
-            logger.exception("Upstream call to '%s:%s' failed", server_name, tool_name)
-            # Evict dead connection so next call reconnects.
-            await self._conn_mgr.evict(user_id, server_name)
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"Error calling upstream server '{server_name}': {exc}\n"
-                        f"The tool call was approved but the upstream server "
-                        f"returned an error."
-                    ),
-                )
-            ]
+        except HybridError as exc:
+            # Native MCP has no HTTP error status. Keep typed retry/dispatch
+            # evidence instead of letting the SDK reduce it to an error string.
+            return CallToolResult(
+                content=[TextContent(type="text", text=str(exc))],
+                isError=True,
+                _meta={"intaris": exc.detail()},
+            )
+        content = [
+            TextContent(type="text", text=item["text"]) for item in result["content"]
+        ]
+        if (result.get("evaluation_metadata") or {}).get(
+            "evaluation_policy_version"
+        ) == "hybrid_v1" or (result.get("evaluation_metadata") or {}).get("overlay"):
+            return CallToolResult(
+                content=content,
+                isError=result["isError"],
+                _meta={
+                    "intaris": {
+                        key: value for key, value in result.items() if key != "content"
+                    }
+                },
+            )
+        return content
 
     async def _ensure_session(self, user_id: str, agent_id: str | None) -> str:
         """Ensure an Intaris session exists for this MCP proxy connection.
@@ -655,6 +607,14 @@ class MCPProxy:
         server_name: str,
         tool_name: str,
         arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
+        minimum_outcome: str | None = None,
+        approval_call_id: str | None = None,
+        evaluation_policy_version: str | None = None,
+        logical_call_id: str | None = None,
+        expected_policy_revision: int | None = None,
+        expected_policy_hash: str | None = None,
+        controller_context: dict | None = None,
     ) -> dict[str, Any]:
         """Call an upstream MCP tool via REST API with full safety evaluation.
 
@@ -682,20 +642,48 @@ class MCPProxy:
 
         evaluator_args = _compact_evaluator_args(arguments)
 
-        # Run safety evaluation (sync evaluator wrapped in to_thread).
-        eval_result = await asyncio.to_thread(
-            self._evaluator.evaluate,
+        # Metadata waiting must not retain a request worker slot.
+        eval_result = await self._evaluator.evaluate_async(
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,
             tool=namespaced,
             args=evaluator_args,
+            original_args=arguments,
             tool_preferences=tool_prefs,
+            **{
+                key: value
+                for key, value in {
+                    "evaluation_policy_version": evaluation_policy_version,
+                    "logical_call_id": logical_call_id,
+                    "expected_policy_revision": expected_policy_revision,
+                    "expected_policy_hash": expected_policy_hash,
+                    "controller_context": controller_context,
+                }.items()
+                if value is not None
+            },
+            **(
+                {
+                    "context": context,
+                    "minimum_outcome": minimum_outcome,
+                    "approval_call_id": approval_call_id,
+                }
+                if context is not None
+                or minimum_outcome is not None
+                or approval_call_id is not None
+                else {}
+            ),
         )
 
         decision = eval_result["decision"]
         call_id = eval_result.get("call_id")
         reasoning = eval_result.get("reasoning")
+        hybrid = (eval_result.get("evaluation_metadata") or {}).get(
+            "evaluation_policy_version"
+        ) == "hybrid_v1"
+        has_metadata = hybrid or bool(
+            (eval_result.get("evaluation_metadata") or {}).get("overlay")
+        )
 
         if decision == "deny":
             return {
@@ -713,6 +701,11 @@ class MCPProxy:
                 "decision": "deny",
                 "call_id": call_id,
                 "reasoning": reasoning,
+                **(
+                    {"evaluation_metadata": eval_result["evaluation_metadata"]}
+                    if has_metadata
+                    else {}
+                ),
                 "latency_ms": round((time.monotonic() - start) * 1000),
             }
 
@@ -747,6 +740,11 @@ class MCPProxy:
                 "decision": "escalate",
                 "call_id": call_id,
                 "reasoning": reasoning,
+                **(
+                    {"evaluation_metadata": eval_result["evaluation_metadata"]}
+                    if has_metadata
+                    else {}
+                ),
                 "latency_ms": round((time.monotonic() - start) * 1000),
             }
 
@@ -807,12 +805,46 @@ class MCPProxy:
                     "agent_id": agent_id,
                 }
 
+        dispatched = False
         try:
             client = await self._conn_mgr.get_or_connect(
                 server_config=server_with_secrets,
                 user_id=user_id,
             )
 
+            if hybrid:
+                from datetime import datetime, timezone
+
+                from intaris.hybrid import action_digest
+                from intaris.policy_activation import HybridError
+
+                metadata = eval_result["evaluation_metadata"]
+                admission = metadata.get("admission")
+                if (
+                    not admission
+                    or datetime.now(timezone.utc)
+                    >= datetime.fromisoformat(admission["dispatch_deadline"])
+                    or metadata["action_digest"]
+                    != action_digest(
+                        user_id,
+                        session_id,
+                        namespaced,
+                        arguments,
+                        mode_identity=metadata.get("digest_mode_identity"),
+                    )
+                ):
+                    raise HybridError(
+                        "expired_admission",
+                        "Fresh admission required before dispatch",
+                        409,
+                    )
+                eval_result["evaluation_metadata"] = await asyncio.to_thread(
+                    self._audit.mark_execution,
+                    call_id,
+                    user_id=user_id,
+                    state="dispatched",
+                )
+            dispatched = True
             result = await client.call_tool(
                 name=tool_name,
                 arguments=arguments,
@@ -823,6 +855,13 @@ class MCPProxy:
             text_contents = self._convert_result(result)
             content = [{"type": "text", "text": c.text} for c in text_contents]
             is_error = result.isError or False
+            if hybrid:
+                eval_result["evaluation_metadata"] = await asyncio.to_thread(
+                    self._audit.mark_execution,
+                    call_id,
+                    user_id=user_id,
+                    state="completed",
+                )
 
             return {
                 "content": content,
@@ -831,9 +870,49 @@ class MCPProxy:
                 "call_id": call_id,
                 "reasoning": reasoning,
                 "latency_ms": round((time.monotonic() - start) * 1000),
+                **(
+                    {
+                        "evaluation_metadata": {
+                            **eval_result["evaluation_metadata"],
+                            "execution_state": "completed",
+                        }
+                    }
+                    if has_metadata
+                    else {}
+                ),
             }
 
+        except asyncio.CancelledError:
+            if hybrid and dispatched:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        self._audit.mark_execution,
+                        call_id,
+                        user_id=user_id,
+                        state="uncertain",
+                    )
+                )
+            raise
         except Exception as exc:
+            from intaris.policy_activation import HybridError
+
+            if isinstance(exc, HybridError):
+                raise HybridError(
+                    exc.code,
+                    str(exc),
+                    exc.status,
+                    call_id=call_id,
+                    logical_call_id=(eval_result.get("evaluation_metadata") or {}).get(
+                        "logical_call_id"
+                    ),
+                ) from exc
+            if hybrid and dispatched:
+                eval_result["evaluation_metadata"] = await asyncio.to_thread(
+                    self._audit.mark_execution,
+                    call_id,
+                    user_id=user_id,
+                    state="uncertain",
+                )
             logger.exception("Upstream call to '%s:%s' failed", server_name, tool_name)
             # Evict dead connection so next call reconnects.
             await self._conn_mgr.evict(user_id, server_name)
@@ -854,6 +933,22 @@ class MCPProxy:
                 "call_id": call_id,
                 "reasoning": reasoning,
                 "latency_ms": round((time.monotonic() - start) * 1000),
+                **(
+                    {
+                        "execution_state": "uncertain"
+                        if dispatched
+                        else "not_dispatched",
+                        "retryable": False,
+                        "evaluation_metadata": {
+                            **eval_result["evaluation_metadata"],
+                            "execution_state": "uncertain"
+                            if dispatched
+                            else "not_dispatched",
+                        },
+                    }
+                    if has_metadata
+                    else {}
+                ),
             }
 
     def build_instructions(self, user_id: str) -> str:

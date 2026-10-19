@@ -21,6 +21,8 @@ class EmbeddingError(RuntimeError):
 def _strip_provider_prefix(model: str) -> str:
     if not model:
         return model
+    if model.startswith("routes/"):
+        return model
     if "/" in model:
         return model.split("/", 1)[1]
     return model
@@ -45,14 +47,17 @@ class EmbeddingClient:
         if self._client is not None:
             return self._client
         try:
-            from openai import OpenAI  # type: ignore[import-not-found]
+            from intaris.config import LLMConfig
+            from intaris.llm import LLMClient
         except ImportError as exc:  # pragma: no cover
             raise EmbeddingError("openai package not installed; cannot embed") from exc
-        self._client = OpenAI(
-            base_url=self._base_url,
-            api_key=self._api_key,
-            timeout=self._timeout_s,
+        config = LLMConfig(
+            model=self._model,
+            timeout_ms=int(self._timeout_s * 1000),
         )
+        # Embeddings use their configured endpoint, not the L1 managed route.
+        config.base_url, config.api_key = self._base_url, self._api_key
+        self._client = LLMClient(config)
         return self._client
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -60,7 +65,7 @@ class EmbeddingClient:
             return []
         client = self._ensure_client()
         try:
-            resp = client.embeddings.create(model=self._model, input=texts)
+            resp = client.embed(texts)
         except Exception as exc:  # noqa: BLE001
             raise EmbeddingError(f"embedding call failed: {exc}") from exc
         try:

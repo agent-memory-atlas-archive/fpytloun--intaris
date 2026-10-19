@@ -1,0 +1,48 @@
+# Static Git trust boundary
+
+This is the canonical Git classification threat model.
+
+Intaris guards against agent drift from user intention and harmful behavior over
+short and long horizons. It is not an antivirus or an adversarial-agent sandbox.
+Filesystem/network isolation and limited tools provide containment. Static reads
+are a pragmatic fast path, not a proof against every weaponizable construction.
+Review findings should concern plausible drift, real mutation, explicit
+command-line/environment injection, disclosure or regressions—not hypothetical
+helper chains. Scoring/bypass-attempt detection is outside this change.
+
+Existing repository and global Git configuration is trusted, including implicit
+external diff/textconv drivers, signature-verification helpers, pager and
+attribute-selected drivers. Formats (including `%G*`), `--show-signature`,
+`--textconv` and `--ext-diff` do not by themselves remove read-only proof.
+The classifier does not execute or inspect these helpers. Existing configured
+aliases are trusted infrastructure, but unknown subcommands still need assessment
+because their effects cannot be inferred from their names.
+
+Command-line or environment overrides are untrusted. Static proof excludes:
+
+- Config/executable injection: `-c`, `--config-env`, `--exec-path`,
+  `--upload-pack`, `--receive-pack`, `-u` and transports/URLs.
+- Any environment-assignment prefix, including `GIT_*`, `PAGER`, `EDITOR`;
+  shell wrappers (`env`, `sh -c`, etc.) cannot evade this.
+- Output options (`--output`, abbreviations and `-o`), redirects, substitutions,
+  backticks, unsupported shell syntax and executable filters.
+- Global repository relocation (`--git-dir`, `--work-tree`, `-C`): these are
+  conservatively not proved, including inside-target forms. `git rev-parse
+  --git-dir` is an observation, not global relocation.
+- Mutating subcommands and options. `git config` is observational only with
+  `--get` or `--list`; unknown config options are not proved.
+
+All config changes go through evaluated writes: `git config` setters and direct
+writes/edits to `.git/config`, `.gitconfig`, `.git/hooks/*` and `.gitattributes`.
+The write is assessed under ordinary policy; a read grant is never reused for it.
+
+Target/disclosure guards still apply. Git blob operands and literal filenames
+after `--` feed deny-path checks. Ordinary glob/pathspec reads are permitted;
+expansion with an explicit deny-path policy still needs assessment, as do broad
+hidden-file reads. The blanket no-expansion rule and exhaustive formatting-option
+allowlist have been removed. Existing shell substitution, wrapper and filter
+rules remain because they introduce plausible command/effect ambiguity.
+Brace alternatives remain assessed because they can spell explicit credential
+filenames absent from the literal disclosure check (`HEAD:.{env,env.local}`).
+Trusted config does not imply permission to disclose credentials or bypass
+explicit denies, applicable restrictions, floors or human checkpoints.

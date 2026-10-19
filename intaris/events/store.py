@@ -311,6 +311,14 @@ class EventStore:
                         self._is_user_message_event(event) for event in events
                     ],
                     minimum_last_seq=current_seq,
+                    latest_user_evidence=next(
+                        (
+                            {"source": "recording_client", "data": event.get("data")}
+                            for event in reversed(events)
+                            if self._is_user_message_event(event)
+                        ),
+                        None,
+                    ),
                 )
                 current_seq = assigned_seqs[-1]
                 with self._lock:

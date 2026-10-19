@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 from datetime import datetime
 from datetime import timezone as tz
@@ -13,10 +12,47 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from intaris.api.deps import SessionContext, get_session_context
 from intaris.api.schemas import EvaluateRequest, EvaluateResponse
 from intaris.decision import UNATTENDED_JUDGE_REVIEW
+from intaris.evaluator_backend import EvaluatorBackendUnavailable
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_completed_review(outcome, *, call_id: str) -> None:
+    """Infrastructure failures cannot become policy denials or approval prompts."""
+    metadata = outcome.record.get("evaluation_metadata") or {}
+    if metadata.get("evaluation_policy_version") != "hybrid_v1":
+        return
+    failed = outcome.notification_event_type == "judge_error" or any(
+        stage.get("stage") == "judge"
+        and (
+            stage.get("response_origin") == "assessment_failed"
+            or (stage.get("authorization_check") or {}).get("outcome") == "unavailable"
+        )
+        for stage in metadata.get("stages", [])
+    )
+    if failed:
+        from intaris.policy_activation import HybridError
+
+        raise HybridError(
+            "review_unavailable",
+            "Automated review could not complete; no tool was dispatched. "
+            "Retry the evaluation when the review service is available.",
+            503,
+            call_id=call_id,
+            logical_call_id=metadata.get("logical_call_id"),
+            retryable=True,
+        )
+
+
+@router.get("/process-lifecycle-capabilities")
+def process_lifecycle_capabilities(ctx: SessionContext = Depends(get_session_context)):
+    return {
+        "versions": [1],
+        "authentication": "controller_jwt",
+        "requires_hybrid": True,
+    }
 
 
 async def _emit_unresolved_escalation(
@@ -96,6 +132,20 @@ async def evaluate(
 
     Returns the decision with reasoning, risk level, and latency.
     """
+    from intaris.model_retry import evaluation_deadline
+    from intaris.server import _get_config
+
+    # Model-call retries in this request (L1, Jev, Judge) start only when
+    # they can finish within the request's overall budget.
+    with evaluation_deadline(_get_config().evaluation_deadline_ms / 1000.0):
+        return await _evaluate(request, http_request, ctx)
+
+
+async def _evaluate(
+    request: EvaluateRequest,
+    http_request: Request,
+    ctx: SessionContext,
+) -> EvaluateResponse:
     from intaris.server import _get_evaluator
 
     # Rate limit check
@@ -124,51 +174,94 @@ async def evaluate(
     # the alignment check runs async and we wait for it here. This
     # ensures no tool calls execute before alignment is verified.
     alignment_barrier = getattr(http_request.app.state, "alignment_barrier", None)
-    if alignment_barrier is not None:
+    from intaris.evaluation_override import force_legacy
+
+    if alignment_barrier is not None and not force_legacy():
         await alignment_barrier.wait(ctx.user_id, request.session_id)
 
     try:
         request_started = asyncio.get_running_loop().time()
         evaluator = _get_evaluator()
+        from intaris.api.deps import authorize_controller
+        from intaris.api.schemas import EvaluationExtensions
+
+        authorize_controller(request.controller_context, request.session_id, ctx)
+        extensions = {
+            key: getattr(request, key)
+            for key in EvaluationExtensions.model_fields
+            if getattr(request, key) is not None
+        }
         # agent_id: request body overrides header if provided
         agent_id = request.agent_id or ctx.agent_id
+        lifecycle = None
+        if request.process_scope is not None:
+            from intaris.process_scope import verify_declaration
 
-        # Run the synchronous evaluator in a thread executor to avoid
-        # blocking the asyncio event loop. The evaluator makes synchronous
-        # LLM calls (via the OpenAI SDK) that can take up to 4 seconds.
-        # Without run_in_executor, these block the event loop and prevent
-        # concurrent request processing — including /reasoning calls that
-        # the intention barrier is waiting for.
-        loop = asyncio.get_running_loop()
-        judge_reviewer = getattr(http_request.app.state, "judge_reviewer", None)
-        result = await loop.run_in_executor(
-            None,
-            functools.partial(
-                evaluator.evaluate,
+            scope = verify_declaration(
+                request.process_scope,
+                claims=ctx.controller_claims,
                 user_id=ctx.user_id,
-                session_id=request.session_id,
                 agent_id=agent_id,
+                session_id=request.session_id,
                 tool=request.tool,
                 args=request.args,
-                context=request.context,
-                minimum_outcome=request.minimum_outcome,
-                approval_call_id=request.approval_call_id,
-                judge_unattended=(
-                    judge_reviewer is not None
-                    and judge_reviewer.is_enabled
-                    and request.minimum_outcome is None
-                ),
+            )
+            lifecycle = {
+                "authenticated": True,
+                "matched": False,
+                "declaration": scope.model_dump(),
+            }
+
+        # Decision/model segments run in workers, but metadata waiting does not
+        # retain a default-executor slot. One continuation preserves side effects
+        # and the original request context (including its model-retry budget).
+        judge_reviewer = getattr(http_request.app.state, "judge_reviewer", None)
+        result = await evaluator.evaluate_async(
+            user_id=ctx.user_id,
+            session_id=request.session_id,
+            agent_id=agent_id,
+            tool=request.tool,
+            args=request.args,
+            context=request.context,
+            process_lifecycle=lifecycle,
+            minimum_outcome=request.minimum_outcome,
+            approval_call_id=request.approval_call_id,
+            judge_unattended=(
+                judge_reviewer is not None
+                and judge_reviewer.is_enabled
+                and request.minimum_outcome is None
             ),
+            **extensions,
         )
 
         dispatcher = getattr(http_request.app.state, "notification_dispatcher", None)
         judge_waited = False
 
-        if result.get("decision") == "escalate":
+        hybrid_review = (result.get("evaluation_metadata") or {}).get(
+            "judge_required", False
+        )
+        metadata = result.get("evaluation_metadata") or {}
+        final_policy = metadata.get("final_policy_result") or {}
+        validated_human_approval = (
+            result.get("decision") == "approve"
+            and result.get("effective_decision") == "approve"
+            and result.get("outcome_override") == "human_approval"
+            and final_policy.get("decision") == "approve"
+            and final_policy.get("disposition") == "satisfied_by_human"
+            and bool(metadata.get("admission"))
+        )
+        # Runtime validated the receipt and admitted this exact action. Raw
+        # review obligations remain audit evidence, not a second authority gate.
+        if validated_human_approval:
+            hybrid_review = False
+        if result.get("decision") == "escalate" or hybrid_review:
             if (
                 judge_reviewer is not None
                 and judge_reviewer.is_enabled
-                and request.minimum_outcome not in {"deny", "escalate"}
+                and not (result.get("evaluation_metadata") or {}).get("operator_bound")
+                and (
+                    hybrid_review or request.minimum_outcome not in {"deny", "escalate"}
+                )
             ):
                 judge_waited = True
                 outcome = await judge_reviewer.review_for_evaluate(
@@ -177,6 +270,7 @@ async def evaluate(
                     session_id=request.session_id,
                     agent_id=agent_id,
                 )
+                _require_completed_review(outcome, call_id=result["call_id"])
                 if result.get(
                     "outcome_override"
                 ) == UNATTENDED_JUDGE_REVIEW and outcome.decision not in {
@@ -187,6 +281,14 @@ async def evaluate(
                         "Unattended Judge review did not resolve the evaluation"
                     )
                 result["decision"] = outcome.decision
+                if (outcome.record.get("evaluation_metadata") or {}).get(
+                    "evaluation_policy_version"
+                ) == "hybrid_v1":
+                    result["evaluation_metadata"] = outcome.record[
+                        "evaluation_metadata"
+                    ]
+                    result["effective_decision"] = outcome.decision
+                    result["outcome_override"] = outcome.record.get("outcome_override")
                 if result.get("maximum_outcome") is not None:
                     result["effective_decision"] = outcome.decision
                     result["outcome_override"] = outcome.record.get("outcome_override")
@@ -209,7 +311,7 @@ async def evaluate(
                         )
                         == "always",
                     )
-            else:
+            elif result.get("decision") == "escalate":
                 await _emit_unresolved_escalation(
                     http_request=http_request,
                     user_id=ctx.user_id,
@@ -385,9 +487,54 @@ async def evaluate(
                 logger.debug("Failed to check volume trigger", exc_info=True)
 
         return EvaluateResponse(**result)
+    except HTTPException:
+        raise
+    except EvaluatorBackendUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "evaluation_backend_unavailable",
+                "message": "Evaluation routing metadata is temporarily unavailable.",
+                "retryable": True,
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     except ValueError as e:
+        from intaris.input_budget import ModelResponseError
+
+        if isinstance(e, ModelResponseError):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "invalid_model_response",
+                    "message": "Malformed evaluator model response.",
+                },
+            ) from e
+        from intaris.policy_activation import HybridError
+
+        if isinstance(e, HybridError):
+            from intaris.api.errors import hybrid_http_error
+
+            raise hybrid_http_error(
+                e,
+                session_id=request.session_id,
+                tool=request.tool,
+                call_id=locals().get("result", {}).get("call_id"),
+                logical_call_id=request.logical_call_id,
+            ) from e
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
+        from intaris.input_budget import ContextInsufficientError
+
+        if isinstance(e, ContextInsufficientError):
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "context_insufficient",
+                    "message": "Essential evidence exceeds available model input capacity.",
+                    "model_view": e.diagnostics,
+                },
+            ) from e
         try:
             from intaris.llm import LLMTemporaryError
 

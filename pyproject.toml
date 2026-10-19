@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "intaris"
-version = "0.11.0"
+version = "0.13.0"
 description = "Guardrails service for AI agents — safety evaluation, audit, and approval workflows"
 readme = "README.md"
 license = "LicenseRef-BSL-1.1"
@@ -25,11 +25,12 @@ classifiers = [
 ]
 
 dependencies = [
+    "jsonschema>=4.20",
     "pydantic>=2.12",
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.30.0",
     "starlette>=0.38.0",
-    "openai>=1.0.0",
+    "openai>=2.26.0",
     "httpx>=0.27.0",
     # MCP 1.27 removed Server.list_tools()/call_tool(), which Intaris's
     # Streamable HTTP proxy uses. Keep the supported decorator API range.

@@ -73,6 +73,8 @@ class AuditStore:
         maximum_outcome: str | None = None,
         minimum_outcome: str | None = None,
         outcome_override: str | None = None,
+        evaluation_metadata: dict[str, Any] | None = None,
+        admission_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Insert an audit record.
 
@@ -112,6 +114,203 @@ class AuditStore:
         now = datetime.now(timezone.utc).isoformat()
 
         with self._db.cursor() as cur:
+            if record_type == "reasoning" and (content or "").startswith(
+                "User message:"
+            ):
+                # Only user-role evidence changes authorization, not activity.
+                role = (args_redacted or {}).get("context", args_redacted or {})
+                is_user_source = (
+                    not isinstance(role, dict) or role.get("role", "user") == "user"
+                )
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision + ?, latest_user_evidence = COALESCE(?, latest_user_evidence) "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (
+                        int(is_user_source),
+                        json.dumps(
+                            {
+                                "source": "reasoning_client",
+                                "content": content,
+                                "source_audit_call_id": call_id,
+                                "recorded_context": args_redacted,
+                            }
+                        )
+                        if is_user_source
+                        else None,
+                        user_id,
+                        session_id,
+                    ),
+                )
+            if admission_snapshot is not None:
+                from intaris.policy_activation import HybridError
+                from intaris.policy_inheritance import validate_parent_chain
+
+                # Ancestors before descendants on both activation and admission:
+                # parent updates cannot commit between validation and admission.
+                validate_parent_chain(
+                    cur, admission_snapshot, postgresql=self._db.backend == "postgresql"
+                )
+                # This no-op CAS takes the session write lock on both engines.
+                # Every relevant writer increments state_revision on this row.
+                metadata = evaluation_metadata or {}
+                operator_bound = metadata.get("operator_bound") is True
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision "
+                    "WHERE user_id = ? AND session_id = ? "
+                    "AND policy_revision = ? "
+                    + (
+                        ""
+                        if operator_bound
+                        else "AND state_revision = ? AND status = 'active'"
+                    ),
+                    (
+                        user_id,
+                        session_id,
+                        admission_snapshot["policy_revision"],
+                        *(
+                            ()
+                            if operator_bound
+                            else (admission_snapshot["state_revision"],)
+                        ),
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise HybridError(
+                        "stale_policy_revision"
+                        if operator_bound
+                        else "stale_admission",
+                        "Session changed during evaluation",
+                        409,
+                    )
+                workflow = metadata.get("workflow_scope")
+                if workflow is not None:
+                    from intaris.workflow_scope import registry_revision
+
+                    if (
+                        registry_revision(cur, user_id, session_id)
+                        != workflow["registry_revision"]
+                    ):
+                        raise HybridError(
+                            "workflow_step_conflict",
+                            "Workflow declaration changed during admission",
+                            409,
+                        )
+                if operator_bound:
+                    # Resolve under the same lock as human/lifecycle/policy
+                    # writers. No assessment or task context was used to grant.
+                    cur.execute(
+                        "SELECT status, policy, state_revision FROM sessions "
+                        "WHERE user_id = ? AND session_id = ?",
+                        (user_id, session_id),
+                    )
+                    current = cur.fetchone()
+                    policy = json.loads(current["policy"] or "{}")
+                    if policy.get("maximum_outcome") != "approve" or policy.get(
+                        "policy_hash"
+                    ) != metadata.get("policy_hash"):
+                        raise HybridError("stale_policy_hash", "Policy changed", 409)
+                    metadata["state_revision"] = current["state_revision"]
+                    if current["status"] != "active":
+                        decision, outcome_override = (
+                            "deny",
+                            "hard_stop.session_lifecycle",
+                        )
+                if (
+                    operator_bound
+                    or (workflow or {}).get("declared")
+                    or (metadata.get("policy_result") or {}).get("permission_basis")
+                    == "read_only_static"
+                ):
+                    cur.execute(
+                        "SELECT call_id, user_decision, evaluation_metadata FROM audit_log "
+                        "WHERE user_id = ? AND session_id = ? AND tool = ? AND args_hash = ? "
+                        "AND resolved_by = 'user' AND user_decision IS NOT NULL "
+                        "ORDER BY resolved_at DESC, id DESC",
+                        (user_id, session_id, tool, args_hash),
+                    )
+                    for denied in cur.fetchall():
+                        denial_meta = json.loads(denied["evaluation_metadata"] or "{}")
+                        if denial_meta.get("mode_identity") == metadata.get(
+                            "mode_identity"
+                        ):
+                            if denied["user_decision"] == "deny":
+                                decision, outcome_override = "deny", "human_resolution"
+                                metadata["human_denial_reference"] = denied["call_id"]
+                            # A newer exact human approval clears a prior veto;
+                            # it does not grant a reusable approval across policies.
+                            break
+                    if decision != "approve":
+                        metadata["admission"] = None
+                    final = metadata["final_policy_result"]
+                    if decision != final["decision"]:
+                        final.update(
+                            decision=decision,
+                            override=outcome_override,
+                            disposition="blocked",
+                            blocking_reasons=[
+                                *final["blocking_reasons"],
+                                outcome_override,
+                            ],
+                            waived_obligation_ids=[],
+                        )
+                        metadata["obligation_disposition"] = "blocked"
+                        reasoning = f"Authorization blocked: {outcome_override}."
+                if metadata.get("task_context"):
+                    from intaris.task_context import validate_freshness
+
+                    validate_freshness(cur, metadata, user_id, session_id)
+                if metadata.get("approval_reference"):
+                    cur.execute(
+                        "SELECT user_decision, evaluation_metadata FROM audit_log WHERE call_id = ? "
+                        "AND user_id = ? AND session_id = ? AND tool = ? AND args_hash = ?",
+                        (
+                            metadata["approval_reference"],
+                            user_id,
+                            session_id,
+                            tool,
+                            args_hash,
+                        ),
+                    )
+                    approved = cur.fetchone()
+                    approved_meta = (
+                        json.loads(approved["evaluation_metadata"] or "{}")
+                        if approved
+                        else {}
+                    )
+                    if (
+                        not approved
+                        or approved["user_decision"] != "approve"
+                        or approved_meta.get("state_revision")
+                        != metadata["state_revision"]
+                        or approved_meta.get("policy_hash")
+                        != metadata.get("policy_hash")
+                        or approved_meta.get("mode_identity")
+                        != metadata.get("mode_identity")
+                    ):
+                        raise HybridError(
+                            "stale_approval", "Approval changed before admission", 409
+                        )
+                cur.execute(
+                    "SELECT action_digest, effective_decision, decision, call_id FROM audit_log "
+                    "WHERE user_id = ? AND session_id = ? AND logical_call_id = ?",
+                    (user_id, session_id, metadata.get("logical_call_id")),
+                )
+                for previous in cur.fetchall():
+                    if previous["action_digest"] != metadata.get("action_digest"):
+                        raise HybridError(
+                            "logical_call_conflict",
+                            "Logical call arguments changed",
+                            409,
+                        )
+                    if previous["effective_decision"] == "approve" and not (
+                        previous["decision"] == "escalate"
+                        and previous["call_id"] == metadata.get("approval_reference")
+                    ):
+                        raise HybridError(
+                            "duplicate_admission",
+                            "Logical call already admitted; reconcile before retry",
+                            409,
+                        )
             cur.execute(
                 """
                 INSERT INTO audit_log
@@ -120,9 +319,10 @@ class AuditStore:
                      evaluation_path, decision, risk, reasoning, latency_ms,
                      args_hash, profile_version, intention, injection_detected,
                      raw_decision, effective_decision, maximum_outcome,
-                     minimum_outcome, outcome_override)
+                     minimum_outcome, outcome_override, evaluation_metadata,
+                     logical_call_id, action_digest)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -150,6 +350,11 @@ class AuditStore:
                     maximum_outcome,
                     minimum_outcome,
                     outcome_override,
+                    json.dumps(evaluation_metadata)
+                    if evaluation_metadata is not None
+                    else None,
+                    (evaluation_metadata or {}).get("logical_call_id"),
+                    (evaluation_metadata or {}).get("action_digest"),
                 ),
             )
 
@@ -223,6 +428,7 @@ class AuditStore:
             "profile_version": profile_version,
             "intention": intention,
             "injection_detected": injection_detected,
+            "evaluation_metadata": evaluation_metadata,
         }
 
     def get_by_call_id(self, call_id: str, *, user_id: str) -> dict[str, Any]:
@@ -452,6 +658,7 @@ class AuditStore:
                   AND record_type = 'tool_call'
                   AND user_decision IS NOT NULL
                   AND resolved_by = 'user'
+                  AND (resolution_scope IS NULL OR resolution_scope != 'action')
                   AND COALESCE(user_note, '') != 'Resolved via notification action link'
                 ORDER BY COALESCE(resolved_at, timestamp) DESC
                 LIMIT ?
@@ -460,6 +667,24 @@ class AuditStore:
             )
             rows = cur.fetchall()
 
+        return [_row_to_dict(row) for row in rows]
+
+    def get_human_denials(
+        self, session_id: str, *, user_id: str
+    ) -> list[dict[str, Any]]:
+        """Get every final human denial of a tool call in a session."""
+        with self._db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT tool, args_redacted, args_hash, evaluation_metadata
+                FROM audit_log
+                WHERE user_id = ? AND session_id = ?
+                  AND record_type = 'tool_call'
+                  AND resolved_by = 'user' AND user_decision = 'deny'
+                """,
+                (user_id, session_id),
+            )
+            rows = cur.fetchall()
         return [_row_to_dict(row) for row in rows]
 
     def find_approved_escalation(
@@ -524,6 +749,7 @@ class AuditStore:
         judge_reasoning: str | None = None,
         judge_decision: str | None = None,
         judge_risk: str | None = None,
+        hybrid_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a user decision on an escalated or denied tool call.
 
@@ -562,6 +788,53 @@ class AuditStore:
             )
 
         now = datetime.now(timezone.utc).isoformat()
+        existing = self.get_by_call_id(call_id, user_id=user_id)
+        existing_meta = existing.get("evaluation_metadata") or {}
+        from intaris import read_only
+        from intaris.policy_activation import HybridError
+
+        if user_decision == "approve" and (existing_meta.get("overlay") or {}).get(
+            "read_only_required"
+        ):
+            candidate = (
+                hybrid_metadata
+                if resolved_by == "judge" and hybrid_metadata
+                else existing_meta
+            )
+            mutation = candidate.get(
+                "mutation", candidate.get("facts", {}).get("mutation", "unclear")
+            )
+            if existing_meta.get("static_facts", {}).get("mutation") == "mutating":
+                mutation = "mutating"
+            bounded, _ = read_only.enforce(
+                "approve", existing_meta["overlay"], mutation
+            )
+            if bounded != "approve":
+                raise HybridError(
+                    "read_only_ceiling",
+                    "This call has no read-only proof; change mode in a new request",
+                    409,
+                )
+        if existing_meta.get("evaluation_policy_version") == "hybrid_v1":
+            from intaris.policy_activation import HybridError
+
+            if user_decision == "approve" and existing.get("minimum_outcome") == "deny":
+                raise HybridError(
+                    "mandatory_denial",
+                    "The request denial floor cannot be approved",
+                    409,
+                )
+            if (
+                resolved_by == "judge"
+                and user_decision == "approve"
+                and (
+                    (hybrid_metadata or existing_meta).get("human_approval_required")
+                    or existing.get("minimum_outcome") in {"deny", "escalate"}
+                )
+            ):
+                raise HybridError(
+                    "human_approval_required", "Judge cannot satisfy a human floor", 409
+                )
 
         # Atomic update: conditions in WHERE prevent TOCTOU races.
         # Matches unresolved escalations/denials OR records resolved by
@@ -569,18 +842,125 @@ class AuditStore:
         # decisions are final — resolved_by='user' is NOT matched.
         # COALESCE preserves existing judge_reasoning when the caller
         # does not provide it (i.e., human override passes None).
+        # Exact-action consent with no accompanying instruction changes only
+        # this receipt, not the authorization state of sibling actions.
+        action_local = (
+            resolved_by == "user"
+            and user_decision == "approve"
+            and not user_note
+            and existing.get("decision") == "escalate"
+            and (
+                existing.get("resolved_by") is None
+                or (
+                    existing.get("resolved_by") == "judge"
+                    and existing.get("user_decision") == "escalate"
+                    and existing.get("judge_decision") == "defer"
+                )
+            )
+            and existing.get("evaluation_path") != "alignment"
+            and existing_meta.get("evaluation_policy_version") == "hybrid_v1"
+            and bool(existing.get("action_digest"))
+        )
         with self._db.cursor() as cur:
+            if resolved_by == "user":
+                # Lock first; bump only after successful resolution below.
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, existing["session_id"]),
+                )
+            if existing_meta.get(
+                "evaluation_policy_version"
+            ) == "hybrid_v1" or existing_meta.get("overlay"):
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision "
+                    "WHERE user_id = ? AND session_id = ? AND policy_revision = ? "
+                    "AND state_revision = ? AND status = 'active'",
+                    (
+                        user_id,
+                        existing["session_id"],
+                        existing_meta["policy_revision"],
+                        existing_meta["state_revision"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise HybridError(
+                        "stale_resolution", "Session changed before resolution", 409
+                    )
+                if existing_meta.get("task_context"):
+                    from intaris.task_context import validate_freshness
+
+                    validate_freshness(
+                        cur,
+                        existing_meta,
+                        user_id,
+                        existing["session_id"],
+                        exclude_call_id=call_id,
+                    )
+                if (
+                    resolved_by == "judge"
+                    and hybrid_metadata is None
+                    and existing_meta.get("evaluation_policy_version") == "hybrid_v1"
+                ):
+                    raise HybridError(
+                        "invalid_judge_resolution",
+                        "Hybrid classification required",
+                        409,
+                    )
+            if resolved_by == "user" and existing_meta.get("policy_result"):
+                from intaris.hybrid import PolicyResult
+                from intaris.hybrid_runtime import finalize_result
+
+                final = finalize_result(
+                    PolicyResult.model_validate(existing_meta["policy_result"]),
+                    maximum=existing.get("maximum_outcome"),
+                    minimum=existing.get("minimum_outcome"),
+                    human_resolution=user_decision,
+                    overlay=existing_meta.get("overlay"),
+                    mutation=existing_meta.get("facts", {}).get("mutation", "unclear"),
+                )
+                if final.decision != user_decision:
+                    raise HybridError(
+                        "protected_floor", "Resolution violates a protected floor", 409
+                    )
+                hybrid_metadata = {
+                    **existing_meta,
+                    "final_policy_result": final.model_dump(mode="json"),
+                    "outstanding_obligations": [
+                        item.model_dump(mode="json")
+                        for item in final.outstanding_obligations
+                    ],
+                    "obligation_disposition": final.disposition,
+                }
+            if hybrid_metadata is not None:
+                cur.execute(
+                    "UPDATE audit_log SET evaluation_metadata = ? WHERE call_id = ? "
+                    "AND user_id = ? AND (user_decision IS NULL OR resolved_by = 'judge') "
+                    "AND evaluation_metadata = ?",
+                    (
+                        json.dumps(hybrid_metadata),
+                        call_id,
+                        user_id,
+                        json.dumps(existing_meta),
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise HybridError(
+                        "stale_resolution",
+                        "Audit evidence changed before resolution",
+                        409,
+                    )
             cur.execute(
                 """
                 UPDATE audit_log
                 SET user_decision = ?, user_note = ?, resolved_at = ?,
-                    resolved_by = ?,
+                    resolved_by = ?, resolution_scope = ?,
                     judge_reasoning = COALESCE(?, judge_reasoning),
                     judge_decision = COALESCE(?, judge_decision),
                     judge_risk = COALESCE(?, judge_risk),
                     effective_decision = ?
                 WHERE call_id = ? AND user_id = ?
-                  AND decision IN ('escalate', 'deny')
+                  AND (decision IN ('escalate', 'deny') OR ?)
                   AND (user_decision IS NULL OR resolved_by = 'judge')
                   AND (? != 'user' OR outcome_override IS NULL OR outcome_override != ?)
                 """,
@@ -589,12 +969,16 @@ class AuditStore:
                     user_note,
                     now,
                     resolved_by,
+                    "action" if action_local else "session",
                     judge_reasoning,
                     judge_decision,
                     judge_risk,
                     user_decision,
                     call_id,
                     user_id,
+                    (resolved_by == "judge" or existing.get("resolved_by") == "judge")
+                    and existing_meta.get("judge_required", False)
+                    and existing_meta.get("evaluation_policy_version") == "hybrid_v1",
                     resolved_by,
                     UNATTENDED_JUDGE_REVIEW,
                 ),
@@ -626,8 +1010,246 @@ class AuditStore:
                     )
                 # Shouldn't reach here, but raise generic error
                 raise ValueError(f"Failed to resolve call {call_id}")
+            if (
+                existing_meta.get("evaluation_policy_version") == "hybrid_v1"
+                and existing.get("evaluation_path") == "alignment"
+                and user_decision == "approve"
+                and resolved_by == "user"
+            ):
+                cur.execute(
+                    "UPDATE sessions SET alignment_state = 'ready', alignment_overridden = ?, "
+                    "updated_at = ? WHERE user_id = ? AND session_id = ?",
+                    (True, now, user_id, existing["session_id"]),
+                )
+            if resolved_by == "user" and not action_local:
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision + 1 "
+                    "WHERE user_id = ? AND session_id = ? "
+                    "RETURNING policy_revision, state_revision",
+                    (user_id, existing["session_id"]),
+                )
+                row = cur.fetchone()
+                revision = row["state_revision"]
+                resolution_revision = [row["policy_revision"], revision]
+                if existing_meta:
+                    # The receipt belongs to the post-decision authorization
+                    # state; otherwise it would invalidate itself immediately.
+                    receipt_meta = dict(hybrid_metadata or existing_meta)
+                    receipt_meta["state_revision"] = revision
+                    cur.execute(
+                        "UPDATE audit_log SET evaluation_metadata = ? "
+                        "WHERE call_id = ? AND user_id = ?",
+                        (json.dumps(receipt_meta), call_id, user_id),
+                    )
+            else:
+                cur.execute(
+                    "SELECT policy_revision, state_revision FROM sessions "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, existing["session_id"]),
+                )
+                row = cur.fetchone()
+                resolution_revision = (
+                    [row["policy_revision"], row["state_revision"]] if row else None
+                )
 
-        return self.get_by_call_id(call_id, user_id=user_id)
+        record = self.get_by_call_id(call_id, user_id=user_id)
+        # Authorization revision at the moment of resolution (not persisted);
+        # write-scope learning is valid only while it is still current.
+        record["resolution_revision"] = resolution_revision
+        return record
+
+    def mark_execution(self, call_id: str, *, user_id: str, state: str) -> dict:
+        """Durably claim dispatch once; a transport failure cannot reset the claim."""
+        from intaris.policy_activation import HybridError
+
+        record = self.get_by_call_id(call_id, user_id=user_id)
+        original = record.get("evaluation_metadata") or {}
+        expected = "not_dispatched" if state == "dispatched" else "dispatched"
+        if (
+            state not in {"dispatched", "completed", "uncertain"}
+            or original.get("execution_state") != expected
+        ):
+            raise HybridError(
+                "execution_state_conflict", "Execution already claimed or terminal", 409
+            )
+        if state == "dispatched":
+            admission = original.get("admission")
+            if not admission or datetime.now(timezone.utc) >= datetime.fromisoformat(
+                admission["dispatch_deadline"]
+            ):
+                raise HybridError(
+                    "expired_admission", "Admission expired before dispatch", 409
+                )
+        updated = {**original, "execution_state": state}
+        with self._db.cursor() as cur:
+            if state == "dispatched" and original.get("workflow_scope") is not None:
+                from intaris.workflow_scope import registry_revision
+
+                scope = original["workflow_scope"]
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision "
+                    "WHERE user_id = ? AND session_id = ?",
+                    (user_id, record["session_id"]),
+                )
+                if (
+                    cur.rowcount != 1
+                    or registry_revision(cur, user_id, record["session_id"])
+                    != scope["registry_revision"]
+                ):
+                    raise HybridError(
+                        "workflow_step_conflict",
+                        "Workflow declaration changed before dispatch",
+                        409,
+                    )
+            if state == "dispatched" and original.get("task_context"):
+                from intaris.task_context import validate_freshness
+
+                cur.execute(
+                    "UPDATE sessions SET state_revision = state_revision WHERE user_id = ? "
+                    "AND session_id = ? AND state_revision = ?",
+                    (user_id, record["session_id"], original["state_revision"]),
+                )
+                if cur.rowcount != 1:
+                    raise HybridError(
+                        "stale_task_context", "Sources changed before dispatch", 409
+                    )
+                validate_freshness(
+                    cur,
+                    original,
+                    user_id,
+                    record["session_id"],
+                    exclude_call_id=call_id,
+                )
+            cur.execute(
+                "UPDATE audit_log SET evaluation_metadata = ? WHERE call_id = ? AND user_id = ? "
+                "AND evaluation_metadata = ?",
+                (json.dumps(updated), call_id, user_id, json.dumps(original)),
+            )
+            if cur.rowcount != 1:
+                raise HybridError(
+                    "execution_state_conflict", "Concurrent execution claim", 409
+                )
+        return updated
+
+    def find_hybrid_approval(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        tool: str,
+        args_hash: str,
+        since: str,
+    ) -> dict | None:
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM audit_log WHERE user_id = ? AND session_id = ? "
+                "AND tool = ? AND args_hash = ? AND user_decision = 'approve' "
+                "AND evaluation_path != 'alignment' "
+                "AND resolved_at >= ? ORDER BY resolved_at DESC LIMIT 1",
+                (user_id, session_id, tool, args_hash, since),
+            )
+            row = cur.fetchone()
+        return _row_to_dict(row) if row else None
+
+    def get_latest_user_message(self, session_id: str, *, user_id: str) -> dict | None:
+        """Keep the latest user restriction independent of a rolling summary."""
+        from intaris.source_capture import user_reasoning_role_sql
+
+        role = user_reasoning_role_sql(self._db.backend)
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM audit_log WHERE user_id = ? AND session_id = ? "
+                "AND record_type = 'reasoning' AND content LIKE 'User message:%' "
+                "AND " + role + " = 'user' ORDER BY timestamp DESC, id DESC LIMIT 1",
+                (user_id, session_id),
+            )
+            row = cur.fetchone()
+        return _row_to_dict(row) if row else None
+
+    def set_hybrid_review(
+        self,
+        call_id: str,
+        *,
+        user_id: str,
+        metadata: dict,
+        reasoning: str,
+        risk: str | None,
+    ) -> None:
+        """Persist one unresolved classification review under the session CAS."""
+        from intaris.policy_activation import HybridError
+
+        record = self.get_by_call_id(call_id, user_id=user_id)
+        with self._db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET state_revision = state_revision "
+                "WHERE user_id = ? AND session_id = ? AND policy_revision = ? "
+                "AND state_revision = ? AND status = 'active'",
+                (
+                    user_id,
+                    record["session_id"],
+                    metadata["policy_revision"],
+                    metadata["state_revision"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise HybridError(
+                    "stale_resolution", "Session changed before review", 409
+                )
+            if metadata.get("task_context"):
+                from intaris.task_context import validate_freshness
+
+                validate_freshness(
+                    cur,
+                    metadata,
+                    user_id,
+                    record["session_id"],
+                    exclude_call_id=call_id,
+                )
+            cur.execute(
+                "UPDATE audit_log SET evaluation_metadata = ?, judge_reasoning = ?, "
+                "judge_decision = 'defer', judge_risk = ? "
+                "WHERE call_id = ? AND user_id = ? AND user_decision IS NULL "
+                "AND evaluation_metadata = ?",
+                (
+                    json.dumps(metadata),
+                    reasoning,
+                    risk,
+                    call_id,
+                    user_id,
+                    json.dumps(record["evaluation_metadata"]),
+                ),
+            )
+            if cur.rowcount != 1:
+                raise HybridError("stale_review", "Call changed during review", 409)
+
+    def record_model_view(
+        self, call_id: str, *, user_id: str, stage: str, view: dict
+    ) -> None:
+        """Record bounded diagnostics without overwriting concurrent policy/audit metadata."""
+        from intaris.policy_activation import HybridError
+
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT evaluation_metadata FROM audit_log WHERE call_id = ? AND user_id = ?",
+                (call_id, user_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("Audit call not found")
+            previous = row["evaluation_metadata"] or ""
+            metadata = json.loads(previous) if previous else {}
+            metadata[stage] = view
+            cur.execute(
+                "UPDATE audit_log SET evaluation_metadata = ? WHERE call_id = ? AND user_id = ? "
+                "AND COALESCE(evaluation_metadata, '') = ?",
+                (json.dumps(metadata), call_id, user_id, previous),
+            )
+            if cur.rowcount != 1:
+                raise HybridError(
+                    "stale_model_view",
+                    "Audit metadata changed before model dispatch",
+                    409,
+                )
 
     def set_judge_reasoning(
         self,
@@ -876,4 +1498,6 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
             d["args_redacted"] = json.loads(d["args_redacted"])
         except (json.JSONDecodeError, TypeError):
             pass
+    if d.get("evaluation_metadata"):
+        d["evaluation_metadata"] = json.loads(d["evaluation_metadata"])
     return d

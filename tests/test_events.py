@@ -1790,6 +1790,7 @@ class TestS3EventBackendCache:
         backend._chunk_cache_ttl = 60.0
         backend._cache_lock = threading.Lock()
         backend._chunk_cache = {}
+        backend._chunk_cache_chunks = 0
         backend._object_versions = {}
         backend._write_prefix_cache = {}
         backend._chunk_cache_hits = 0

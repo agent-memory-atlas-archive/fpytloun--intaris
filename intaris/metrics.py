@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from intaris.events.errors import EVENT_ROUTE, error_category
+
 DEFAULT_LATENCY_BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000)
 
 
@@ -60,6 +62,7 @@ class RuntimeMetrics:
         self._request_lock = threading.Lock()
         self._requests: dict[tuple[str, str, str], Histogram] = {}
         self._request_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+        self._event_outcomes: dict[tuple[str, str, str], int] = defaultdict(int)
         self.event_loop_delay = Histogram((1, 5, 10, 25, 50, 100, 250, 500))
 
     def observe_request(
@@ -68,6 +71,8 @@ class RuntimeMetrics:
         route: str,
         status_code: int,
         duration_ms: float,
+        event_error: str | None = None,
+        event_route: bool = False,
     ) -> None:
         status_group = f"{status_code // 100}xx"
         key = (method, route, status_group)
@@ -77,12 +82,21 @@ class RuntimeMetrics:
                 histogram = Histogram()
                 self._requests[key] = histogram
             self._request_counts[key] += 1
+            if route == EVENT_ROUTE or event_route:
+                bounded_method = (
+                    method if method in {"GET", "POST", "HEAD", "OPTIONS"} else "OTHER"
+                )
+                status = str(status_code) if 100 <= status_code <= 599 else "unknown"
+                self._event_outcomes[
+                    (bounded_method, status, error_category(status_code, event_error))
+                ] += 1
         histogram.observe(duration_ms)
 
     def snapshot(self) -> dict[str, Any]:
         with self._request_lock:
             items = list(self._requests.items())
             counts = dict(self._request_counts)
+            outcomes = dict(self._event_outcomes)
         return {
             "http": {
                 f"{method} {route} {status_group}": {
@@ -92,6 +106,15 @@ class RuntimeMetrics:
                 for (method, route, status_group), histogram in items
             },
             "event_loop_delay": self.event_loop_delay.snapshot(),
+            "event_http": [
+                {
+                    "method": method,
+                    "status": status,
+                    "category": category,
+                    "count": count,
+                }
+                for (method, status, category), count in sorted(outcomes.items())
+            ],
         }
 
 
@@ -112,6 +135,15 @@ def render_prometheus_metrics(
         "# TYPE intaris_database_transaction_latency_milliseconds histogram",
         "# TYPE intaris_database_pool_wait_latency_milliseconds histogram",
     ]
+    lines.append("# TYPE intaris_event_http_requests_total counter")
+    for outcome in runtime.get("event_http", []):
+        lines.append(
+            _sample(
+                "intaris_event_http_requests_total",
+                outcome["count"],
+                {key: outcome[key] for key in ("method", "status", "category")},
+            )
+        )
     for key, values in sorted(runtime.get("http", {}).items()):
         method, route, status_group = key.split(" ", 2)
         labels = {

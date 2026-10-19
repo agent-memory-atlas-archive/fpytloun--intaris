@@ -17,6 +17,7 @@ from intaris.api.schemas import (
     StatusUpdateRequest,
     StatusUpdateResponse,
 )
+from intaris.policy_activation import HybridError
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,25 @@ async def declare_intention(
 
     try:
         store = SessionStore(_get_db())
+        if request.workflow_step is not None:
+            from intaris.api.deps import authorize_controller
+            from intaris.hybrid import digest
+            from intaris.workflow_scope import WorkflowScopeStore
+
+            authorize_controller(
+                None,
+                request.session_id,
+                ctx,
+                declaration_digest=digest(request.workflow_step.model_dump()),
+            )
+            result = await asyncio.to_thread(
+                WorkflowScopeStore(_get_db()).install,
+                request.workflow_step,
+                user_id=ctx.user_id,
+                agent_id=ctx.agent_id,
+                claims=ctx.controller_claims,
+            )
+            return IntentionResponse(**result)
 
         # Validate parent session exists and belongs to the same user
         if request.parent_session_id:
@@ -65,7 +85,7 @@ async def declare_intention(
                     detail=(f"Parent session {request.parent_session_id} not found"),
                 )
 
-        await asyncio.to_thread(
+        session = await asyncio.to_thread(
             store.create,
             user_id=ctx.user_id,
             session_id=request.session_id,
@@ -75,6 +95,7 @@ async def declare_intention(
             policy=request.policy,
             parent_session_id=request.parent_session_id,
             agent_id=ctx.agent_id,
+            expected_policy_revision=request.expected_policy_revision,
         )
 
         # Publish session_created event
@@ -131,7 +152,20 @@ async def declare_intention(
             if alignment_barrier is not None:
                 await alignment_barrier.trigger(ctx.user_id, request.session_id)
 
+        policy = session.get("policy") or {}
+        if policy.get("evaluation_policy_version") == "hybrid_v1":
+            return IntentionResponse(
+                ok=True,
+                policy_revision=session["policy_revision"],
+                state_revision=session["state_revision"],
+                policy_hash=policy["policy_hash"],
+                active_policy=policy["active_policy"],
+            )
         return IntentionResponse(ok=True)
+    except HybridError as e:
+        from intaris.api.errors import hybrid_http_error
+
+        raise hybrid_http_error(e, session_id=request.session_id) from e
     except HTTPException:
         raise
     except ValueError as e:
@@ -265,12 +299,29 @@ async def update_session(
 
     try:
         store = SessionStore(_get_db())
+        if isinstance(request.policy, dict):
+            from intaris.api.schemas import SessionPolicy
+
+            current = await asyncio.to_thread(
+                store.get, session_id, user_id=ctx.user_id
+            )
+            version = request.policy.get(
+                "evaluation_policy_version",
+                (current.get("policy") or {}).get(
+                    "evaluation_policy_version", "legacy"
+                ),
+            )
+            if version == "legacy":
+                request.policy = SessionPolicy(**request.policy).model_dump(
+                    exclude_none=True
+                )
         session = await asyncio.to_thread(
             store.update_session,
             session_id,
             user_id=ctx.user_id,
             details=request.details,
             policy=request.policy,
+            expected_policy_revision=request.expected_policy_revision,
         )
 
         # Publish session_updated event
@@ -288,6 +339,10 @@ async def update_session(
             )
 
         return SessionResponse(**session)
+    except HybridError as e:
+        from intaris.api.errors import hybrid_http_error
+
+        raise hybrid_http_error(e, session_id=session_id) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception:

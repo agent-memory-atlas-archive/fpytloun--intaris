@@ -12,6 +12,7 @@
 |---|---|
 | [Architecture](architecture.md) | System design, layer responsibilities, and key design decisions |
 | [Evaluation Pipeline](evaluation-pipeline.md) | How tool calls are classified, evaluated, and decided |
+| [How Intaris Decides](how-intaris-decides.md) | Rich intention, Jev evaluator, user-simulator Judge and human-decision precedence, traced on one session |
 | [Jev Evaluator](jev-evaluator.md) | Experimental L1 backend, Groq comparison, benchmark results, and deployment status |
 
 ## Reference
@@ -42,3 +43,10 @@
 | Document | Description |
 |---|---|
 | [Development](development.md) | Setup, testing, linting, and code conventions |
+
+## Background
+
+| Document | Description |
+|---|---|
+| [Why We Rebuilt Evaluation](why-we-rebuilt-intaris-evaluation.md) | The story of the October 2026 redesign: what failed, what worked, and why |
+| [Evaluation Redesign Report](evaluation-redesign-2026-10.md) | The measurements behind the redesign: benchmarks, failures, fixes, final results |

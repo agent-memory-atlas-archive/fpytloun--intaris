@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hmac
 import logging
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import jwt
-from jwt import InvalidTokenError, PyJWKClient
+from jwt import InvalidTokenError, PyJWKClient, PyJWKSet
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +18,97 @@ _EXPECTED_ISSUER = "cognis"
 _EXPECTED_AUDIENCE = "intaris"
 _JWKS_CACHE_TTL_SECONDS = 300
 _JWKS_TIMEOUT_SECONDS = 5
+# Minimum spacing between JWKS fetches, bounding refreshes triggered by
+# unknown kids or tokens that fail validation with the cached key.
+_JWKS_MIN_REFRESH_INTERVAL_SECONDS = 10
+# After a failed fetch, do not contact the JWKS endpoint again for this long.
+# Requests keep using the last known keys (bounded by the stale limit) or fail
+# fast instead of each blocking on the fetch timeout.
+_JWKS_FAILURE_BACKOFF_SECONDS = 30
+# Maximum age of last known keys still accepted while the endpoint is failing.
+_JWKS_MAX_STALE_SECONDS = 3600
+
+
+class JWKSKeyCache:
+    """Thread-safe JWKS key cache with single-flight refresh and failure backoff.
+
+    Callers resolve keys synchronously; concurrent refreshes are serialized so
+    an unavailable JWKS endpoint costs at most one fetch timeout per backoff
+    window instead of one per request.
+    """
+
+    def __init__(
+        self,
+        jwks_url: str,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._client = PyJWKClient(
+            jwks_url,
+            cache_jwk_set=False,
+            cache_keys=False,
+            timeout=_JWKS_TIMEOUT_SECONDS,
+        )
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._keys: dict[str | None, object] = {}
+        self._fetched_at: float | None = None
+        self._last_attempt_at: float | None = None
+        self._retry_after = 0.0
+
+    def get_key(self, kid: str | None, *, force_refresh: bool = False) -> object:
+        """Return the verification key for ``kid``.
+
+        Raises:
+            InvalidTokenError: If no usable key can be resolved.
+        """
+        with self._lock:
+            now = self._clock()
+            fresh = (
+                self._fetched_at is not None
+                and now - self._fetched_at < _JWKS_CACHE_TTL_SECONDS
+            )
+            if force_refresh or not fresh or kid not in self._keys:
+                self._maybe_refresh(now)
+            key = self._keys.get(kid)
+            if key is None:
+                raise InvalidTokenError("Unable to resolve JWT signing key")
+            if (
+                self._fetched_at is None
+                or now - self._fetched_at > _JWKS_MAX_STALE_SECONDS
+            ):
+                raise InvalidTokenError("JWKS keys are stale and cannot be refreshed")
+            return key
+
+    def _maybe_refresh(self, now: float) -> None:
+        if now < self._retry_after:
+            return
+        if (
+            self._last_attempt_at is not None
+            and now - self._last_attempt_at < _JWKS_MIN_REFRESH_INTERVAL_SECONDS
+        ):
+            return
+        self._last_attempt_at = now
+        try:
+            data = self._client.fetch_data()
+            if not isinstance(data, dict):
+                raise ValueError("JWKS endpoint did not return a JSON object")
+            jwk_set = PyJWKSet.from_dict(data)
+        except Exception as exc:
+            self._retry_after = now + _JWKS_FAILURE_BACKOFF_SECONDS
+            logger.warning(
+                "JWKS refresh failed; backing off for %ss (%s)",
+                _JWKS_FAILURE_BACKOFF_SECONDS,
+                exc.__class__.__name__,
+            )
+            return
+        keys: dict[str | None, object] = {k.key_id: k.key for k in jwk_set.keys}
+        if len(jwk_set.keys) == 1:
+            # Tokens without a kid header may use the only published key.
+            keys.setdefault(None, jwk_set.keys[0].key)
+        self._keys = keys
+        self._fetched_at = self._clock()
+        self._retry_after = 0.0
 
 
 @dataclass(frozen=True)
@@ -23,6 +117,7 @@ class JWTAuthContext:
 
     user_id: str
     agent_id: str | None = None
+    controller_claims: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +128,7 @@ class AuthResolution:
     agent_id: str | None
     user_bound: bool
     method: str
+    controller_claims: dict | None = None
 
 
 class CognisJWTValidator:
@@ -42,7 +138,9 @@ class CognisJWTValidator:
         self._public_key_path = public_key_path
         self._jwks_url = jwks_url
         self._public_key: str | None = None
-        self._jwks_client: PyJWKClient | None = None
+        self._jwks_cache: JWKSKeyCache | None = (
+            JWKSKeyCache(jwks_url) if jwks_url and not public_key_path else None
+        )
 
         if self._public_key_path:
             with open(self._public_key_path, encoding="utf-8") as f:
@@ -69,8 +167,34 @@ class CognisJWTValidator:
         if claim_agent_id and header_agent_id and claim_agent_id != header_agent_id:
             raise InvalidTokenError("X-Agent-Id does not match JWT agent_id claim")
 
+        controller = None
+        if claims.get("typ") == "controller":
+            required = ("session_id", "agent_id", "jti", "iat", "nbf", "exp")
+            if any(key not in claims for key in required):
+                raise InvalidTokenError(
+                    "Controller token missing binding/lifetime claims"
+                )
+            if not all(
+                isinstance(claims[key], str) and claims[key]
+                for key in ("session_id", "agent_id", "jti")
+            ):
+                raise InvalidTokenError("Invalid controller identity claims")
+            if not all(
+                type(claims[key]) in (int, float) for key in ("iat", "nbf", "exp")
+            ):
+                raise InvalidTokenError("Invalid controller lifetime")
+            if not 0 < claims["exp"] - claims["iat"] <= 300:
+                raise InvalidTokenError("Controller lifetime exceeds five minutes")
+            if (
+                not isinstance(claims.get("capabilities"), list)
+                or "intaris:controller_context" not in claims["capabilities"]
+            ):
+                raise InvalidTokenError("Controller capability missing")
+            controller = claims
         return JWTAuthContext(
-            user_id=user_id, agent_id=claim_agent_id or header_agent_id
+            user_id=user_id,
+            agent_id=claim_agent_id or header_agent_id,
+            controller_claims=controller,
         )
 
     def decode_claims(self, token: str) -> dict:
@@ -90,31 +214,21 @@ class CognisJWTValidator:
         if self._public_key is not None:
             return self._decode_with_key(token, self._public_key)
 
-        last_error: Exception | None = None
-        for force_refresh in (False, True):
-            try:
-                key = (
-                    self._get_jwks_client(force_refresh)
-                    .get_signing_key_from_jwt(token)
-                    .key
-                )
-                return self._decode_with_key(token, key)
-            except InvalidTokenError as e:
-                last_error = e
-                if not force_refresh:
-                    logger.info(
-                        "JWT validation failed with cached JWKS key; refreshing"
-                    )
-                    continue
-                raise
-            except Exception as e:  # pragma: no cover - defensive wrapper
-                last_error = e
-                if not force_refresh:
-                    logger.info("JWKS lookup failed; refreshing JWKS cache")
-                    continue
-                raise InvalidTokenError("Failed to resolve JWT signing key") from e
+        if self._jwks_cache is None:
+            raise InvalidTokenError("JWT validation is not configured")
 
-        raise InvalidTokenError("JWT validation failed") from last_error
+        kid = jwt.get_unverified_header(token).get("kid")
+        key = self._jwks_cache.get_key(kid)
+        try:
+            return self._decode_with_key(token, key)
+        except InvalidTokenError:
+            # The signing key may have rotated; retry once with a (rate
+            # limited) refresh, and only if the resolved key changed.
+            refreshed = self._jwks_cache.get_key(kid, force_refresh=True)
+            if refreshed is key:
+                raise
+            logger.info("JWT validation failed with cached JWKS key; refreshed")
+            return self._decode_with_key(token, refreshed)
 
     @staticmethod
     def _decode_with_key(token: str, key: object) -> dict:
@@ -126,21 +240,10 @@ class CognisJWTValidator:
             audience=_EXPECTED_AUDIENCE,
         )
 
-    def _get_jwks_client(self, force_refresh: bool = False) -> PyJWKClient:
-        if force_refresh or self._jwks_client is None:
-            if not self._jwks_url:
-                raise InvalidTokenError("JWT validation is not configured")
-            self._jwks_client = PyJWKClient(
-                self._jwks_url,
-                cache_jwk_set=True,
-                lifespan=_JWKS_CACHE_TTL_SECONDS,
-                timeout=_JWKS_TIMEOUT_SECONDS,
-            )
-        return self._jwks_client
-
 
 _validator: CognisJWTValidator | None = None
 _validator_config: tuple[str, str] | None = None
+_validator_lock = threading.Lock()
 
 
 def get_jwt_validator(
@@ -150,19 +253,22 @@ def get_jwt_validator(
     """Return a cached JWT validator for the current configuration."""
     global _validator, _validator_config
 
-    if not public_key_path and not jwks_url:
-        _validator = None
-        _validator_config = None
-        return None
+    # Auth runs in worker threads; serialize creation so concurrent cold-start
+    # requests share one validator (and one JWKS cache/backoff state).
+    with _validator_lock:
+        if not public_key_path and not jwks_url:
+            _validator = None
+            _validator_config = None
+            return None
 
-    config_key = (public_key_path, jwks_url)
-    if _validator is None or _validator_config != config_key:
-        _validator = CognisJWTValidator(
-            public_key_path=public_key_path,
-            jwks_url=jwks_url,
-        )
-        _validator_config = config_key
-    return _validator
+        config_key = (public_key_path, jwks_url)
+        if _validator is None or _validator_config != config_key:
+            _validator = CognisJWTValidator(
+                public_key_path=public_key_path,
+                jwks_url=jwks_url,
+            )
+            _validator_config = config_key
+        return _validator
 
 
 def looks_like_jwt(token: str) -> bool:
@@ -214,6 +320,7 @@ def resolve_auth(
                 agent_id=auth_ctx.agent_id,
                 user_bound=True,
                 method="jwt",
+                controller_claims=auth_ctx.controller_claims,
             )
 
     mapped_user_id = match_api_key(token, api_keys)

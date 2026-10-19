@@ -310,6 +310,11 @@ def _make_response(content: str):
     )
 
 
+class _FakeOptions:
+    def with_options(self, **kwargs):
+        return self
+
+
 class TestTransientLLMFailures:
     def test_generate_retries_rate_limit_and_succeeds(self, monkeypatch):
         calls = []
@@ -324,7 +329,7 @@ class TestTransientLLMFailures:
                     )
                 return _make_response('{"ok": true}')
 
-        class _FakeOpenAI:
+        class _FakeOpenAI(_FakeOptions):
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=_FakeCompletions())
 
@@ -343,14 +348,15 @@ class TestTransientLLMFailures:
 
         assert client.generate([{"role": "user", "content": "hi"}]) == '{"ok": true}'
         assert len(calls) == 2
-        assert sleeps == [pytest.approx(4.7052)]
+        # Retry-after is honored up to the 2 s backoff cap.
+        assert sleeps == [pytest.approx(2.0)]
 
     def test_generate_raises_friendly_error_after_retry_exhausted(self, monkeypatch):
         class _FakeCompletions:
             def create(self, **params):
                 raise _FakeRateLimitError("Rate limit reached")
 
-        class _FakeOpenAI:
+        class _FakeOpenAI(_FakeOptions):
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=_FakeCompletions())
 
@@ -373,7 +379,7 @@ class TestTransientLLMFailures:
             def create(self, **params):
                 raise _FakeRateLimitError("Rate limit reached")
 
-        class _FakeOpenAI:
+        class _FakeOpenAI(_FakeOptions):
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=_FakeCompletions())
 
@@ -420,7 +426,7 @@ class TestTransientLLMFailures:
                     }
                 )
 
-        class _FakeOpenAI:
+        class _FakeOpenAI(_FakeOptions):
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=_FakeCompletions())
 
@@ -476,7 +482,7 @@ class TestTransientLLMFailures:
                     )
                 )
 
-        class _FakeOpenAI:
+        class _FakeOpenAI(_FakeOptions):
             def __init__(self, **kwargs):
                 self.chat = SimpleNamespace(completions=_FakeCompletions())
 

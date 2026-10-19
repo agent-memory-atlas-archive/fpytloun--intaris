@@ -1143,7 +1143,7 @@ class _RecordingEvaluator:
         self.decision = decision
         self.calls: list[dict] = []
 
-    def evaluate(self, **kwargs):
+    async def evaluate_async(self, **kwargs):
         self.calls.append(kwargs)
         return {
             "decision": self.decision,

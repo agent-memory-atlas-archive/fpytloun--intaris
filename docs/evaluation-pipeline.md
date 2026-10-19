@@ -1,6 +1,10 @@
-# Evaluation Pipeline
+# Legacy Evaluation Pipeline
 
-How Intaris classifies, evaluates, and decides on every tool call.
+This page describes legacy mode, not the hybrid release candidate. For hybrid
+behavior see [stage separation](evaluation-stage-separation.md) and
+[How Intaris decides](how-intaris-decides.md). The
+[release verification record](release-verification-2026-10.md) identifies which
+mode and source coverage were actually measured.
 
 ## Overview
 

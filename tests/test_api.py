@@ -25,13 +25,19 @@ def _reset_server_globals(monkeypatch):
     import intaris.server as srv
 
     monkeypatch.setenv("METRICS_ENABLED", "false")
+    # This module exercises the original evaluator response schema and mocks
+    # _llm_evaluation_flow. Hybrid/default contracts live in test_hybrid_api and
+    # test_release_policy_defaults; legacy is now an explicit test selection.
+    monkeypatch.setenv("EVALUATION_POLICY_VERSION", "legacy")
     srv._config = None
     srv._db = None
     srv._evaluator = None
+    srv._evaluator_backend = None
     yield
     srv._config = None
     srv._db = None
     srv._evaluator = None
+    srv._evaluator_backend = None
 
 
 @pytest.fixture
@@ -102,6 +108,16 @@ def client_with_auth(env_with_auth):
 def _auth_headers(token: str = "test-api-key") -> dict:
     """Create auth headers."""
     return {"Authorization": f"Bearer {token}"}
+
+
+def _decision_flow(decision):
+    """Stub the resumable model boundary without changing outcome assertions."""
+
+    def complete(**kwargs):
+        yield from ()
+        return decision
+
+    return complete
 
 
 @pytest.mark.parametrize("actual", ["deny", "escalate", "approve"])
@@ -189,8 +205,8 @@ def test_maximum_outcome_api_matrix(client_no_auth, maximum, minimum, raw):
     _set_app_state(client, "event_bus", bus)
     with patch.object(
         _get_evaluator(),
-        "_llm_evaluate",
-        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision(raw, "high", "Raw assessment", "llm")),
     ) as llm:
         response = client.post(
             "/api/v1/evaluate",
@@ -263,8 +279,8 @@ def test_unattended_task_outcome_is_never_escalated_or_silently_allowed(
     _set_app_state(client, "event_bus", bus)
     with patch.object(
         _get_evaluator(),
-        "_llm_evaluate",
-        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision(raw, "high", "Raw assessment", "llm")),
     ):
         response = client.post(
             "/api/v1/evaluate",
@@ -296,6 +312,64 @@ def test_unattended_task_outcome_is_never_escalated_or_silently_allowed(
     session = client.get("/api/v1/session/unattended", headers=headers).json()
     assert session["escalated_count"] == 0
     assert session["approved_count" if expected == "approve" else "denied_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "failure,status,code",
+    [
+        ("budget", 413, "context_insufficient"),
+        ("malformed", 502, "invalid_model_response"),
+    ],
+)
+def test_evaluate_model_failure_is_not_session_not_found(
+    client_no_auth, failure, status, code, monkeypatch
+):
+    from intaris.input_budget import ContextInsufficientError
+    from intaris.server import _get_evaluator
+
+    headers = {"X-User-Id": "budget-user", "X-Agent-Id": "budget-agent"}
+    client_no_auth.post(
+        "/api/v1/intention",
+        headers=headers,
+        json={
+            "session_id": "budget-session",
+            "intention": "Edit the local report",
+        },
+    ).raise_for_status()
+    llm = _get_evaluator()._llm
+    monkeypatch.setattr(llm, "generate", Mock())
+    if failure == "budget":
+        llm.generate.side_effect = ContextInsufficientError(
+            {
+                "overflow": True,
+                "bytes": 120000,
+                "application_fallback": "UNKNOWN-CAPACITY",
+            }
+        )
+    else:
+        llm.generate.side_effect = None
+        llm.generate.return_value = "not a valid structured assessment"
+    response = client_no_auth.post(
+        "/api/v1/evaluate",
+        headers=headers,
+        json={
+            "session_id": "budget-session",
+            "tool": "write",
+            "args": {"path": "/tmp/report"},
+        },
+    )
+    assert response.status_code == status, response.text
+    assert response.json()["detail"]["code"] == code
+    missing = client_no_auth.post(
+        "/api/v1/evaluate",
+        headers=headers,
+        json={
+            "session_id": "missing-budget-session",
+            "tool": "write",
+            "args": {},
+        },
+    )
+    assert missing.status_code == 404
 
 
 @pytest.mark.parametrize("judge_enabled", [False, True])
@@ -398,8 +472,8 @@ def test_unattended_task_judge_resolves_before_final_outcome(
     _set_app_state(client, "judge_reviewer", judge)
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision(raw, "high", "Raw assessment", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision(raw, "high", "Raw assessment", "llm")),
     ):
         response = client.post(
             "/api/v1/evaluate",
@@ -490,8 +564,8 @@ def test_unattended_provisional_review_is_not_human_approvable(client_no_auth):
     _set_app_state(client, "judge_reviewer", Reviewer())
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision("deny", "medium", "Needs review", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision("deny", "medium", "Needs review", "llm")),
     ):
         response = client.post(
             "/api/v1/evaluate",
@@ -559,8 +633,8 @@ def test_unattended_repeat_call_requires_fresh_judge_review(
     }
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision("deny", "medium", "Needs review", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision("deny", "medium", "Needs review", "llm")),
     ) as llm_evaluate:
         first = client.post("/api/v1/evaluate", headers=headers, json=body)
         first.raise_for_status()
@@ -622,8 +696,8 @@ def test_unattended_call_does_not_reuse_prior_human_approval(client_no_auth):
     _set_app_state(client, "judge_reviewer", None)
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision("deny", "medium", "Needs review", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision("deny", "medium", "Needs review", "llm")),
     ):
         first = client.post("/api/v1/evaluate", headers=headers, json=body)
     first.raise_for_status()
@@ -669,8 +743,8 @@ def test_unattended_call_does_not_reuse_prior_human_approval(client_no_auth):
     body["session_id"] = "unattended"
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision("deny", "medium", "Needs review", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(Decision("deny", "medium", "Needs review", "llm")),
     ) as llm_evaluate:
         second = client.post("/api/v1/evaluate", headers=headers, json=body)
     second.raise_for_status()
@@ -720,8 +794,10 @@ def test_unattended_judge_error_persists_denial(client_no_auth, maximum):
     )
     with patch.object(
         evaluator,
-        "_llm_evaluate",
-        return_value=Decision("escalate", "medium", "Needs review", "llm"),
+        "_llm_evaluation_flow",
+        side_effect=_decision_flow(
+            Decision("escalate", "medium", "Needs review", "llm")
+        ),
     ):
         response = client.post(
             "/api/v1/evaluate",
@@ -832,7 +908,12 @@ def test_maximum_outcome_hard_stop_provenance(client_no_auth, stop):
     client = client_no_auth
     headers = {"X-User-Id": "ceiling-user", "X-Agent-Id": "ceiling-agent"}
     store = SessionStore(_get_db())
-    store.create(session_id="parent", user_id="ceiling-user", intention="Test")
+    store.create(
+        session_id="parent",
+        user_id="ceiling-user",
+        intention="Test",
+        policy={"maximum_outcome": "approve"},
+    )
     store.create(
         session_id="stopped",
         user_id="ceiling-user",
@@ -1231,7 +1312,7 @@ class _FakeEvaluator:
     def __init__(self, result: dict):
         self._result = result
 
-    def evaluate(self, **kwargs):
+    async def evaluate_async(self, **kwargs):
         return dict(self._result)
 
     def get_behavioral_context(self, user_id, agent_id):
@@ -3662,12 +3743,14 @@ class TestAnalysisEndpoints:
             [
                 {
                     "type": "assistant_message",
-                    "data": {"content": "I can push ainews into origin/main for you."},
+                    "data": {
+                        "content": "I can push the sample repository into origin/main for you."
+                    },
                 },
                 {
                     "type": "user_message",
                     "data": {
-                        "content": "Ok I allow to push ainews into origin:main. Try again"
+                        "content": "Ok I allow to push the sample repository into origin:main. Try again"
                     },
                 },
             ],
@@ -3690,10 +3773,10 @@ class TestAnalysisEndpoints:
         audit = AuditStore(_get_db())
         record = audit.get_by_call_id(call_id, user_id="user-reason-events")
         assert record["content"] == (
-            "User message: Ok I allow to push ainews into origin:main. Try again"
+            "User message: Ok I allow to push the sample repository into origin:main. Try again"
         )
         assert record["args_redacted"]["context"] == (
-            "I can push ainews into origin/main for you."
+            "I can push the sample repository into origin/main for you."
         )
         assert record["args_redacted"]["intention_eligible"] is True
         assert isinstance(record["args_redacted"]["source_event_seq"], int)
@@ -3709,6 +3792,25 @@ class TestAnalysisEndpoints:
         assert events[0]["data"]["call_id"] == call_id
         assert events[0]["data"]["content"] == record["content"]
         assert events[0]["data"]["from_events"] is True
+
+        # A client retry of the same report (e.g. after a lost response) is a no-op.
+        retry = client_no_auth.post(
+            "/api/v1/reasoning",
+            json={
+                "session_id": "sess-reason-events",
+                "content": "",
+                "from_events": True,
+            },
+            headers=headers,
+        )
+        assert retry.status_code == 200
+        assert retry.json()["call_id"] == call_id
+        events_resp = client_no_auth.get(
+            "/api/v1/session/sess-reason-events/events",
+            params={"type": "reasoning"},
+            headers=headers,
+        )
+        assert len(events_resp.json()["events"]) == 1
 
     def test_ineligible_event_is_audited_without_triggering_intention(
         self, client_no_auth

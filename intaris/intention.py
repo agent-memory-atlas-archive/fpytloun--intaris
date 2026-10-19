@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 from intaris.audit import AuditStore
 from intaris.db import Database
-from intaris.llm import LLMClient
+from intaris.llm import STRUCTURED_OUTPUT_MAX_TOKENS, LLMClient
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
     ANTI_INJECTION_PREAMBLE,
@@ -116,6 +116,58 @@ _REASONING_CONTEXT_LIMIT = 20
 _REASONING_CONTEXT_CHAR_BUDGET = 6000
 
 
+def _schema_rejected(error: Exception) -> bool:
+    """Inspect provider metadata locally; never log provider bodies or output."""
+    body = getattr(error, "body", None)
+    if body is None:
+        response = getattr(error, "response", None)
+        try:
+            body = response.json() if response is not None else None
+        except (ValueError, TypeError):
+            body = None
+    encoded = json.dumps(body, default=str).lower()
+    code = str(getattr(error, "code", "")).lower()
+    return any(
+        marker in encoded or marker in code
+        for marker in (
+            "json_validate_failed",
+            "invalid_json_schema",
+            "schema_validation_error",
+            "schema_validation_failed",
+        )
+    ) or (
+        "response_format" in encoded
+        and any(
+            word in encoded
+            for word in ("unsupported", "not supported", "invalid schema")
+        )
+    )
+
+
+class IntentionGenerationFailure(Exception):
+    """Safe failure metadata for bounded recovery, never provider text or payloads."""
+
+    def __init__(self, source_digest: str, error: Exception):
+        self.source_digest = source_digest
+        self.error_class = type(error).__name__
+        self.status = getattr(error, "status_code", None)
+        self.schema_rejected = _schema_rejected(error)
+        self.retryable = (
+            self.schema_rejected
+            or self.status
+            in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }
+            or self.error_class in {"APIConnectionError", "APITimeoutError"}
+        )
+        super().__init__("Rich intention generation unavailable")
+
+
 def generate_intention(
     *,
     llm: LLMClient,
@@ -130,6 +182,12 @@ def generate_intention(
     decision_context: dict[str, Any] | None = None,
     source_event_seq: int | None = None,
     freshness_check: Callable[[], bool] | None = None,
+    jev: Any | None = None,
+    generation: str = "spans",
+    recover_failures: bool = False,
+    expected_source_digest: str | None = None,
+    response_mode: str = "json_schema",
+    validation_repair: bool = True,
 ) -> str | None:
     """Generate an updated intention from reasoning payloads and tool calls.
 
@@ -228,11 +286,6 @@ def generate_intention(
             continue
         if latest_user_message is None and content.startswith("User message:"):
             latest_user_message = content[len("User message:") :].strip() or None
-        remaining = _REASONING_CONTEXT_CHAR_BUDGET - used_chars
-        if remaining <= 0:
-            break
-        if len(content) > remaining:
-            content = content[: max(0, remaining - 3)] + "..."
         selected_reasoning.append(content)
         used_chars += len(content) + 4
 
@@ -246,6 +299,16 @@ def generate_intention(
     current_title = session.get("title")
     current_intention = session.get("intention", "unknown")
     prompt_parts = [f"Working directory: {sanitize_for_prompt(wd)}"]
+    initial_assignment = session.get("original_assignment")
+    if initial_assignment:
+        prompt_parts.append(
+            "Original assignment (labelled context, not independent human authorization):\n"
+            + wrap_with_boundary(sanitize_for_prompt(initial_assignment), "context")
+        )
+    else:
+        prompt_parts.append(
+            "Original assignment: unavailable (current generated intention is not substituted)."
+        )
 
     if latest_user_message:
         safe_latest = sanitize_for_prompt(latest_user_message)
@@ -257,6 +320,7 @@ def generate_intention(
     # For sub-sessions, include parent intention to keep the
     # generated intention within the parent's scope
     parent_session_id = session.get("parent_session_id")
+    parent_intention = None
     if parent_session_id:
         try:
             parent_session = session_store.get(parent_session_id, user_id=user_id)
@@ -319,6 +383,35 @@ def generate_intention(
         f"Intention: {sanitize_for_prompt(current_intention)}"
     )
     prompt_parts.append("Generate the updated title and intention:")
+
+    if (
+        (session.get("policy") or {}).get("intention_gate") == "jev"
+        and intention_source == "user"
+        and not decision_context
+        # A stable goal does not mean stable restrictions or approval scope.
+        # The single rich generator owns those facts and must refresh them.
+        and generation != "single"
+    ):
+        from intaris.config import JevConfig
+        from intaris.jev import JevClient
+
+        gate = jev
+        try:
+            gate = gate or JevClient(JevConfig())
+            vote = gate.intention_gate(
+                state={
+                    "current_intention": current_intention,
+                    "evidence": "\n\n".join(prompt_parts),
+                }
+            )
+            if vote == "keep":
+                return None
+        except Exception:
+            # Unavailable or malformed gate must preserve the existing refresh.
+            logger.warning("Intention gate unavailable; retaining refresh behavior")
+        finally:
+            if gate is not None and jev is None:
+                gate.close()
 
     messages = [
         {
@@ -383,13 +476,198 @@ def generate_intention(
         },
     ]
 
+    captured, profile, generation_metrics = None, None, None
     try:
-        raw = llm.generate(messages, max_tokens=500)
+        if generation == "single":
+            from intaris import intention_profile
+
+            captured = intention_profile.snapshot(db, session, event_store=event_store)
+            if (
+                expected_source_digest is not None
+                and captured["source_digest"] != expected_source_digest
+            ) or (
+                recover_failures
+                and freshness_check is not None
+                and not freshness_check()
+            ):
+                return None
+            messages = [
+                {"role": "system", "content": intention_profile.SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": intention_profile.prompt_parts(
+                        captured,
+                        session,
+                        tool_summary,
+                        parent_intention=parent_intention
+                        if parent_session_id
+                        else None,
+                    ),
+                },
+            ]
+            start = time.monotonic()
+            schema = intention_profile.wire_schema(
+                require_items=bool(captured["profile_sources"])
+            )
+            source_chars = sum(
+                len(row["content"]) for row in captured["profile_sources"]
+            )
+            max_tokens = min(8192, max(4096, 2048 + (source_chars + 3) // 4))
+            if response_mode == "json_object":
+                messages[0] = {
+                    **messages[0],
+                    "content": messages[0]["content"]
+                    + "\nReturn JSON conforming to this schema:\n"
+                    + json.dumps(schema["schema"], ensure_ascii=False),
+                }
+            try:
+                # A strict JSON schema guarantees shape, not valid source spans.
+                # The same bounded repair applies to either wire format.
+                for validation_attempt in range(2 if validation_repair else 1):
+                    try:
+                        raw = llm.generate(
+                            messages,
+                            max_tokens=max_tokens,
+                            json_schema=schema,
+                            single_attempt=True,
+                            response_mode=response_mode,
+                        )
+                    except Exception:
+                        if not validation_attempt:
+                            raise
+                        # Do not multiply the barrier's retry budget after repair.
+                        # The first completion still undergoes local validation.
+                        break
+                    _, parsed_intention = _parse_title_intention(raw, current_title)
+                    validation_details = []
+                    parsed = intention_profile.parse_profile(
+                        raw, captured, parsed_intention, diagnostics=validation_details
+                    )
+                    problems = validation_details or (
+                        parsed["validation"]["drop_reasons"] if parsed else []
+                    )
+                    # Reuse the existing bounded repair for malformed selectors,
+                    # not for genuine uncertainty or missing antecedents.
+                    if parsed:
+                        problems = [
+                            *problems,
+                            *[
+                                row
+                                for row in parsed["validation"].get(
+                                    "confirmation_diagnostics", []
+                                )
+                                if row["form"] == "single_permission"
+                                and row["reason"]
+                                in {
+                                    "unmatched_selector",
+                                    "nonliteral_selector",
+                                    "trailing_context_omitted",
+                                }
+                            ],
+                        ]
+                    logger.info(
+                        "Profile validation attempt=%s problems=%s",
+                        validation_attempt + 1,
+                        json.dumps(problems),
+                    )
+                    selector_repair = any(
+                        row.get("code") == "unproved_confirmation" for row in problems
+                    )
+                    if (
+                        not problems
+                        or validation_attempt
+                        or (response_mode != "json_object" and not selector_repair)
+                    ):
+                        break
+                    messages = [
+                        {
+                            **messages[0],
+                            "content": messages[0]["content"]
+                            + "\nInternal validation feedback (not user/task evidence): "
+                            "The profile did not fully validate. Regenerate the "
+                            "complete JSON using the exact schema and ORIGINAL LANGUAGE "
+                            "verbatim source quotes; never paraphrase. Derive the title "
+                            "and intention only from the unchanged source payload, "
+                            "never from these repair instructions. Safe validation "
+                            "diagnostics: "
+                            + json.dumps(problems)
+                            + "\nSchema: "
+                            + json.dumps(schema["schema"]),
+                        },
+                        messages[1],
+                    ]
+            except Exception as exc:
+                if recover_failures:
+                    raise IntentionGenerationFailure(
+                        captured["source_digest"], exc
+                    ) from None
+                raise
+            finally:
+                metrics = getattr(llm, "generation_metrics", None)
+                generation_metrics = (
+                    metrics
+                    if isinstance(metrics, dict)
+                    else {
+                        "calls": 1,
+                        "latency_ms": round((time.monotonic() - start) * 1000),
+                        "prompt_tokens": None,
+                        "completion_tokens": None,
+                    }
+                )
+                generation_metrics = {
+                    **generation_metrics,
+                    "prompt_chars": sum(len(m["content"]) for m in messages),
+                    "response_mode": response_mode,
+                    "max_tokens": max_tokens,
+                }
+                logger.info(
+                    "Intention generation metrics user=%s session=%s generation=single metrics=%s",
+                    user_id,
+                    session_id,
+                    json.dumps(generation_metrics, sort_keys=True),
+                )
+        else:
+            raw = llm.generate(messages, max_tokens=STRUCTURED_OUTPUT_MAX_TOKENS)
         title, intention = _parse_title_intention(raw, current_title)
-        if not intention or len(intention) < 5:
+        if captured is not None:
+            profile = intention_profile.parse_profile(raw, captured, intention)
             logger.info(
-                "LLM returned too-short intention (%d chars) for session=%s",
+                "Intention profile validation user=%s session=%s status=%s dropped=%s drop_reasons=%s",
+                user_id,
+                session_id,
+                "ready" if profile and profile.get("available") else "unavailable",
+                profile["validation"]["dropped"] if profile else None,
+                profile["validation"]["drop_reasons"] if profile else None,
+            )
+        unavailable_profile = captured is not None and (
+            not profile or not profile.get("available")
+        )
+        if unavailable_profile or not intention or len(intention) < 5:
+            if generation == "single" and (
+                freshness_check is None or freshness_check()
+            ):
+                # An unusable extraction cannot replace the declared/last valid
+                # intention or retain old derived grants. Original user evidence
+                # remains available independently through raw-context fallback.
+                session_store.update_generated_intention(
+                    session_id,
+                    user_id=user_id,
+                    intention=current_intention,
+                    intention_source=session.get("intention_source") or "initial",
+                    title=None,
+                    intention_profile=None,
+                    expected_state_revision=session["state_revision"],
+                    expected_user_message_seq=source_event_seq
+                    if source_event_seq is not None
+                    else session.get("latest_user_message_seq"),
+                    guard_user_message_seq=intention_source == "user",
+                    require_no_user_message=intention_source == "bootstrap",
+                )
+            logger.info(
+                "Skipped unusable intention update (%d chars, profile_unavailable=%s) "
+                "for session=%s",
                 len(intention or ""),
+                unavailable_profile,
                 session_id,
             )
             return None
@@ -421,6 +699,14 @@ def generate_intention(
             expected_user_message_seq=expected_user_message_seq,
             guard_user_message_seq=guard_user_message_seq,
             require_no_user_message=intention_source == "bootstrap",
+            **(
+                {
+                    "intention_profile": profile,
+                    "expected_state_revision": session["state_revision"],
+                }
+                if generation == "single"
+                else {}
+            ),
         )
         if not updated:
             logger.info(
@@ -472,6 +758,16 @@ def generate_intention(
                                 "new_intention": intention,
                                 "old_title": old_title or None,
                                 "new_title": title,
+                                **(
+                                    {
+                                        "generation": generation_metrics,
+                                        "profile_validation": profile.get("validation")
+                                        if profile
+                                        else None,
+                                    }
+                                    if generation_metrics is not None
+                                    else {}
+                                ),
                             },
                         }
                     ],
@@ -481,6 +777,8 @@ def generate_intention(
                 logger.debug("Failed to append intention_updated event", exc_info=True)
 
         return intention
+    except IntentionGenerationFailure:
+        raise
     except Exception as e:
         logger.warning("Failed to generate intention: %s", e)
         return None
@@ -512,9 +810,11 @@ class IntentionBarrier:
         llm: LLMClient,
         timeout_ms: int = _DEFAULT_TIMEOUT_MS,
         poll_timeout_ms: int = _DEFAULT_POLL_TIMEOUT_MS,
+        generation: str = "spans",
     ) -> None:
         self._db = db
         self._llm = llm
+        self._generation = generation
         self._timeout = timeout_ms / 1000.0
         self._poll_timeout = poll_timeout_ms / 1000.0
         self._event_bus: Any | None = None
@@ -533,6 +833,11 @@ class IntentionBarrier:
         # Set at the start of trigger(), cleared when _run() completes.
         self._last_user_message_time: dict[tuple[str, str], float] = {}
         self._generation_tokens: dict[tuple[str, str], str] = {}
+        self._source_events: dict[tuple[str, str], int | None] = {}
+        self.recovery_attempts = 0
+        self.recovery_exhausted = 0
+        self.recovery_non_retryable = 0
+        self._recovery_delays = (2.0, 8.0)
 
         # Metrics
         self.wait_count: int = 0
@@ -575,6 +880,9 @@ class IntentionBarrier:
             "arrival_hit_count": self.arrival_hit_count,
             "arrival_timeout_count": self.arrival_timeout_count,
             "user_message_tracked": len(self._last_user_message_time),
+            "recovery_attempts": self.recovery_attempts,
+            "recovery_exhausted": self.recovery_exhausted,
+            "recovery_non_retryable": self.recovery_non_retryable,
         }
 
     async def trigger(
@@ -606,6 +914,16 @@ class IntentionBarrier:
             source_event_seq: Durable sequence of the eligible source event.
         """
         key = (user_id, session_id)
+        pending = self._pending.get(key)
+        if (
+            self._generation == "single"
+            and source_event_seq is not None
+            and self._source_events.get(key) == source_event_seq
+            and pending is not None
+            and not pending[1].done()
+        ):
+            return
+        self._source_events[key] = source_event_seq
         generation_token = str(uuid.uuid4())
         self._generation_tokens[key] = generation_token
 
@@ -675,6 +993,7 @@ class IntentionBarrier:
         """
         key = (user_id, session_id)
         self._generation_tokens.pop(key, None)
+        self._source_events.pop(key, None)
         old = self._pending.pop(key, None)
         if old is not None:
             old_event, old_task = old
@@ -858,9 +1177,15 @@ class IntentionBarrier:
             loop = asyncio.get_running_loop()
             session_store = SessionStore(self._db)
 
-            result = await loop.run_in_executor(
-                None,
-                functools.partial(
+            expected_source_digest = None
+            response_mode = (
+                "json_object"
+                if getattr(self._llm, "profile_response_mode", None) == "json_object"
+                else "json_schema"
+            )
+            fallback_used = False
+            for attempt in range(len(self._recovery_delays) + 1):
+                call = functools.partial(
                     generate_intention,
                     llm=self._llm,
                     db=self._db,
@@ -872,11 +1197,53 @@ class IntentionBarrier:
                     context=context,
                     decision_context=decision_context,
                     source_event_seq=source_event_seq,
+                    generation=self._generation,
+                    **(
+                        {
+                            "recover_failures": True,
+                            "expected_source_digest": expected_source_digest,
+                            "response_mode": response_mode,
+                            "validation_repair": attempt == 0,
+                        }
+                        if self._generation == "single"
+                        else {}
+                    ),
                     freshness_check=lambda: (
                         self._generation_tokens.get(key) == generation_token
                     ),
-                ),
-            )
+                )
+                try:
+                    result = await loop.run_in_executor(None, call)
+                    break
+                except IntentionGenerationFailure as exc:
+                    self.update_errors += 1
+                    logger.warning(
+                        "Rich intention unavailable user=%s session=%s attempt=%d "
+                        "error_class=%s status=%s retryable=%s",
+                        user_id,
+                        session_id,
+                        attempt + 1,
+                        exc.error_class,
+                        exc.status,
+                        exc.retryable,
+                    )
+                    if fallback_used:
+                        self.recovery_exhausted += 1
+                        return
+                    if not exc.retryable:
+                        self.recovery_non_retryable += 1
+                        return
+                    if attempt == len(self._recovery_delays):
+                        self.recovery_exhausted += 1
+                        return
+                    expected_source_digest = exc.source_digest
+                    if exc.schema_rejected:
+                        response_mode = "json_object"
+                        fallback_used = True
+                    await asyncio.sleep(self._recovery_delays[attempt])
+                    if self._generation_tokens.get(key) != generation_token:
+                        return
+                    self.recovery_attempts += 1
 
             if result is not None:
                 self.update_count += 1
@@ -925,6 +1292,7 @@ class IntentionBarrier:
             await asyncio.sleep(0)
             if self._pending.get(key, (None, None))[0] is event:
                 del self._pending[key]
+                self._source_events.pop(key, None)
             # Clear the user message timestamp now that the barrier is
             # done.  This prevents wait() from doing a spurious arrival
             # wait on subsequent evaluate calls — the intention update

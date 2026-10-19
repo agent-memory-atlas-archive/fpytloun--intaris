@@ -110,6 +110,23 @@ function auditTab() {
           resolved_at: new Date().toISOString(),
         });
       }
+      if (data.type === 'judge_reviewed') {
+        this._refreshReview(data.call_id);
+      }
+    },
+
+    async _refreshReview(callId) {
+      if (!callId) return;
+      try {
+        const fresh = await IntarisAPI.getAuditRecord(callId);
+        const record = this.records.find(r => r.source !== 'event' && r.call_id === callId);
+        if (record) Object.assign(record, fresh);
+        if (this.expandedRecord?.call_id === callId) {
+          this.expandedRecord = fresh;
+        }
+      } catch (_) {
+        // Existing evidence stays visible until the next successful fetch.
+      }
     },
 
     async load() {

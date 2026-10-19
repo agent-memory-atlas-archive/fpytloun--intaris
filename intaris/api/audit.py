@@ -146,6 +146,23 @@ async def resolve_decision(
 
         return DecisionResponse(ok=True)
     except ValueError as e:
+        from intaris.policy_activation import HybridError
+
+        if isinstance(e, HybridError):
+            from intaris.api.errors import hybrid_http_error
+
+            record = await asyncio.to_thread(
+                store.get_by_call_id, request.call_id, user_id=ctx.user_id
+            )
+            raise hybrid_http_error(
+                e,
+                session_id=record["session_id"],
+                tool=record.get("tool"),
+                call_id=request.call_id,
+                logical_call_id=(record.get("evaluation_metadata") or {}).get(
+                    "logical_call_id"
+                ),
+            ) from e
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception:
         logger.exception("Error in /decision")

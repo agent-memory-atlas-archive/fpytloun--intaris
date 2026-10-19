@@ -138,6 +138,31 @@ List sessions with pagination and filtering.
 
 Get full session details including counters and metadata.
 
+Hybrid sessions also expose `active_policy` (profile, compiled `rules`, and
+`advisory_clauses`) and `policy_hash`. Top-level `advisory_clauses` mirrors the
+active snapshot's list, or is null for legacy sessions. Each clause has `id`,
+`effect` (`allow`/`deny`), `text`, and original `source`. Unsupported English
+remains advisory operator data rather than preventing session activation.
+
+`intention_profile` is a nullable read-only view of the persisted rich intention.
+It contains `version`, `available`, `items`, zero-based `current` item indices,
+and `validation` (`dropped`, `dropped_current`, and `drop_reasons` entries with
+zero-based `item` and finite `code`). Items expose `kind`, exact `quote`, `status`,
+nullable `msg` (one-based numbering of retained profile sources), and optional
+`approves` scope. Internal source content, offsets, watermarks and integrity
+bindings are not included. No profile or malformed storage returns null; old
+profiles may be unavailable. These fields also appear in session list/update
+responses. This view is not an authority or an editing interface.
+
+Audit `evaluation_metadata.stages` includes structured Judge `classification`
+(`user_would`, `basis`, `question`, `cites`, `operator_policy_ids`) and
+`citation_sources` (`index`, `ref`, exact presented `text`). Citation numbering
+belongs to that captured Judge request, not the session's intention profile.
+L1 `abstentions` and observed effect provenance remain available in metadata;
+`l1_projection` is null when L1 did not run. The UI reads these fields directly,
+never parses reasoning prose. A tenant-scoped `judge_reviewed` stream event
+notifies clients that an unresolved call's review metadata can be refetched.
+
 **Response:**
 
 ```json

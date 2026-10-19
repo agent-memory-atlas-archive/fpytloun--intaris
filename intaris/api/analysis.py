@@ -151,6 +151,17 @@ async def submit_reasoning(
                 # The client may have called this before events were flushed,
                 # or no user messages exist yet.
                 return ReasoningResponse(ok=True, call_id="")
+            # A client retry after a lost response must not record the same
+            # user event twice.
+            latest = audit_store.get_latest_user_message(
+                request.session_id, user_id=ctx.user_id
+            )
+            if (
+                latest is not None
+                and isinstance(latest.get("args_redacted"), dict)
+                and latest["args_redacted"].get("source_event_seq") == resolved.seq
+            ):
+                return ReasoningResponse(ok=True, call_id=latest["call_id"])
 
             user_content = resolved.content
             assistant_context = resolved.assistant_context

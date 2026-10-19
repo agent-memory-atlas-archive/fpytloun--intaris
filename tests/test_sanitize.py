@@ -612,10 +612,8 @@ class TestPromptHardening:
             agent_id=None,
         )
 
-        # Full 200-char note should not appear
-        assert long_note not in result
-        # But truncated version with ellipsis should
-        assert "..." in result
+        # Complete human scope/conditions survive until final capacity accounting.
+        assert long_note in result
 
     def test_user_approved_escalation_suppresses_reasoning(self):
         """User-approved escalation must NOT show original reasoning.
@@ -794,6 +792,7 @@ class TestSessionPolicyValidation:
             session_id="test",
             intention="Build a web app",
             policy={
+                "evaluation_policy_version": "legacy",
                 "allow_tools": ["read"],
                 "evil_key": "inject this",
             },
@@ -844,7 +843,7 @@ class TestEvaluateRequestContextValidation:
     def test_oversized_context_rejected(self):
         from intaris.api.schemas import EvaluateRequest
 
-        with pytest.raises(ValueError, match="context dict exceeds 8 KB"):
+        with pytest.raises(ValueError, match="Serialized context exceeds limit"):
             EvaluateRequest(
                 session_id="test",
                 tool="bash",

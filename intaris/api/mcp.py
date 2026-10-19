@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from intaris.api.deps import SessionContext, get_session_context
+from intaris.api.schemas import EvaluationExtensions
 from intaris.mcp.store import MCPServerStore
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,7 @@ class ToolPreferenceResponse(BaseModel):
     )
 
 
-class ToolCallRequest(BaseModel):
+class ToolCallRequest(EvaluationExtensions):
     """Request to call an MCP tool via the REST proxy."""
 
     session_id: str = Field(..., description="Intaris session ID")
@@ -101,6 +102,9 @@ class ToolCallRequest(BaseModel):
     arguments: dict[str, Any] = Field(
         default_factory=dict, description="Tool arguments"
     )
+    context: dict[str, Any] | None = None
+    minimum_outcome: str | None = None
+    approval_call_id: str | None = None
 
 
 # ── Helper ───────────────────────────────────────────────────────────
@@ -440,6 +444,9 @@ async def call_tool(
             pass  # Session not found — evaluator will catch it.
 
     try:
+        from intaris.api.deps import authorize_controller
+
+        authorize_controller(body.controller_context, body.session_id, ctx)
         result = await mcp_proxy.call_tool_rest(
             user_id=ctx.user_id,
             agent_id=agent_id,
@@ -447,10 +454,33 @@ async def call_tool(
             server_name=body.server,
             tool_name=body.tool,
             arguments=body.arguments,
+            **{
+                key: getattr(body, key)
+                for key in (
+                    *EvaluationExtensions.model_fields,
+                    "context",
+                    "minimum_outcome",
+                    "approval_call_id",
+                )
+                if getattr(body, key) is not None
+            },
         )
         return result
     except ValueError as exc:
+        from intaris.policy_activation import HybridError
+
+        if isinstance(exc, HybridError):
+            from intaris.api.errors import hybrid_http_error
+
+            raise hybrid_http_error(
+                exc,
+                session_id=body.session_id,
+                tool=f"{body.server}:{body.tool}",
+                logical_call_id=body.logical_call_id,
+            ) from exc
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("MCP tool call failed: %s:%s", body.server, body.tool)
         raise HTTPException(

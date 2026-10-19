@@ -1,0 +1,137 @@
+"""Static read grants retain legacy latency without treating exemptions as effects."""
+
+import pytest
+
+from intaris.classifier import (
+    _READ_ONLY_TOOLS,
+    is_read_only,
+    observe_hybrid,
+    verified_read_only_bash,
+)
+from tests.test_hybrid_races import race_store as race_store
+
+EXAMPLES = [
+    ("get_current_datetime", {"timezone": "UTC"}),
+    ("skill_load", {"skill_id": "cognis-coding"}),
+    ("read", {"file_path": "/repo/README.md"}),
+    ("grep", {"path": "/repo", "pattern": "test"}),
+    ("list_directory", {"path": "/repo"}),
+    ("bash", {"command": "git rev-parse HEAD origin/main"}),
+    ("bash", {"command": "git status --short; git rev-parse HEAD origin/main"}),
+]
+
+
+@pytest.mark.parametrize("operand", ["HEAD:.env", "HEAD:private.env", ".env"])
+def test_git_sensitive_blob_and_path_denial(operand):
+    command = f"git show --no-ext-diff --no-textconv {operand}"
+    facts = observe_hybrid(
+        "bash",
+        {"command": command},
+        policy={"deny_paths": ["*.env", "**/*.env"]},
+        working_directory="/repo",
+    )
+    assert not facts["static_read"]
+    assert facts["configured_deny"]
+    assert facts["secret_argument"]
+
+
+def test_existing_configured_git_drivers_are_trusted(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for key in ("diff.external", "diff.private.textconv"):
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "config", key, "unexpected-helper"], check=True
+        )
+    assert verified_read_only_bash({"command": "git diff"})
+    assert verified_read_only_bash({"command": "git show HEAD:file"})
+    assert verified_read_only_bash({"command": "git diff --no-ext-diff --no-textconv"})
+
+
+@pytest.mark.parametrize("profile", ["balanced", "bounded_autonomy"])
+@pytest.mark.parametrize("tool,args", EXAMPLES)
+def test_production_reads_never_infer(race_store, profile, tool, args):
+    sessions, audit, llm, evaluator, sid = race_store
+    sessions.update_session(sid, user_id="race-owner", policy={"profile": profile})
+    llm.generate.side_effect = AssertionError("Static read must not infer")
+    result = evaluator.evaluate(
+        user_id="race-owner",
+        session_id=sid,
+        agent_id=None,
+        tool=tool,
+        args=args,
+        context={"chat_mode": "plan"},
+    )
+    assert result["decision"] == "approve"
+    assert (
+        result["evaluation_metadata"]["policy_result"]["permission_basis"]
+        == "read_only_static"
+    )
+    assert not result["evaluation_metadata"]["judge_required"]
+    assert not result["evaluation_metadata"]["stages"]
+    llm.generate.assert_not_called()
+    assert (
+        audit.get_by_call_id(result["call_id"], user_id="race-owner")["decision"]
+        == "approve"
+    )
+
+
+@pytest.mark.parametrize("tool", sorted(_READ_ONLY_TOOLS))
+def test_legacy_local_tool_table(race_store, tool):
+    sessions, _, llm, evaluator, sid = race_store
+    assert is_read_only(tool, {})
+    result = evaluator.evaluate(
+        user_id="race-owner", session_id=sid, agent_id=None, tool=tool, args={}
+    )
+    if tool != "todowrite":
+        assert result["decision"] == "approve"
+        assert (
+            result["evaluation_metadata"]["policy_result"]["permission_basis"]
+            == "read_only_static"
+        )
+        llm.generate.assert_not_called()
+    else:
+        # Legacy labels a metadata mutation as READ; that is not effect proof.
+        assert (
+            result["evaluation_metadata"]["policy_result"]["permission_basis"]
+            != "read_only_static"
+        )
+
+
+@pytest.mark.parametrize(
+    "guard", ["strict", "deny", "advisory", "sensitive", "human", "floor"]
+)
+def test_fast_path_guards(race_store, guard):
+    sessions, audit, llm, evaluator, sid = race_store
+    policy = {
+        "strict": {"profile": "strict"},
+        "deny": {"deny_tools": ["read"]},
+        "advisory": {"deny_policies": ["Do not read private project material."]},
+    }.get(guard, {})
+    if policy:
+        sessions.update_session(sid, user_id="race-owner", policy=policy)
+    if guard == "advisory":
+        llm.generate.side_effect = AssertionError("Advisory text never routes")
+    args = {"file_path": "/repo/.env" if guard == "sensitive" else "/repo/README.md"}
+    kwargs = dict(
+        user_id="race-owner", session_id=sid, agent_id=None, tool="read", args=args
+    )
+    if guard == "human":
+        pending = evaluator.evaluate(**kwargs, minimum_outcome="escalate")
+        audit.resolve_escalation(pending["call_id"], "deny", user_id="race-owner")
+    result = evaluator.evaluate(
+        **kwargs, **({"minimum_outcome": "deny"} if guard == "floor" else {})
+    )
+    if guard in {"deny", "human", "floor"}:
+        assert result["decision"] == "deny"
+    elif guard == "advisory":
+        assert result["decision"] == "approve"
+        assert (
+            result["evaluation_metadata"]["policy_result"]["permission_basis"]
+            == "read_only_static"
+        )
+    else:
+        assert (
+            result["evaluation_metadata"]["policy_result"]["permission_basis"]
+            != "read_only_static"
+        )

@@ -2938,11 +2938,20 @@ def _get_session_summaries_for_analysis(
                    risk_indicators, tools_used, call_count, approved_count,
                    denied_count, escalated_count, window_start, window_end,
                    trigger
-            FROM session_summaries
+            FROM session_summaries AS selected
             WHERE user_id = ? AND session_id IN ({placeholders})
+              AND (
+                  summary_type = 'compacted'
+                  OR session_id NOT IN (
+                      SELECT session_id FROM session_summaries
+                      WHERE user_id = ?
+                        AND session_id IN ({placeholders})
+                        AND summary_type = 'compacted'
+                  )
+              )
             ORDER BY window_start ASC
             """,
-            [user_id] + session_ids,
+            [user_id] + session_ids + [user_id] + session_ids,
         )
         summary_rows = [dict(row) for row in cur.fetchall()]
 

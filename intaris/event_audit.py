@@ -107,17 +107,21 @@ class EventAuditStore:
             )
 
         with self._db.cursor() as cur:
-            for row in rows:
+            # Stay below SQLite's legacy 999-variable limit; every batch and
+            # the contiguous checkpoint remain in the same transaction.
+            for offset in range(0, len(rows), 80):
+                batch = rows[offset : offset + 80]
+                values = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(batch))
                 cur.execute(
-                    """
+                    f"""
                     INSERT INTO audit_event_index
                         (user_id, session_id, seq, timestamp, event_type,
                          event_source, tool, call_id, audit_call_id, is_error,
                          duration_ms)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES {values}
                     ON CONFLICT (user_id, session_id, seq) DO NOTHING
                     """,
-                    row,
+                    [value for row in batch for value in row],
                 )
             cur.execute(
                 """

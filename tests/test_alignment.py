@@ -22,7 +22,9 @@ def db(tmp_path):
 
 
 @pytest.fixture
-def session_store(db):
+def session_store(db, monkeypatch):
+    # These evaluator/lifecycle fixtures use the original alignment schema.
+    monkeypatch.setenv("EVALUATION_POLICY_VERSION", "legacy")
     return SessionStore(db)
 
 
@@ -114,9 +116,9 @@ class TestCheckIntentionAlignment:
         assert aligned is True
         assert reasoning == ""
 
-    def test_jev_backend_is_used_without_llm(self):
-        """Jev handles bounded alignment while generative LLM stays separate."""
-        from intaris.alignment import check_intention_alignment
+    def test_negative_jev_without_reviewer_is_unavailable(self):
+        """A model-derived negative result cannot masquerade as reviewed scope."""
+        from intaris.alignment import AlignmentUnavailable, check_intention_alignment
 
         jev = MagicMock()
         jev.check_alignment.return_value = (
@@ -124,33 +126,29 @@ class TestCheckIntentionAlignment:
             "Jev classified the child intention as not aligned.",
         )
 
-        aligned, reasoning = check_intention_alignment(
-            llm=None,
-            jev=jev,
-            parent_intention="Maintain the web application",
-            child_intention="Delete production backups",
-        )
-
-        assert aligned is False
-        assert "not aligned" in reasoning
+        with pytest.raises(AlignmentUnavailable):
+            check_intention_alignment(
+                llm=None,
+                jev=jev,
+                parent_intention="Maintain the web application",
+                child_intention="Delete production backups",
+            )
         jev.check_alignment.assert_called_once()
 
     def test_jev_failure_escalates_instead_of_failing_open(self):
-        """Unverified Jev alignment is represented as misalignment."""
-        from intaris.alignment import check_intention_alignment
+        """Unverified alignment remains blocked without claiming a conflict."""
+        from intaris.alignment import AlignmentUnavailable, check_intention_alignment
 
         jev = MagicMock()
         jev.check_alignment.side_effect = RuntimeError("provider unavailable")
 
-        aligned, reasoning = check_intention_alignment(
-            llm=None,
-            jev=jev,
-            parent_intention="Maintain the web application",
-            child_intention="Update the API documentation",
-        )
-
-        assert aligned is False
-        assert "could not be verified" in reasoning
+        with pytest.raises(AlignmentUnavailable):
+            check_intention_alignment(
+                llm=None,
+                jev=jev,
+                parent_intention="Maintain the web application",
+                child_intention="Update the API documentation",
+            )
 
 
 # ── AlignmentBarrier tests ────────────────────────────────────────────
@@ -262,24 +260,17 @@ class TestAlignmentBarrier:
         mock_llm.generate.assert_not_called()
         assert barrier.check_count == 0
 
-    def test_parent_not_found_skips_check(self, db, mock_llm, session_store):
-        """If parent session doesn't exist, alignment check is skipped."""
-        session_store.create(
-            user_id="user-1",
-            session_id="orphan-1",
-            intention="Do something",
-            parent_session_id="nonexistent-parent",
-        )
-
-        barrier = _make_barrier(db, mock_llm)
-
-        async def _test():
-            await barrier.trigger("user-1", "orphan-1")
-            result = await barrier.wait("user-1", "orphan-1")
-            assert result is True
-
-        asyncio.run(_test())
-
+    def test_parent_not_found_rejects_creation(self, db, mock_llm, session_store):
+        """Delegation cannot bypass inherited restrictions through a missing parent."""
+        with pytest.raises(ValueError, match="not found"):
+            session_store.create(
+                user_id="user-1",
+                session_id="orphan-1",
+                intention="Do something",
+                parent_session_id="nonexistent-parent",
+            )
+        with pytest.raises(ValueError, match="not found"):
+            session_store.get("orphan-1", user_id="user-1")
         mock_llm.generate.assert_not_called()
 
     def test_timeout_fails_open(self, db, session_store):

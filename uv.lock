@@ -637,7 +637,7 @@ wheels = [
 
 [[package]]
 name = "intaris"
-version = "0.11.0"
+version = "0.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -645,6 +645,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastembed" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "openai" },
     { name = "pydantic" },
@@ -672,8 +673,9 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.100.0" },
     { name = "fastembed", specifier = ">=0.3.0" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "jsonschema", specifier = ">=4.20" },
     { name = "mcp", specifier = ">=1.6.0,<1.27.0" },
-    { name = "openai", specifier = ">=1.0.0" },
+    { name = "openai", specifier = ">=2.26.0" },
     { name = "psycopg2-binary", marker = "extra == 'postgresql'", specifier = ">=2.9.0" },
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8.0" },

@@ -1136,7 +1136,8 @@ class TestTaskQueueRecentlyCompleted:
         task_id = task_queue.enqueue(
             "intention_update", TEST_USER, session_id="sess_rc"
         )
-        task_queue.complete(task_id)
+        task = task_queue.claim_next()
+        task_queue.complete(task_id, claim_token=task["claim_token"])
 
         result = task_queue.recently_completed(
             "intention_update", TEST_USER, session_id="sess_rc"
@@ -1148,7 +1149,8 @@ class TestTaskQueueRecentlyCompleted:
         task_id = task_queue.enqueue(
             "intention_update", TEST_USER, session_id="sess_rc_a"
         )
-        task_queue.complete(task_id)
+        task = task_queue.claim_next()
+        task_queue.complete(task_id, claim_token=task["claim_token"])
 
         result = task_queue.recently_completed(
             "intention_update", TEST_USER, session_id="sess_rc_b"
@@ -1160,7 +1162,8 @@ class TestTaskQueueRecentlyCompleted:
         task_id = task_queue.enqueue(
             "intention_update", TEST_USER, session_id="sess_rc"
         )
-        task_queue.complete(task_id)
+        task = task_queue.claim_next()
+        task_queue.complete(task_id, claim_token=task["claim_token"])
 
         result = task_queue.recently_completed(
             "intention_update", OTHER_USER, session_id="sess_rc"
@@ -1181,7 +1184,8 @@ class TestTaskQueueRecentlyCompleted:
         task_id = task_queue.enqueue(
             "intention_update", TEST_USER, session_id="sess_rc"
         )
-        task_queue.complete(task_id)
+        task = task_queue.claim_next()
+        task_queue.complete(task_id, claim_token=task["claim_token"])
 
         result = task_queue.recently_completed(
             "intention_update",
@@ -1260,12 +1264,14 @@ class TestParentIntentionPrompt:
             user_id=TEST_USER,
             session_id="parent-sess",
             intention="Build user dashboard",
+            policy={"evaluation_policy_version": "legacy"},
         )
         session_store.create(
             user_id=TEST_USER,
             session_id="child-sess",
             intention="Explore components",
             parent_session_id="parent-sess",
+            policy={"evaluation_policy_version": "legacy"},
         )
 
         # Mock LLM to capture the prompt
@@ -1312,6 +1318,7 @@ class TestParentIntentionPrompt:
             user_id=TEST_USER,
             session_id="root-sess",
             intention="Root session intention",
+            policy={"evaluation_policy_version": "legacy"},
         )
 
         mock_llm = MagicMock()

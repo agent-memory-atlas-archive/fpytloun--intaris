@@ -56,6 +56,10 @@ _session_agent_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _session_user_bound: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "session_user_bound", default=False
 )
+_controller_claims: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "controller_claims",
+    default=None,
+)
 # user_bound is True when the API key maps to a specific user_id.
 # When True, the UI should prevent user impersonation (X-User-Id override).
 # Enforcement is deferred to the UI layer — the middleware always sets it.
@@ -71,7 +75,7 @@ _session_intention: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _config = None
 _db = None
 _evaluator = None
-_jev_client = None
+_evaluator_backend = None
 _mcp_proxy_ref = None  # Module-level reference for _MCPEndpoint ASGI wrapper
 
 
@@ -91,19 +95,38 @@ def _get_db():
     return _db
 
 
-def _get_jev_client():
-    global _jev_client
-    cfg = _get_config()
-    if not cfg.jev.enabled:
-        return None
-    if _jev_client is None:
+def _get_evaluator_backend():
+    """Process-wide per-call evaluator selector (llm, jev, or auto)."""
+    global _evaluator_backend
+    if _evaluator_backend is None:
+        from intaris.config import evaluator_backend_mode
+        from intaris.evaluator_backend import EvaluatorBackend
+        from intaris.inference import managed_endpoint, token_supplier
         from intaris.jev import JevClient
 
-        _jev_client = JevClient(cfg.jev)
-    return _jev_client
+        cfg = _get_config()
+        mode = evaluator_backend_mode()
+        endpoint = managed_endpoint()
+        backend = None
+
+        def jev_factory():
+            return JevClient(
+                cfg.jev,
+                on_protocol_mismatch=(backend.protocol_mismatch if endpoint else None),
+            )
+
+        backend = EvaluatorBackend(
+            mode,
+            jev_factory=jev_factory if cfg.jev.enabled else None,
+            models_url=f"{endpoint}/models" if endpoint else None,
+            token=token_supplier() if endpoint else None,
+            timeout_s=cfg.llm.timeout_ms / 1000.0,
+        )
+        _evaluator_backend = backend
+    return _evaluator_backend
 
 
-def _get_evaluator(alignment_barrier=None):
+def _get_evaluator(alignment_barrier=None, analysis_llm=None, event_store=None):
     global _evaluator
     if _evaluator is None:
         from intaris.audit import AuditStore
@@ -113,14 +136,47 @@ def _get_evaluator(alignment_barrier=None):
 
         cfg = _get_config()
         db = _get_db()
+        context_owner = None
+        if cfg.hybrid_context_mode == "source_context":
+            from intaris.hybrid import digest
+            from intaris.task_context import TaskContext
+
+            analysis_llm = analysis_llm or (
+                LLMClient(cfg.llm_analysis) if cfg.llm_analysis.api_key else None
+            )
+            context_owner = TaskContext(
+                llm=analysis_llm,
+                sessions=SessionStore(db),
+                audit=AuditStore(db),
+                generation=cfg.source_context_generation,
+                extractor_identity={
+                    "model": cfg.llm_analysis.model,
+                    "endpoint_digest": digest(cfg.llm_analysis.base_url),
+                    "temperature": cfg.llm_analysis.temperature,
+                    "reasoning_effort": cfg.llm_analysis.reasoning_effort,
+                    "timeout_ms": cfg.llm_analysis.timeout_ms,
+                },
+            )
+        from intaris.inference import managed_endpoint
+
+        backend = _get_evaluator_backend()
+        # Only managed inference can return Cognis's protocol-mismatch error.
+        mismatch = (
+            {"on_protocol_mismatch": backend.protocol_mismatch}
+            if managed_endpoint()
+            else {}
+        )
         _evaluator = Evaluator(
-            llm=LLMClient(cfg.llm),
+            llm=LLMClient(cfg.llm, **mismatch),
             session_store=SessionStore(db),
             audit_store=AuditStore(db),
             db=db,
             analysis_config=cfg.analysis,
             alignment_barrier=alignment_barrier,
-            jev=_get_jev_client(),
+            evaluator_backend=backend,
+            task_context=context_owner,
+            l1_input_projection=cfg.l1_input_projection,
+            event_store=event_store,
         )
     return _evaluator
 
@@ -311,34 +367,72 @@ class PerformanceMetricsMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         started_at = time.monotonic()
+        # Mounted dispatch mutates scope["app"] and routing context.
+        metrics = getattr(request.app.state, "runtime_metrics", None)
+        route_path = _route_template(request.app, request.scope)
+        from intaris.events.errors import ERROR_HEADER, EVENT_ROUTE, error_category
+
+        # Resolve unsupported methods without changing legacy route labels.
+        event_route = route_path == EVENT_ROUTE or (
+            route_path == "<unmatched>"
+            and _route_template(request.app, {**request.scope, "method": "GET"})
+            == EVENT_ROUTE
+        )
         status_code = 500
+        event_error = None
         try:
             response = await call_next(request)
             status_code = response.status_code
+            if event_route and status_code >= 400:
+                event_error = error_category(
+                    status_code, response.headers.get(ERROR_HEADER)
+                )
+                response.headers[ERROR_HEADER] = event_error
             return response
         finally:
-            metrics = getattr(request.app.state, "runtime_metrics", None)
             if metrics is not None:
-                route_path = _route_template(request.app, request.scope)
                 metrics.observe_request(
                     request.method,
                     route_path,
                     status_code,
                     (time.monotonic() - started_at) * 1000,
+                    event_error=event_error,
+                    event_route=event_route,
                 )
 
 
 def _route_template(app: Any, scope: dict[str, Any], prefix: str = "") -> str:
     """Resolve a bounded route template, including recursively mounted apps."""
-    for route in getattr(app, "routes", ()):
+    from fastapi import routing as fastapi_routing
+
+    # Mount middleware wraps the application without forwarding its routes.
+    seen: set[int] = set()
+    while not hasattr(app, "routes") and hasattr(app, "app"):
+        if id(app) in seen:
+            return "<unmatched>"
+        seen.add(id(app))
+        app = app.app
+    routes = getattr(app, "routes", ())
+    # New FastAPI versions retain included routers rather than flattening them.
+    # Use effective contexts so include prefixes are preserved. Older supported
+    # versions already expose concrete routes and need no adaptation.
+    iter_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
+    if iter_contexts is not None:
+        routes = iter_contexts(routes)
+    for route in routes:
         match, child_scope = route.matches(scope)
         if match != Match.FULL:
             continue
-        route_path = getattr(route, "path", "")
-        if isinstance(route, Mount):
+        route_path = getattr(route, "path", None)
+        if route_path is None:
+            return "<unmatched>"
+        original_route = getattr(route, "original_route", route)
+        if isinstance(original_route, Mount):
             mounted_scope = dict(scope)
             mounted_scope.update(child_scope)
-            return _route_template(route.app, mounted_scope, prefix + route_path)
+            return _route_template(
+                original_route.app, mounted_scope, prefix + route_path
+            )
         return prefix + route_path
     return "<unmatched>"
 
@@ -421,7 +515,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                         status_code=401,
                     )
 
-                resolution = resolve_auth(
+                # JWT validation may fetch JWKS synchronously; keep it off
+                # the event loop so a slow key endpoint cannot stall probes.
+                resolution = await asyncio.to_thread(
+                    resolve_auth,
                     token=token,
                     header_user_id=header_user_id,
                     header_agent_id=header_agent_id,
@@ -451,6 +548,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             _session_user_id.set(resolution.user_id if resolution else None)
             _session_agent_id.set(resolution.agent_id if resolution else None)
             _session_user_bound.set(resolution.user_bound if resolution else False)
+            _controller_claims.set(resolution.controller_claims if resolution else None)
 
             # Read optional intention hint for MCP proxy sessions
             intention = request.headers.get("x-intaris-intention", "").strip() or None
@@ -462,6 +560,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             _session_user_id.set(None)
             _session_agent_id.set(None)
             _session_user_bound.set(False)
+            _controller_claims.set(None)
             _session_intention.set(None)
 
 
@@ -771,6 +870,7 @@ async def lifespan(app):
         )
     )
     analysis_llm: LLMClient | None = None
+    judge_llm = LLMClient(cfg.llm_judge) if cfg.judge.mode != "disabled" else None
     if cfg.analysis.enabled and cfg.llm_analysis.api_key:
         analysis_llm = LLMClient(cfg.llm_analysis)
         app.state.intention_barrier = IntentionBarrier(
@@ -778,6 +878,7 @@ async def lifespan(app):
             llm=analysis_llm,
             timeout_ms=barrier_timeout_ms,
             poll_timeout_ms=barrier_poll_timeout_ms,
+            generation=cfg.source_context_generation,
         )
         app.state.intention_barrier.set_event_bus(app.state.event_bus)
         logger.info(
@@ -793,12 +894,15 @@ async def lifespan(app):
     from intaris.alignment import AlignmentBarrier
 
     alignment_timeout_ms = int(os.environ.get("ALIGNMENT_BARRIER_TIMEOUT_MS", "15000"))
-    alignment_jev = _get_jev_client()
-    if cfg.analysis.enabled and (analysis_llm is not None or alignment_jev is not None):
+    evaluator_backend = _get_evaluator_backend()
+    if cfg.analysis.enabled and (
+        analysis_llm is not None or evaluator_backend.mode != "llm"
+    ):
         app.state.alignment_barrier = AlignmentBarrier(
             db=_get_db(),
             llm=analysis_llm,
-            jev=alignment_jev,
+            judge_llm=judge_llm,
+            evaluator_backend=evaluator_backend,
             timeout_ms=alignment_timeout_ms,
         )
         app.state.alignment_barrier.set_event_bus(app.state.event_bus)
@@ -833,10 +937,6 @@ async def lifespan(app):
                 len(_startup_sessions),
             )
 
-    # Eagerly initialize the evaluator with alignment_barrier reference
-    # so it's available for both REST API and MCP proxy.
-    _get_evaluator(alignment_barrier=app.state.alignment_barrier)
-
     # Initialize event store for session recording (before background worker
     # so the flush loop is included when the worker starts).
     from intaris.events.store import EventStore
@@ -862,6 +962,13 @@ async def lifespan(app):
         app.state.event_store = None
         app.state.event_reconciliation_task = None
         logger.info("Event store disabled")
+
+    # The evaluator snapshots recorded outcomes through the canonical event owner.
+    _get_evaluator(
+        alignment_barrier=app.state.alignment_barrier,
+        analysis_llm=analysis_llm,
+        event_store=app.state.event_store,
+    )
 
     # Search schema and optional vector backend initialization can load large
     # third-party model definitions. It is non-critical, so never let it hold
@@ -916,11 +1023,10 @@ async def lifespan(app):
     if cfg.judge.mode != "disabled":
         from intaris.audit import AuditStore as _AuditStore
         from intaris.judge import JudgeReviewer
-        from intaris.llm import LLMClient as _LLMClient
         from intaris.session import SessionStore as _SessionStore
 
         judge_reviewer = JudgeReviewer(
-            llm=_LLMClient(cfg.llm_judge),
+            llm=judge_llm,
             config=cfg.judge,
             audit_store=_AuditStore(_get_db()),
             session_store=_SessionStore(_get_db()),
@@ -963,7 +1069,7 @@ async def lifespan(app):
             pass  # Table may not exist yet on first run.
 
     # Initialize MCP proxy
-    global _jev_client, _mcp_proxy_ref
+    global _evaluator_backend, _mcp_proxy_ref
     try:
         mcp_proxy = _init_mcp_proxy(cfg)
     except Exception:
@@ -1114,10 +1220,10 @@ async def lifespan(app):
             db = _get_db()
             db.close()
 
-        if _jev_client is not None:
+        if _evaluator_backend is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                _jev_client.close()
-            _jev_client = None
+                await _evaluator_backend.aclose()
+            _evaluator_backend = None
 
         logger.info("Intaris shut down")
 

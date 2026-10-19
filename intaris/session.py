@@ -37,6 +37,7 @@ class SessionStore:
         parent_session_id: str | None = None,
         agent_id: str | None = None,
         title: str | None = None,
+        expected_policy_revision: int | None = None,
     ) -> dict[str, Any]:
         """Create a new session.
 
@@ -58,19 +59,45 @@ class SessionStore:
         Raises:
             ValueError: If session_id already exists.
         """
+        from intaris.policy_activation import HybridError, prepare_policy
+
+        if expected_policy_revision not in (None, 0):
+            raise HybridError(
+                "stale_policy_revision", "New session requires revision 0", 409
+            )
+        from intaris.policy_inheritance import (
+            authorization_identity,
+            inherit_policy,
+            source_policy,
+        )
+
+        local_policy = source_policy(policy)
+        parent = (
+            self.refresh_inherited_policy(parent_session_id, user_id=user_id)
+            if parent_session_id
+            else None
+        )
+        policy = prepare_policy(
+            inherit_policy(parent["policy"], local_policy) if parent else local_policy,
+            tenant=user_id,
+            scope=details,
+        )
         now = datetime.now(timezone.utc).isoformat()
         details_json = json.dumps(details) if details else None
         policy_json = json.dumps(policy) if policy else None
 
         with self._db.cursor() as cur:
             try:
+                if parent:
+                    self._guard_parent(cur, parent, user_id)
                 cur.execute(
                     """
                     INSERT INTO sessions
                         (session_id, user_id, intention, details, policy,
                          last_activity_at, parent_session_id, agent_id,
-                         title, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           title, created_at, updated_at, alignment_state, original_assignment,
+                           policy_source, parent_policy_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -84,6 +111,14 @@ class SessionStore:
                         title,
                         now,
                         now,
+                        "pending"
+                        if parent_session_id
+                        and (policy or {}).get("evaluation_policy_version")
+                        == "hybrid_v1"
+                        else "ready",
+                        intention,
+                        json.dumps(local_policy),
+                        authorization_identity(parent) if parent else None,
                     ),
                 )
             except Exception as e:
@@ -95,6 +130,64 @@ class SessionStore:
                 raise
 
         return self.get(session_id=session_id, user_id=user_id)
+
+    def _guard_parent(self, cur, parent, user_id):
+        from intaris.policy_activation import HybridError
+        from intaris.policy_inheritance import validate_parent_chain
+
+        validate_parent_chain(cur, parent, postgresql=self._db.backend == "postgresql")
+        cur.execute(
+            "SELECT policy_revision, state_revision, status FROM sessions WHERE session_id = ? AND user_id = ?"
+            + (" FOR UPDATE" if self._db.backend == "postgresql" else ""),
+            (parent["session_id"], user_id),
+        )
+        row = cur.fetchone()
+        if (
+            row is None
+            or row["policy_revision"] != parent["policy_revision"]
+            or row["state_revision"] != parent["state_revision"]
+        ):
+            raise HybridError(
+                "policy_state_changed",
+                "Parent changed during policy activation",
+                409,
+                retryable=True,
+            )
+        if row["status"] in {"suspended", "terminated"}:
+            raise HybridError(
+                "parent_session_inactive",
+                "Parent session is suspended or terminated",
+                403,
+            )
+
+    def refresh_inherited_policy(self, session_id, *, user_id, _seen=None):
+        """Re-activate stale inherited sources before evaluation, without new verdicts."""
+        from intaris.policy_activation import HybridError
+        from intaris.policy_inheritance import authorization_identity
+
+        seen = set(_seen or ())
+        if session_id in seen or len(seen) >= 32:
+            raise HybridError("invalid_parent_chain", "Invalid session ancestry", 409)
+        seen.add(session_id)
+        current = self.get(session_id, user_id=user_id)
+        parent_id = current.get("parent_session_id")
+        if not parent_id:
+            return current
+        parent = self.refresh_inherited_policy(parent_id, user_id=user_id, _seen=seen)
+        if parent["status"] in {"suspended", "terminated"}:
+            raise HybridError(
+                "parent_session_inactive",
+                "Parent session is suspended or terminated",
+                403,
+            )
+        identity = authorization_identity(parent)
+        if current.get("parent_policy_hash") != identity:
+            from intaris.policy_inheritance import source_policy
+
+            local = current.get("policy_source")
+            local = json.loads(local) if local else source_policy(current.get("policy"))
+            return self.update_session(session_id, user_id=user_id, policy=local)
+        return current
 
     def get(self, session_id: str, *, user_id: str) -> dict[str, Any]:
         """Get a session by ID, scoped to user.
@@ -157,7 +250,8 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = ?, status_reason = ?, updated_at = ?
+                SET status = ?, status_reason = ?, updated_at = ?,
+                    state_revision = state_revision + 1
                 WHERE session_id = ? AND user_id = ?
                 """,
                 (status, status_reason, now, session_id, user_id),
@@ -175,6 +269,7 @@ class SessionStore:
         policy: dict[str, Any] | None = None,
         intention_source: str | None = None,
         title: str | None = None,
+        expected_policy_revision: int | None = None,
     ) -> dict[str, Any]:
         """Update session intention, title, and/or details.
 
@@ -196,6 +291,25 @@ class SessionStore:
         Raises:
             ValueError: If session not found.
         """
+        from intaris.policy_activation import HybridError, prepare_policy
+
+        current = None
+        parent = None
+        local_policy = None
+        parent_identity = None
+        captured_revision = None
+        captured_state = None
+        if policy is not None or expected_policy_revision is not None:
+            current = self.get(session_id, user_id=user_id)
+            captured_revision = current["policy_revision"]
+            captured_state = current["state_revision"]
+            if (
+                expected_policy_revision is not None
+                and expected_policy_revision != captured_revision
+            ):
+                raise HybridError(
+                    "stale_policy_revision", "Policy revision changed", 409
+                )
         if (
             intention is None
             and details is None
@@ -205,8 +319,61 @@ class SessionStore:
         ):
             return self.get(session_id, user_id=user_id)
 
+        if policy is not None:
+            assert current is not None
+            from intaris.policy_inheritance import (
+                authorization_identity,
+                inherit_policy,
+                source_policy,
+            )
+
+            local_policy = source_policy(policy)
+            if current.get("parent_session_id"):
+                parent = self.refresh_inherited_policy(
+                    current["parent_session_id"], user_id=user_id
+                )
+                parent_identity = authorization_identity(parent)
+                policy = inherit_policy(parent.get("policy"), local_policy)
+            policy = prepare_policy(
+                policy,
+                tenant=user_id,
+                scope=details if details is not None else current.get("details"),
+                existing_version=(current.get("policy") or {}).get(
+                    "evaluation_policy_version", "legacy"
+                ),
+            )
+        # Runtime executor refreshes may resend the exact same policy/details
+        # immediately after approval. Do not turn that no-op into a new scope
+        # revision and invalidate the exact-action receipt. Real changes keep
+        # the existing guarded write/invalidation path.
+        if current is None:
+            current = self.get(session_id, user_id=user_id)
+        if (
+            (not parent or current.get("parent_policy_hash") == parent_identity)
+            and (
+                not parent
+                or local_policy is None
+                or json.loads(current.get("policy_source") or "{}") == local_policy
+            )
+            and all(
+                value is None or value == current.get(key)
+                for key, value in (
+                    ("intention", intention),
+                    ("policy", policy),
+                    ("details", details),
+                    ("intention_source", intention_source),
+                    ("title", title),
+                )
+            )
+        ):
+            return current
         now = datetime.now(timezone.utc).isoformat()
         sets = ["updated_at = ?"]
+        if any(
+            value is not None
+            for value in (intention, policy, details, intention_source)
+        ):
+            sets.append("state_revision = state_revision + 1")
         params: list[Any] = [now]
 
         if intention is not None:
@@ -217,7 +384,10 @@ class SessionStore:
             params.append(json.dumps(details))
         if policy is not None:
             sets.append("policy = ?")
+            sets.append("policy_revision = policy_revision + 1")
             params.append(json.dumps(policy))
+            sets.extend(["policy_source = ?", "parent_policy_hash = ?"])
+            params.extend([json.dumps(local_policy), parent_identity])
         if intention_source is not None:
             sets.append("intention_source = ?")
             params.append(intention_source)
@@ -226,17 +396,66 @@ class SessionStore:
             params.append(title)
 
         params.extend([session_id, user_id])
+        revision_clause = ""
+        if captured_revision is not None:
+            revision_clause = " AND policy_revision = ? AND state_revision = ?"
+            params.extend([captured_revision, captured_state])
 
         with self._db.cursor() as cur:
+            if parent:
+                self._guard_parent(cur, parent, user_id)
             cur.execute(
                 f"UPDATE sessions SET {', '.join(sets)} "
-                f"WHERE session_id = ? AND user_id = ?",
+                f"WHERE session_id = ? AND user_id = ?{revision_clause}",
                 params,
             )
             if cur.rowcount == 0:
+                if captured_revision is not None:
+                    raise HybridError(
+                        "stale_policy_revision",
+                        "Policy changed during compilation",
+                        409,
+                    )
                 raise ValueError(f"Session {session_id} not found")
 
+            if (
+                policy is not None
+                and policy.get("evaluation_policy_version") != "hybrid_v1"
+            ):
+                from intaris.workflow_scope import registry_revision
+
+                if registry_revision(cur, user_id, session_id):
+                    raise HybridError(
+                        "workflow_step_conflict",
+                        "Declared workflow scope requires the hybrid policy engine",
+                        409,
+                    )
+
         return self.get(session_id, user_id=user_id)
+
+    def set_alignment_state(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        state: str,
+        expected_state_revision: int | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        if state not in {"ready", "pending", "misaligned", "error"}:
+            raise ValueError("Invalid alignment state")
+        condition = "" if expected_state_revision is None else " AND state_revision = ?"
+        params = [state, reason, session_id, user_id]
+        if expected_state_revision is not None:
+            params.append(expected_state_revision)
+        with self._db.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET alignment_state = ?, alignment_reason = ?, "
+                "state_revision = state_revision + 1 "
+                f"WHERE session_id = ? AND user_id = ?{condition}",
+                params,
+            )
+            return cur.rowcount == 1
 
     def allocate_event_sequences(
         self,
@@ -245,6 +464,7 @@ class SessionStore:
         user_id: str,
         user_message_flags: list[bool],
         minimum_last_seq: int = 0,
+        latest_user_evidence: dict[str, Any] | None = None,
     ) -> list[int]:
         """Allocate event sequences and advance durable user-message state."""
         if not user_message_flags:
@@ -277,7 +497,9 @@ class SessionStore:
                         WHEN ? > 0 THEN TRUE
                         ELSE user_message_observed
                     END,
-                    last_event_seq = {base_sql} + ?
+                    last_event_seq = {base_sql} + ?,
+                    state_revision = state_revision + CASE WHEN ? > 0 THEN 1 ELSE 0 END,
+                    latest_user_evidence = COALESCE(?, latest_user_evidence)
                 WHERE session_id = ? AND user_id = ?{returning}
                 """,
                 (
@@ -289,6 +511,10 @@ class SessionStore:
                     minimum_last_seq,
                     minimum_last_seq,
                     count,
+                    last_user_offset,
+                    json.dumps(latest_user_evidence)
+                    if latest_user_evidence is not None
+                    else None,
                     session_id,
                     user_id,
                 ),
@@ -328,10 +554,21 @@ class SessionStore:
                         THEN ?
                         ELSE last_event_seq
                     END,
-                    user_message_observed = TRUE
+                    user_message_observed = TRUE,
+                    state_revision = state_revision + CASE
+                        WHEN latest_user_message_seq IS NULL OR latest_user_message_seq < ?
+                        THEN 1 ELSE 0 END
                 WHERE session_id = ? AND user_id = ?
                 """,
-                (event_seq, event_seq, event_seq, event_seq, session_id, user_id),
+                (
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    event_seq,
+                    session_id,
+                    user_id,
+                ),
             )
             if cur.rowcount == 0:
                 raise ValueError(f"Session {session_id} not found")
@@ -347,7 +584,7 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET user_message_observed = TRUE
+                SET user_message_observed = TRUE, state_revision = state_revision + 1
                 WHERE session_id = ? AND user_id = ?
                 """,
                 (session_id, user_id),
@@ -418,11 +655,21 @@ class SessionStore:
         expected_user_message_seq: int | None = None,
         guard_user_message_seq: bool = False,
         require_no_user_message: bool = False,
+        intention_profile: dict[str, Any] | None = None,
+        expected_state_revision: int | None = None,
     ) -> bool:
         """Persist a generated intention only while its durable guard holds."""
         now = datetime.now(timezone.utc).isoformat()
         conditions = ["session_id = ?", "user_id = ?"]
-        params: list[Any] = [intention, intention_source, title, now]
+        params: list[Any] = [
+            intention,
+            intention_source,
+            title,
+            now,
+            json.dumps(intention_profile, ensure_ascii=False)
+            if intention_profile is not None
+            else None,
+        ]
         condition_params: list[Any] = [session_id, user_id]
         if guard_user_message_seq:
             if expected_user_message_seq is None:
@@ -433,13 +680,16 @@ class SessionStore:
         if require_no_user_message:
             conditions.append("user_message_observed = FALSE")
             conditions.append("intention_source = 'initial'")
+        if expected_state_revision is not None:
+            conditions.append("state_revision = ?")
+            condition_params.append(expected_state_revision)
         params.extend(condition_params)
         with self._db.cursor() as cur:
             cur.execute(
                 """
                 UPDATE sessions
-                SET intention = ?, intention_source = ?,
-                    title = COALESCE(?, title), updated_at = ?
+                SET intention = ?, intention_source = ?, state_revision = state_revision + 1,
+                    title = COALESCE(?, title), updated_at = ?, intention_profile = ?
                 WHERE """
                 + " AND ".join(conditions),
                 params,
@@ -531,7 +781,7 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = 'idle', updated_at = ?
+                SET status = 'idle', updated_at = ?, state_revision = state_revision + 1
                 WHERE status = 'active'
                   AND last_activity_at IS NOT NULL
                   AND last_activity_at < ?
@@ -568,7 +818,7 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET status = 'completed', updated_at = ?
+                SET status = 'completed', updated_at = ?, state_revision = state_revision + 1
                 WHERE status = 'idle'
                   AND parent_session_id IS NOT NULL
                   AND last_activity_at IS NOT NULL
@@ -645,10 +895,22 @@ class SessionStore:
             cur.execute(
                 """
                 UPDATE sessions
-                SET alignment_overridden = ?, updated_at = ?
+                SET alignment_overridden = ?, updated_at = ?,
+                    state_revision = state_revision + CASE
+                        WHEN alignment_overridden != ? OR (? AND alignment_state != 'ready')
+                        THEN 1 ELSE 0 END,
+                    alignment_state = CASE WHEN ? THEN 'ready' ELSE alignment_state END
                 WHERE session_id = ? AND user_id = ?
                 """,
-                (overridden, now, session_id, user_id),
+                (
+                    overridden,
+                    now,
+                    overridden,
+                    overridden,
+                    overridden,
+                    session_id,
+                    user_id,
+                ),
             )
 
     def get_active_child_sessions(
@@ -1040,4 +1302,9 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
                 d[json_field] = json.loads(d[json_field])
             except (json.JSONDecodeError, TypeError):
                 pass
+    policy = d.get("policy") or {}
+    if policy.get("evaluation_policy_version") == "hybrid_v1":
+        d["policy_hash"] = policy.get("policy_hash")
+        d["active_policy"] = policy.get("active_policy")
+        d["advisory_clauses"] = (d["active_policy"] or {}).get("advisory_clauses", [])
     return d

@@ -91,11 +91,12 @@ class EventAppendIdempotencyStore:
             )
 
     def delete_expired(self, *, max_age: timedelta) -> int:
-        """Delete completed or abandoned rows older than the allowed age."""
+        """Expire completed receipts only; pending outcomes require reconciliation."""
         cutoff = (datetime.now(UTC) - max_age).isoformat()
         with self._db.cursor() as cur:
             cur.execute(
-                "DELETE FROM event_append_idempotency WHERE created_at < ?",
+                "DELETE FROM event_append_idempotency "
+                "WHERE status = 'completed' AND created_at < ?",
                 (cutoff,),
             )
             return cur.rowcount

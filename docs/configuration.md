@@ -1,8 +1,107 @@
 # Configuration Reference
 
+## Cognis-managed inference
+
+When managed inference is enabled, unset `LLM_REASONING_EFFORT`,
+`ANALYSIS_LLM_REASONING_EFFORT`, `ANALYSIS_L3_LLM_REASONING_EFFORT` and
+`JUDGE_LLM_REASONING_EFFORT` to inherit Cognis's routing defaults. Standalone
+implicit `low` defaults are not sent in managed mode. Explicit values remain
+client overrides; L3 continues to inherit an explicitly configured analysis
+effort unless its own variable is set. Empty values omit effort.
+
+Set `COGNIS_INFERENCE_URL` to Cognis's `/v1` endpoint and
+`COGNIS_INFERENCE_TOKEN_FILE` to a protected file containing an Intaris inference
+service JWT. In this mode Cognis's admin-configured global routes select
+evaluation, judge, analysis, deep-analysis and embedding models. Direct LLM
+settings remain the default when these variables are absent.
+
+### Evaluator backend follows the Cognis route (`EVALUATOR_BACKEND=auto`)
+
+Backend selection shares one process-local metadata refresh between synchronous
+and asynchronous callers. The metadata worker is created only on a cache miss,
+uses one thread, and retains the configured `LLM_TIMEOUT_MS` HTTP timeout.
+Async HTTP and MCP evaluations suspend at their existing selection sites without
+occupying default-executor slots; metadata-independent fast paths do not fetch
+metadata. Cancellation detaches only that evaluation, not the shared refresh.
+Invalidation discards an in-flight result before another refresh can begin.
+Shutdown drains the metadata worker before closing its HTTP client.
+
+`EVALUATION_DEADLINE_MS` (default `60000`) is the shared model-retry budget,
+not a hard endpoint cancellation deadline or a metadata timeout. Suspending and
+resuming an evaluation does not reset that budget.
+
+With managed inference and `EVALUATOR_BACKEND` unset (or set to `auto`), the
+evaluator follows the model selected for Cognis's `intaris_evaluation` route.
+Switching between an LLM and the experimental Jev evaluator only requires
+changing that route in Cognis; no Intaris environment change or restart.
+
+- Intaris reads `GET /v1/models` with its companion token and looks at
+  `routes/intaris_evaluation` → `cognis.operations`. `["systemone"]` selects
+  Jev (`POST /v1/systemone`); `["chat"]` selects the LLM evaluator.
+- The result is cached per process for about 60 seconds. Concurrent lookups
+  are coalesced. Lookups happen only when an evaluation needs a model, never
+  once per evaluation. A failed lookup is retried after about 5 seconds.
+- During a switch, Cognis rejects a request that uses the old protocol before
+  upstream dispatch (`400 invalid_model`). Evaluations that already selected
+  the old backend fail closed (normally one; more if several were in flight),
+  the cache is cleared, and later evaluations use the new backend. Intaris
+  does not replay the call or infer the backend from model names. With a
+  pinned `llm`/`jev`, `/api/v1/config` shows the latest rejection in
+  `evaluator.backend_error` for about 60 seconds.
+- Older Cognis without `cognis.operations`: Intaris uses the LLM evaluator and
+  logs this once. Malformed or unknown metadata (for example both `chat` and
+  `systemone`, or a missing route) fails evaluations closed.
+- Judge, intention generation, and L2/L3 analysis always use their chat routes.
+  Parent/child alignment uses the selected evaluator, as before.
+- In managed mode `JEV_MODEL`, `JEV_BASE_URL`, and standalone Jev keys are
+  replaced by the Cognis route, endpoint, and rotating companion token. No
+  TypeSafe/OpenRouter key is needed. Confidence thresholds and decision policy
+  are unchanged.
+
+Explicit `EVALUATOR_BACKEND=llm` or `jev` pins the backend and keeps its
+meaning. If the route does not match the pin, each evaluation fails closed
+with an error that names the pinned mode; Intaris does not switch.
+`EVALUATOR_BACKEND=auto` without `COGNIS_INFERENCE_URL` is a startup error.
+Without managed inference the default remains `llm`, and standalone Jev
+(`EVALUATOR_BACKEND=jev` with `JEV_API_KEY`) is unchanged.
+
+Troubleshooting: `GET /api/v1/config` reports `evaluator.mode`, the active
+`evaluator.backend` (`llm`, `jev`, or `null`), and `evaluator.backend_error`.
+Look for `Evaluator backend selected`, `older Cognis`, `metadata rejected`,
+or `rejected the ... protocol` in the Intaris logs.
+
+The token file is read for each request, not at startup; atomic rotation does
+not require restart. Missing credentials or unconfigured Cognis routing leave
+inference unavailable and evaluation fail-closed. JWT verification for incoming
+Intaris API requests remains a separate configuration. Keep search dimensions
+consistent with the global embedding route, and reindex before changing models.
+
 All settings are loaded from environment variables. Defaults are optimized for local development -- just set `LLM_API_KEY` and run.
 
 Data is stored in `~/.intaris` by default (override with `DATA_DIR`). In Docker, `DATA_DIR` is set to `/data` for volume mounting.
+
+### Evaluation and review timing
+
+`EVALUATION_DEADLINE_MS` defaults to **60000**. This is the shared request
+ceiling for L1, bounded Judge repair and independent authorization checks.
+Individual model-call timeouts still apply. Evaluate clients must allow
+transport headroom above this ceiling; Cognis uses 65 seconds only for
+`POST /api/v1/evaluate` (other endpoint timeouts are unchanged).
+
+`LLM_TIMEOUT_MS` and `JEV_TIMEOUT_MS` bound each transport attempt, not the
+entire retry sequence when a shared evaluation deadline exists. A timed-out
+attempt may retry within the remaining shared budget and configured attempt
+limit. Standalone calls without an outer deadline retain a total budget equal
+to their configured timeout. For slower routed inference, configure suitable
+per-attempt limits (for example 15000 ms) without extending the shared ceiling.
+Malformed responses and authentication failures are not made retryable.
+
+An incomplete hybrid review returns HTTP **503**, code `review_unavailable`,
+with `retryable: true`. No tool is dispatched and no human-permission
+notification is emitted for that infrastructure failure. A completed reviewer
+request for a human decision still follows normal escalation handling.
+Qualification must use the deployed model/request deadlines, not minute-scale
+benchmark-only overrides.
 
 ## Server
 
@@ -48,16 +147,17 @@ JWT validation requires:
 
 | Variable | Default | Description |
 |---|---|---|
-| `EVALUATOR_BACKEND` | `llm` | Bounded evaluator backend: `llm` or `jev`. |
+| `EVALUATOR_BACKEND` | `auto` with managed inference, else `llm` | Evaluator backend: `llm`, `jev`, or `auto` (follow the Cognis `intaris_evaluation` route; managed inference only). |
+| `EVALUATION_DEADLINE_MS` | `60000` | Shared model-call retry budget from `/evaluate` arrival, including L1, repairs and the Judge. Not a hard endpoint deadline or metadata timeout. |
 | `LLM_API_KEY` | (required for generative features) | API key for the LLM provider. Falls back to `OPENAI_API_KEY`. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API base URL. Falls back to `OPENAI_API_BASE`. |
 | `LLM_MODEL` | `gpt-5.4-nano` | Model for safety evaluation when `EVALUATOR_BACKEND=llm`. |
 | `LLM_REASONING_EFFORT` | `low` | Reasoning effort hint (provider-specific). |
-| `LLM_TIMEOUT_MS` | `4000` | Timeout for LLM calls in milliseconds. Must be under the 5-second circuit breaker. Minimum: 500ms. |
+| `LLM_TIMEOUT_MS` | `4000` | Total budget per LLM generation, including transient retries and format repairs. Also limits each attempt. Minimum: 500ms. |
 | `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
 | `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
-| `JEV_TIMEOUT_MS` | `4000` | Jev timeout in milliseconds. Minimum: 500ms. |
+| `JEV_TIMEOUT_MS` | `4000` | Total budget per Jev request, including transient retries. Also limits each attempt. Minimum: 500ms. |
 | `JEV_MINIMUM_CONFIDENCE` | `0.6` | Minimum confidence for each Jev classification dimension. Lower-confidence tool calls and alignments escalate. |
 | `JEV_DECISION_QUESTION` | `true` | Keep the third Jev disposition question; set `false` only for the experimental two-axis benchmark, where Intaris derives disposition from alignment and risk. |
 | `JEV_DIAGNOSTICS` | `false` | Include model probabilities, per-question confidence, and token usage in authenticated evaluation responses for calibration. No tool arguments or intention text. |
@@ -92,7 +192,7 @@ ANALYSIS_LLM_MODEL=gpt-5.4-mini
 JUDGE_LLM_MODEL=gpt-5.4
 ```
 
-For Jev through OpenRouter with the production Groq-backed generative setup:
+For Jev through OpenRouter with Groq-backed generative models:
 
 ```bash
 EVALUATOR_BACKEND=jev
@@ -100,7 +200,7 @@ JEV_BASE_URL=https://openrouter.ai/api
 JEV_MODEL=typesafe/jev-1.13-20260917
 JEV_API_KEY=<OpenRouter API key>
 LLM_MODEL=gpt-oss-20b
-LLM_BASE_URL=https://openai.fpy.cz/v1
+LLM_BASE_URL=https://api.groq.com/openai/v1
 ANALYSIS_LLM_MODEL=gpt-oss-120b
 JUDGE_LLM_MODEL=gpt-oss-120b
 ```

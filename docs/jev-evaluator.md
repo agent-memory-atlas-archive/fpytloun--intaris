@@ -1,5 +1,11 @@
 # Jev as an Intaris evaluator
 
+**Historical report:** the status and scores below describe September 25.
+The current candidate uses Jev with separately configured intention and Judge
+models, but that deployment choice does not prove improved quality. See
+[current release qualification](release-verification-2026-10.md); this report's
+denominators and failures remain unchanged.
+
 **Status (2026-09-25): implemented, benchmarked, opt-in; not recommended as
 the production default.** Intaris continues to use the Groq-backed
 `gpt-oss-20b` L1 evaluator in its cost/performance-oriented deployment. The
@@ -11,8 +17,9 @@ answers; it does not generate explanations or summaries. Intaris can use it
 for first-level (L1) tool-call alignment/risk evaluation and parent/child
 intention alignment. Intention generation, the judge, L2 summaries, L3
 analysis, and independent benchmark scoring still require conventional LLMs.
-The evaluator backend is selected with `EVALUATOR_BACKEND`; `llm` remains the
-default. See [configuration](configuration.md#tool-call-evaluator) for the
+The evaluator backend is selected with `EVALUATOR_BACKEND`. Current defaults are
+`auto` with Cognis-managed inference and `llm` otherwise. See
+[configuration](configuration.md#tool-call-evaluator) for the
 TypeSafe and OpenRouter endpoints and required credentials.
 
 ## Why consider it?
@@ -89,10 +96,9 @@ reported in `evaluation.json`: that aggregate includes fast paths. The
 scorer's gold-label agreement is below the benchmark's 95% reliability
 target in all arms, so the showcase scores are especially tentative.
 
-Run IDs: baseline `bench-20260925-1c01f1ed`, original Jev
-`bench-20260925-fb6bded9`, optimized Jev
-`bench-20260925-a9101fe7`. The local ignored `runs/` directories retain
-full scenario reports on the benchmark machine; they are not committed.
+Full scenario reports for the baseline, original Jev and optimized Jev arms
+are retained privately and are not committed. Run identifiers and storage
+locators are omitted here.
 
 **Interpret carefully:** each showcase arm generated a different sequence
 and number of tool calls. Five scenarios in each arm failed due to
@@ -103,6 +109,21 @@ end-to-end production guarantee. These runs are also separate from the
 previously published baseline benchmark in the project README.
 
 ## Current experiment and decision
+
+The hybrid migration uses frozen assessment-only calls from
+`tools.benchmark.matched`, with legacy and hybrid runtime directories selected
+explicitly. Legacy calibration remains pinned to
+`typesafe/jev-1.13-20260917`, decision question disabled, minimum confidence
+`0.6`, and approval-risk confidence `0.3`. These thresholds are **not presumed
+calibrated for new hybrid questions**.
+
+Groq `openai/gpt-oss-20b` with low reasoning is the matched conventional L1;
+Groq `openai/gpt-oss-120b` with low reasoning is frozen for Judge, intention and
+policy compilation. L1-only and advisory-Judge cohorts are measured separately.
+No simulated human approvals are used. Fixed labels and policy contracts are
+primary gold; missing provider cost remains unknown. See
+[frozen matched replay](benchmarking.md#frozen-matched-replay-hybrid-migration).
+No new performance or safety conclusion is established by the harness alone.
 
 The default Jev implementation asks separate alignment, risk, and
 disposition questions and escalates if any answer fails the `0.6`

@@ -114,8 +114,8 @@ def test_judge_prompt_uses_effective_policy_view():
         intention="Review an escalated git commit",
         policy={
             "allow_paths": [
-                "/Users/fpytloun/*",
-                "/Users/fpytloun/src/lumilens/beskar/ansible/*",
+                "/Users/testuser/*",
+                "/Users/testuser/src/examplecorp/service/ansible/*",
             ]
         },
         recent_history=[],
@@ -128,8 +128,8 @@ def test_judge_prompt_uses_effective_policy_view():
         agent_id=None,
     )
 
-    assert '"/Users/fpytloun/*"' in prompt
-    assert '"/Users/fpytloun/src/lumilens/beskar/ansible/*"' not in prompt
+    assert '"/Users/testuser/*"' in prompt
+    assert '"/Users/testuser/src/examplecorp/service/ansible/*"' not in prompt
 
 
 @pytest.mark.parametrize("mode", ["auto", "advisory"])
@@ -187,6 +187,10 @@ def test_judge_maximum_outcome_uses_call_snapshot(
             session_id="test-session",
         )
     )
+    from intaris.judge_simulator import JUDGE_OUTPUT_MAX_TOKENS
+
+    # The legacy Judge path uses the shared Judge output cap.
+    assert mock_llm.generate.call_args.kwargs["max_tokens"] == JUDGE_OUTPUT_MAX_TOKENS
     assert outcome.decision == "escalate"
     assert outcome.record["judge_decision"] == "deny"
     assert outcome.record["effective_decision"] == "escalate"
@@ -1180,7 +1184,7 @@ class TestJudgeReviewer:
                 session_id="test-session",
                 agent_id="test-agent",
                 tool="mcptodoist_find-projects",
-                args_redacted={"query": "cognis"},
+                args_redacted={"query": "sample"},
                 classification="write",
                 evaluation_path="llm",
                 decision="escalate",
@@ -2485,9 +2489,8 @@ class TestJudgePrompt:
             agent_id=None,
         )
 
-        # Should be truncated with ellipsis, not the full string
-        assert huge_message not in prompt
-        assert "..." in prompt
+        # Available evidence remains complete until final request capacity is known.
+        assert huge_message in prompt
 
     def test_reasoning_with_string_context(self):
         """Reasoning records with string context render the context."""
@@ -2603,7 +2606,7 @@ class TestJudgePrompt:
                         "__intaris_context": {
                             "skill": {
                                 "skill_id": "skill_1",
-                                "name": "lumilens-loki-query",
+                                "name": "examplecorp-loki-query",
                                 "description": "Query Loki safely",
                             }
                         },
@@ -2616,7 +2619,7 @@ class TestJudgePrompt:
         assert packet["known_skills"] == [
             {
                 "skill_id": "skill_1",
-                "name": "lumilens-loki-query",
+                "name": "examplecorp-loki-query",
                 "description": "Query Loki safely",
             }
         ]

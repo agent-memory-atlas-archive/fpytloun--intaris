@@ -4,6 +4,45 @@ Guardrails evaluation system that simulates AI agents with various behavioral pr
 
 See [docs/benchmarking.md](../../docs/benchmarking.md) for full documentation.
 
+## Deployment-specific release transports
+
+Release transport helpers have no built-in private deployment targets. Configure
+only targets independently authorized for the experiment:
+
+- `paired_release`: set `COGNIS_BENCHMARK_BASE_URL` (including `/v1`) and
+  `COGNIS_API_KEY` for the fixed-model direct transport.
+- `release_proxy` and `proxy_recovery`: set `INTARIS_BENCHMARK_NAMESPACE`,
+  `INTARIS_BENCHMARK_COGNIS_POD` and `INTARIS_BENCHMARK_DEPLOYMENT` for the
+  authorized namespace, controller pod and guardrails bridge deployment.
+  Pod UID, endpoint and model-binding verification still apply.
+- `tools/paid_write_replay.py`: optional token refresh requires
+  `REPLAY_TOKEN_NAMESPACE` together with `REPLAY_TOKEN_POD` and
+  `REPLAY_TOKEN_PATH`; the local destination remains
+  `COGNIS_INFERENCE_TOKEN_FILE`.
+
+Missing deployment configuration fails before the corresponding transport is
+started. Do not put credentials, private addresses or raw captured evidence in
+tracked fixtures or reports. These settings do not authorize a live benchmark.
+
+Database-backed replay helpers (`rc3_replay`, `static_comparison` and callers)
+also require `INTARIS_REPLAY_DB_NAMESPACE`, `INTARIS_REPLAY_DB_TARGET` (a kubectl
+resource such as `deployment/example-store`), `INTARIS_REPLAY_DB_CONTAINER`,
+`INTARIS_REPLAY_DB_USER` and `INTARIS_REPLAY_DB_NAME`. There are no deployment
+defaults; SQL retains its read-only transaction boundary.
+
+## Fixture provenance
+
+Scenario worlds, people, messages, logs and example credentials are fictional.
+Replay regression tests can reconstruct observed failure classes, but their
+public inputs use synthetic targets and omit private record identifiers.
+Production-backed replay exports and raw evidence must remain outside Git,
+even when a provider or audit system has already redacted credentials.
+
+Public-content edits can change model-visible prompts without changing labels
+or scenario structure. Results recorded against older revisions remain results
+of those original inputs; they are not measurements of reworded fixtures.
+Re-run and identify the exact fixture revision before making new comparisons.
+
 ## Quick Start
 
 ```bash

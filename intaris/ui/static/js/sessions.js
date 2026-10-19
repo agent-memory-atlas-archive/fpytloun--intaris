@@ -139,6 +139,7 @@ function sessionsTab() {
           if (data.intention) this.expandedSession.intention = data.intention;
           if (data.details) this.expandedSession.details = data.details;
           this.expandedSession.last_activity_at = new Date().toISOString();
+          this._refreshExpandedSession(data.session_id);
         }
       }
 
@@ -180,6 +181,19 @@ function sessionsTab() {
           ].slice(0, Math.max(this.auditLimit, this.sessionAudit.length + 1));
           if (isNew) this.auditTotal++;
         }
+      }
+    },
+
+    async _refreshExpandedSession(sessionId) {
+      try {
+        const fresh = await IntarisAPI.getSession(sessionId);
+        if (this.expandedId !== sessionId) return;
+        const session = this.sessions.find(s => s.session_id === sessionId);
+        if (session && (fresh.state_revision || 0) >= (session.state_revision || 0)) {
+          Object.assign(session, fresh);
+        }
+      } catch (_) {
+        // Keep the existing display until the next successful refresh.
       }
     },
 
@@ -473,7 +487,7 @@ function sessionsTab() {
         this.collapsedSessions = { ...this.collapsedSessions };
       }
       try {
-        const [audit, summaries] = await Promise.all([
+        const [audit, summaries, fresh] = await Promise.all([
           IntarisAPI.listAudit({
             session_id: session.session_id,
             limit: 5,
@@ -482,7 +496,12 @@ function sessionsTab() {
             intaris_summaries: [],
             agent_summaries: [],
           })),
+          IntarisAPI.getSession(session.session_id).catch(() => null),
         ]);
+        if (this.expandedId !== session.session_id) return;
+        if (fresh && (fresh.state_revision || 0) >= (session.state_revision || 0)) {
+          Object.assign(session, fresh);
+        }
         this.sessionAudit = audit.items || [];
         this.auditTotal = audit.total || 0;
         // Attach summaries to session for template access

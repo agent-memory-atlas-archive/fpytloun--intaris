@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -19,6 +20,20 @@ logger = logging.getLogger("intaris")
 
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
+
+
+def evaluator_backend_mode() -> str:
+    """Explicit ``EVALUATOR_BACKEND``, else ``auto`` with managed inference."""
+    explicit = _env("EVALUATOR_BACKEND").strip().lower()
+    if explicit:
+        return explicit
+    return "auto" if _env("COGNIS_INFERENCE_URL") else "llm"
+
+
+def _reasoning_effort(key: str, standalone_default: str = "") -> str | None:
+    """Managed mode inherits Cognis effort unless explicitly configured."""
+    default = "" if _env("COGNIS_INFERENCE_URL") else standalone_default
+    return _env(key, default) or None
 
 
 def _env_int(key: str, default: int) -> int:
@@ -96,34 +111,49 @@ class LLMConfig:
 
     model: str = field(default_factory=lambda: _env("LLM_MODEL", "gpt-5.4-nano"))
     base_url: str = field(default_factory=_llm_base_url)
-    api_key: str = field(default_factory=_llm_api_key)
+    api_key: str | Callable[[], str] = field(default_factory=_llm_api_key)
     temperature: float = 0.1
     reasoning_effort: str | None = field(
-        default_factory=lambda: _env("LLM_REASONING_EFFORT", "low") or None
+        default_factory=lambda: _reasoning_effort("LLM_REASONING_EFFORT", "low")
     )
     # Timeout in milliseconds for LLM evaluation calls.
     # Must be well under the 5-second circuit breaker in the Executor Adapter.
     timeout_ms: int = field(default_factory=lambda: _env_int("LLM_TIMEOUT_MS", 4000))
+
+    def __post_init__(self) -> None:
+        from intaris.inference import managed_endpoint, token_supplier
+
+        endpoint = managed_endpoint()
+        if endpoint:
+            self.base_url = endpoint
+            self.api_key = token_supplier()
 
 
 @dataclass
 class JevConfig:
     """TypeSafe Jev configuration for bounded safety classifications."""
 
+    # ``enabled`` means Jev may evaluate calls: pinned ``jev`` or ``auto``.
     enabled: bool = field(
-        default_factory=lambda: _env("EVALUATOR_BACKEND", "llm").lower() == "jev"
+        default_factory=lambda: evaluator_backend_mode() in ("jev", "auto")
     )
     model: str = field(default_factory=lambda: _env("JEV_MODEL", "jev-1.13.0"))
     base_url: str = field(
         default_factory=lambda: _env("JEV_BASE_URL", "https://api.typesafe.ai")
     )
-    api_key: str = ""
+    api_key: str | Callable[[], str] = ""
     timeout_ms: int = field(default_factory=lambda: _env_int("JEV_TIMEOUT_MS", 4000))
     minimum_confidence: float = field(
         default_factory=lambda: _env_float("JEV_MINIMUM_CONFIDENCE", 0.6)
     )
     decision_question: bool = field(
         default_factory=lambda: _env_bool("JEV_DECISION_QUESTION", True)
+    )
+    hybrid_minimum_posterior: float = field(
+        default_factory=lambda: _env_float("JEV_HYBRID_MINIMUM_POSTERIOR", 0.6)
+    )
+    hybrid_minimum_margin: float = field(
+        default_factory=lambda: _env_float("JEV_HYBRID_MINIMUM_MARGIN", 0.1)
     )
     diagnostics: bool = field(default_factory=lambda: _env_bool("JEV_DIAGNOSTICS"))
     approval_risk_confidence: float | None = field(
@@ -135,6 +165,14 @@ class JevConfig:
     )
 
     def __post_init__(self) -> None:
+        from intaris.inference import managed_endpoint, token_supplier
+
+        endpoint = managed_endpoint()
+        if endpoint and self.enabled:
+            self.base_url = endpoint.removesuffix("/v1")
+            self.model = "routes/intaris_evaluation"
+            self.api_key = token_supplier()
+            return
         if self.api_key:
             return
         self.api_key = _env("JEV_API_KEY")
@@ -535,7 +573,11 @@ class SearchConfig:
     def vector_enabled(self) -> bool:
         return self.vector_provider != "disabled" and bool(self.embedding_model)
 
-    def resolve_embedding_api_key(self) -> str:
+    def resolve_embedding_api_key(self) -> str | Callable[[], str]:
+        from intaris.inference import managed_endpoint, token_supplier
+
+        if managed_endpoint():
+            return token_supplier()
         return self.embedding_api_key or _llm_api_key()
 
     def resolve_embedding_base_url(self) -> str:
@@ -555,8 +597,32 @@ def _build_analysis_llm_config() -> LLMConfig:
         base_url=_env("ANALYSIS_LLM_BASE_URL") or _llm_base_url(),
         api_key=_env("ANALYSIS_LLM_API_KEY") or _llm_api_key(),
         temperature=0.1,
-        reasoning_effort=_env("ANALYSIS_LLM_REASONING_EFFORT", "low") or None,
+        reasoning_effort=_reasoning_effort("ANALYSIS_LLM_REASONING_EFFORT", "low"),
         timeout_ms=_env_int("ANALYSIS_LLM_TIMEOUT_MS", 30000),
+    )
+
+
+def build_policy_compiler_llm_config() -> LLMConfig:
+    """Lazy conventional compiler config, independent of the L1 backend.
+
+    Reuse analysis defaults and the managed analysis route rather than the
+    evaluation route. Compiler-specific overrides are optional.
+    """
+    from intaris.inference import managed_endpoint
+
+    analysis = _build_analysis_llm_config()
+    return LLMConfig(
+        model=_env("POLICY_COMPILER_LLM_MODEL")
+        or ("routes/intaris_analysis" if managed_endpoint() else analysis.model),
+        base_url=_env("POLICY_COMPILER_LLM_BASE_URL") or analysis.base_url,
+        api_key=_env("POLICY_COMPILER_LLM_API_KEY") or analysis.api_key,
+        temperature=analysis.temperature,
+        reasoning_effort=(
+            _reasoning_effort("POLICY_COMPILER_LLM_REASONING_EFFORT")
+            if "POLICY_COMPILER_LLM_REASONING_EFFORT" in os.environ
+            else analysis.reasoning_effort
+        ),
+        timeout_ms=_env_int("POLICY_COMPILER_LLM_TIMEOUT_MS", analysis.timeout_ms),
     )
 
 
@@ -579,9 +645,11 @@ def _build_l3_analysis_llm_config() -> LLMConfig:
         or _env("ANALYSIS_LLM_API_KEY")
         or _llm_api_key(),
         temperature=0.1,
-        reasoning_effort=_env("ANALYSIS_L3_LLM_REASONING_EFFORT")
-        or _env("ANALYSIS_LLM_REASONING_EFFORT", "low")
-        or None,
+        reasoning_effort=(
+            _reasoning_effort("ANALYSIS_L3_LLM_REASONING_EFFORT")
+            if "ANALYSIS_L3_LLM_REASONING_EFFORT" in os.environ
+            else _reasoning_effort("ANALYSIS_LLM_REASONING_EFFORT", "low")
+        ),
         timeout_ms=_env_int(
             "ANALYSIS_L3_LLM_TIMEOUT_MS",
             _env_int("ANALYSIS_LLM_TIMEOUT_MS", 30000),
@@ -605,7 +673,7 @@ def _build_judge_llm_config() -> LLMConfig:
         base_url=_env("JUDGE_LLM_BASE_URL") or _llm_base_url(),
         api_key=_env("JUDGE_LLM_API_KEY") or _llm_api_key(),
         temperature=0.1,
-        reasoning_effort=_env("JUDGE_LLM_REASONING_EFFORT", "low") or None,
+        reasoning_effort=_reasoning_effort("JUDGE_LLM_REASONING_EFFORT", "low"),
         timeout_ms=_env_int("JUDGE_LLM_TIMEOUT_MS", 15000),
     )
 
@@ -613,6 +681,23 @@ def _build_judge_llm_config() -> LLMConfig:
 @dataclass
 class Config:
     """Root configuration container."""
+
+    l1_input_projection: str = field(
+        default_factory=lambda: _env("L1_INPUT_PROJECTION", "auto")
+    )
+    hybrid_context_mode: str = field(
+        default_factory=lambda: os.environ.get("HYBRID_CONTEXT_MODE", "mixed")
+    )
+    source_context_generation: str = field(
+        default_factory=lambda: os.environ.get("SOURCE_CONTEXT_GENERATION", "spans")
+    )
+    # Overall budget of one /evaluate request (from arrival). Model-call
+    # retries start only when they can finish within it. This covers sequential
+    # L1, bounded Judge repair and independent authorization, not just L1.
+    # Evaluate clients need a transport timeout above this shared ceiling.
+    evaluation_deadline_ms: int = field(
+        default_factory=lambda: _env_int("EVALUATION_DEADLINE_MS", 60000)
+    )
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     jev: JevConfig = field(default_factory=JevConfig)
@@ -641,6 +726,21 @@ class Config:
 
     def validate(self) -> None:
         """Validate that required configuration is present."""
+        from intaris.l1_projection import MODES
+
+        if self.l1_input_projection not in MODES:
+            raise ValueError("L1_INPUT_PROJECTION must be auto, json or lines")
+        if self.source_context_generation not in {
+            "spans",
+            "quotes",
+            "coherent",
+            "single",
+        }:
+            raise ValueError(
+                "SOURCE_CONTEXT_GENERATION must be spans, quotes, coherent or single"
+            )
+        if self.hybrid_context_mode not in {"mixed", "source_context"}:
+            raise ValueError("HYBRID_CONTEXT_MODE must be mixed or source_context")
         # Database backend validation.
         if self.db.backend not in ("sqlite", "postgresql"):
             raise ValueError(
@@ -673,11 +773,18 @@ class Config:
                 f"JUDGE_NOTIFY_MODE={self.judge.notify_mode} is not supported. "
                 "Use 'deny_only', 'always', or 'never'."
             )
-        evaluator_backend = _env("EVALUATOR_BACKEND", "llm").lower()
-        if evaluator_backend not in ("llm", "jev"):
+        from intaris.inference import managed_endpoint
+
+        evaluator_backend = evaluator_backend_mode()
+        if evaluator_backend not in ("llm", "jev", "auto"):
             raise ValueError(
                 f"EVALUATOR_BACKEND={evaluator_backend} is not supported. "
-                "Use 'llm' or 'jev'."
+                "Use 'llm', 'jev', or 'auto'."
+            )
+        if evaluator_backend == "auto" and not managed_endpoint():
+            raise ValueError(
+                "EVALUATOR_BACKEND=auto requires Cognis-managed inference "
+                "(COGNIS_INFERENCE_URL and COGNIS_INFERENCE_TOKEN_FILE)."
             )
         if self.jev.enabled and not self.jev.api_key:
             raise ValueError(
@@ -692,6 +799,14 @@ class Config:
                 )
             if not 0.0 <= self.jev.minimum_confidence <= 1.0:
                 raise ValueError("JEV_MINIMUM_CONFIDENCE must be between 0 and 1.")
+            if not all(
+                0 <= value <= 1
+                for value in (
+                    self.jev.hybrid_minimum_posterior,
+                    self.jev.hybrid_minimum_margin,
+                )
+            ):
+                raise ValueError("JEV_HYBRID thresholds must be between 0 and 1.")
             if (
                 self.jev.approval_risk_confidence is not None
                 and not 0.0 <= self.jev.approval_risk_confidence <= 1.0
@@ -879,6 +994,15 @@ def load_config() -> Config:
     Creates the data directory (~/.intaris by default) if it doesn't exist.
     """
     config = Config()
+    from intaris.inference import managed_endpoint
+
+    if managed_endpoint():
+        config.llm.model = "routes/intaris_evaluation"
+        config.llm_analysis.model = "routes/intaris_analysis"
+        config.llm_l3_analysis.model = "routes/intaris_analysis_deep"
+        config.llm_judge.model = "routes/intaris_judge"
+        config.search.embedding_model = "routes/intaris_embedding"
+        config.search.embedding_base_url = managed_endpoint()
     config.validate()
 
     # Ensure data directory exists

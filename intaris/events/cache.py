@@ -313,6 +313,8 @@ class FilesystemEventChunkCache:
         return self._ttl_seconds > 0 and now - entry.accessed_at > self._ttl_seconds
 
     def _evict_to_size_locked(self) -> int:
+        if self._resident_bytes <= self._max_bytes:
+            return 0
         removed = 0
         for digest in list(self._entries):
             if self._resident_bytes <= self._max_bytes:

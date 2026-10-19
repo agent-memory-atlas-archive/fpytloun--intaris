@@ -403,7 +403,7 @@ async def config(
     The LLM base URL is masked to prevent topology leakage.
     """
     from intaris import __version__
-    from intaris.server import _get_config
+    from intaris.server import _get_config, _get_evaluator_backend
 
     try:
         cfg = _get_config()
@@ -417,24 +417,26 @@ async def config(
             "openai" if cfg.llm_analysis.base_url == default_openai else "custom"
         )
 
+        # Uses the same cached, coalesced selection as evaluations; the
+        # lookup is blocking I/O, so keep it off the event loop.
+        selection = await asyncio.to_thread(_get_evaluator_backend().active)
+        jev = selection["active"] == "jev"
         return {
             "version": __version__,
             "evaluator": {
-                "backend": "jev" if cfg.jev.enabled else "llm",
-                "model": cfg.jev.model if cfg.jev.enabled else cfg.llm.model,
-                "timeout_ms": (
-                    cfg.jev.timeout_ms if cfg.jev.enabled else cfg.llm.timeout_ms
-                ),
-                "minimum_confidence": (
-                    cfg.jev.minimum_confidence if cfg.jev.enabled else None
-                ),
-                "decision_question": (
-                    cfg.jev.decision_question if cfg.jev.enabled else None
-                ),
+                # Active backend for the next evaluation; None when it cannot
+                # be determined (evaluations then fail closed).
+                "backend": selection["active"],
+                "mode": selection["mode"],
+                "backend_error": selection["error"],
+                "model": cfg.jev.model if jev else cfg.llm.model,
+                "timeout_ms": cfg.jev.timeout_ms if jev else cfg.llm.timeout_ms,
+                "minimum_confidence": cfg.jev.minimum_confidence if jev else None,
+                "decision_question": cfg.jev.decision_question if jev else None,
                 "approval_risk_confidence": (
-                    cfg.jev.approval_risk_confidence if cfg.jev.enabled else None
+                    cfg.jev.approval_risk_confidence if jev else None
                 ),
-                "diagnostics": cfg.jev.diagnostics if cfg.jev.enabled else False,
+                "diagnostics": cfg.jev.diagnostics if jev else False,
             },
             "llm": {
                 "model": cfg.llm.model,
