@@ -51,6 +51,13 @@ The Dockerfile uses a two-stage build for fast dependency caching:
 - Health check: `GET /health` every 30s
 - Entry point: `intaris`
 
+GitHub Actions publishes `ghcr.io/fpytloun/intaris:latest` from `main` and
+`ghcr.io/fpytloun/intaris:vX.Y.Z` for published, non-prerelease server releases.
+Before first use, an owner must set the GHCR package visibility to **Public** in
+GitHub Packages settings (`fpytloun/intaris`). Then pull the image with
+`docker pull ghcr.io/fpytloun/intaris:latest` or
+`docker pull ghcr.io/fpytloun/intaris:v0.13.0`.
+
 ### Custom Docker Compose
 
 For production, extend the compose file with all required configuration:
