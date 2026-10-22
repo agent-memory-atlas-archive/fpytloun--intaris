@@ -10,7 +10,15 @@ from intaris.judge_simulator import Answer, classify, request
 from intaris.policy_evidence import from_observations
 
 
-def packet(*, original=True, truncated=False, missing=False, omitted=False):
+def packet(
+    *,
+    original=True,
+    truncated=False,
+    missing=False,
+    omitted=False,
+    instruction="Plan approved. Build in the task worktree. Do not push.",
+    human_decisions=None,
+):
     sources = [
         {
             "ref": "session_intention",
@@ -23,7 +31,7 @@ def packet(*, original=True, truncated=False, missing=False, omitted=False):
             {
                 "ref": "build-approval",
                 "origin": "client_user_claim",
-                "content": "Plan approved. Build in the task worktree. Do not push.",
+                "content": instruction,
                 "truncated": truncated,
             }
         )
@@ -59,6 +67,7 @@ def packet(*, original=True, truncated=False, missing=False, omitted=False):
         state,
         evaluate_policy([], state),
         artifact,
+        human_decisions=human_decisions,
     )
 
 
@@ -86,10 +95,78 @@ def test_summary_fallback_remains_when_original_instructions_are_incomplete(
     assert "no changes of any kind" in q["messages"][1]["content"]
 
 
-@pytest.mark.parametrize("options", [{"missing": True}, {"omitted": True}])
-def test_partial_originals_retain_remaining_summary_context(options):
+@pytest.mark.parametrize(
+    "options",
+    [{"missing": True}, {"omitted": True}, {"missing": True, "omitted": True}],
+)
+def test_missing_history_does_not_promote_summary_over_available_originals(options):
     q = packet(**options)
+    body = json.loads(q["messages"][1]["content"])
+    assert "no changes of any kind" not in q["messages"][1]["content"]
+    assert "Do not push." in q["messages"][1]["content"]
+    assert set(q["citable"].values()) == {"build-approval"}
+    assert {q["citable"][index] for index in q["grant_citable"]} == {"build-approval"}
+    assert body["raw_task_context"]["coverage"] == (
+        "partial" if options.get("omitted") else "captured"
+    )
+    summary = next(
+        row
+        for row in body["raw_task_context"]["sources"]
+        if row["ref"] == "session_intention"
+    )
+    assert summary["body_availability"] == "omitted_generated_interpretation"
+    assert "content" not in summary
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Maintenance checks passed. Merge the reviewed commit and push origin/main.",
+        "Review locally only. Do not edit, merge or push anything.",
+    ],
+)
+def test_current_original_remains_authoritative_without_a_generated_restriction(
+    instruction,
+):
+    q = packet(missing=True, omitted=True, instruction=instruction)
+    body = json.loads(q["messages"][1]["content"])
+    assert q["citation_sources"] == [
+        {"index": 1, "ref": "build-approval", "text": instruction}
+    ]
+    assert instruction in body["originals"][0]
+    assert "Read-only phase: no changes of any kind." not in json.dumps(body)
+
+
+def test_missing_history_without_any_complete_original_keeps_existing_fallback():
+    q = packet(original=False, missing=True, omitted=True)
     assert "no changes of any kind" in q["messages"][1]["content"]
+    assert set(q["citable"].values()) == {"session_intention"}
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny", None])
+def test_human_decision_only_history_does_not_promote_generated_summary(decision):
+    q = packet(
+        original=False,
+        missing=True,
+        human_decisions=[
+            {
+                "call_id": "maintenance-decision",
+                "tool": "apply_patch",
+                "args_redacted": {"patch": "task edit"},
+                "user_decision": decision,
+            }
+        ],
+    )
+    text = q["messages"][1]["content"]
+    if decision is None:
+        assert set(q["citable"].values()) == {"session_intention"}
+        assert "no changes of any kind" in text
+    else:
+        assert set(q["citable"].values()) == {"decision:maintenance-decision"}
+        assert (
+            f"Earlier you {'approved' if decision == 'approve' else 'denied'}" in text
+        )
+        assert "no changes of any kind" not in text
 
 
 @pytest.mark.parametrize("vote", ["approve", "ask", "refuse"])

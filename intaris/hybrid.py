@@ -13,16 +13,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from intaris.effect_scope import requires_explicit_grant
 from intaris.policy_evidence import (
     AUTHORITY_FIELDS,
     Evidence,
     Obligation,
     fields_for,
     from_observations,
+    ground,
 )
 
 VERSION = "hybrid_v1"
-BUNDLE_VERSION = "builtin-v8"
+BUNDLE_VERSION = "builtin-v10"
 CLASSIFICATION_VERSION = "action-intention-v2"
 
 Relationship = Literal[
@@ -325,6 +327,37 @@ class PolicyResult(StrictModel):
     evidence_quality: Literal["deterministic", "model_assessed", "unresolved"] = (
         "unresolved"
     )
+    # Verification of model-asserted conflicts and which ungrounded opinions
+    # the active profile declined to turn into obligations. Diagnostic only.
+    grounding: dict[str, str] = Field(default_factory=dict)
+    ignored_opinions: list[str] = Field(default_factory=list)
+
+
+def bounded_effects(state: Evidence) -> bool:
+    """Controller facts alone establish a bounded, recoverable local action.
+
+    Model risk labels cannot escalate such an action by themselves. Unknown or
+    hazardous effects, external/irreversible hints, secret operands and
+    incomplete path coverage all fail this test.
+    """
+    values = state.comparison()
+    if values.get("secret_argument") or values.get("external_or_irreversible"):
+        return False
+    observed_risk = state.observations.get("risk")
+    if observed_risk is not None and observed_risk.value in {"high", "critical"}:
+        return False
+    effects = set(state.value("effects", ["unknown"]))
+    if not effects or effects & {"unknown", "transmit", "delete"}:
+        return False
+    if values.get("static_read") and state.value("mutation") == "read_only":
+        return True
+    return bool(
+        (state.workflow_scope or {}).get("matched") is True
+        and values.get("paths_complete") is True
+        and values.get("paths")
+        and state.known("effects")
+        and effects <= {"read", "write"}
+    )
 
 
 # Recorded P(critical) below which an abstained risk still admits the explicit
@@ -438,6 +471,7 @@ def evaluate_policy(
         "intent.scope",
         "intent.unrelated",
         "process.current_restrictions",
+        "alignment.compatibility",
     }
     judge_scope_approval = bool(
         review is not None
@@ -463,6 +497,7 @@ def evaluate_policy(
             "intent.unrelated",
             "intent.scope",
             "process.current_restrictions",
+            "alignment.compatibility",
             "risk.high",
             "risk.unknown",
             "model.risk.critical",
@@ -476,7 +511,9 @@ def evaluate_policy(
             for rule in rules
             if fields_for(rule.when) & AUTHORITY_FIELDS
         }
-        if review.corrected_assessment is not None and ids & authority_rules:
+        if review.corrected_assessment is not None and ids & (
+            authority_rules | {"disclosure.authorization"}
+        ):
             for group in review.corrected_assessment.validated_groups(
                 state, review.evidence_refs
             ):
@@ -492,6 +529,7 @@ def evaluate_policy(
             "intent.scope",
             "intent.unrelated",
             "process.current_restrictions",
+            "alignment.compatibility",
         } and (review.risk in {"high", "critical"} or judge_scope_approval):
             # Scope adjudication examines the actual action as well as intent.
             # Its validated severity must not leave an unreviewed model or
@@ -508,6 +546,28 @@ def evaluate_policy(
                 # Recompute configured predicates too, not only built-in scope.
                 return evaluate_policy(rules, state, profile, assessed=assessed)
             values = state.comparison()
+
+    grounding = ground(state)
+    ignored: list[str] = []
+
+    def opinion_blocks(key: str) -> bool:
+        """Whether a model-asserted conflict creates an obligation here.
+
+        Grounded conflicts bind in every profile. Ungrounded ones bind unless
+        the profile is bounded autonomy, which only acts on evidence of harm
+        or a genuine contradiction and records the ignored opinion.
+        """
+        # Lack of a citation does not disprove an explicit prohibition. The
+        # typed classifier can omit references even for genuine bans, so this
+        # finding remains reviewable; task-relevance opinions are different.
+        if key == "restriction_conflict":
+            return True
+        if grounding.get(key) in {"grounded", "unavailable"}:
+            return True
+        if profile == "bounded_autonomy":
+            ignored.append(key)
+            return False
+        return True
 
     def result(outcome, basis=None, quality="unresolved", blocking=()):
         remaining = list(obligations)
@@ -534,6 +594,8 @@ def evaluate_policy(
                     outstanding_obligations=remaining,
                     permission_basis=None,
                     evidence_quality=quality,
+                    grounding=grounding,
+                    ignored_opinions=ignored,
                     **base,
                 )
             # Scope/conflicts are recomputed from corrected factual fields.
@@ -580,6 +642,8 @@ def evaluate_policy(
             outstanding_obligations=remaining,
             permission_basis=basis,
             evidence_quality=quality,
+            grounding=grounding,
+            ignored_opinions=ignored,
             **base,
         )
 
@@ -611,12 +675,20 @@ def evaluate_policy(
         need("human.checkpoint", [], kind="human", protected=True)
     if state.assessment_failed and not state.human_approved:
         need("assessment.invalid_response", [], kind="human", protected=True)
+    alignment = state.parent_alignment or {}
+    if (
+        alignment.get("state") in {"incompatible", "unavailable"}
+        and not alignment.get("overridden")
+        and opinion_blocks("alignment_conflict")
+    ):
+        # Parent/child compatibility is a classification like any other: it
+        # is reviewed through the same pipeline, never a pre-policy hard stop.
+        need("alignment.compatibility", [], kind="independent_review", protected=True)
     # Advisory clauses are L1 context only: they never route a call to
     # assessment or create obligations. Only a conflict that L1 already
     # classified against one, through contextual_restrictions, is reviewed,
     # including on a static read that reached L1 for another reason.
-    compatibility = state.assessment.get("contextual_restrictions", "unresolved")
-    reference = state.assessment.get("restriction_reference")
+    compatibility = state.value("contextual_restrictions", "unresolved")
     if (
         profile == "strict"
         and any(
@@ -634,7 +706,15 @@ def evaluate_policy(
         profile == "strict"
         and state.assessment
         and compatibility == "unresolved"
-        and any(source.get("constraint_kinds") for source in state.sources.values())
+        and any(
+            source.get("constraint_kinds")
+            or any(
+                item.get("status") == "current"
+                and item.get("kind") in {"restriction", "disapproval", "uncertainty"}
+                for item in source.get("constraint_items", [])
+            )
+            for source in state.sources.values()
+        )
     ):
         # A supplied prohibition with unresolved applicability is different from
         # mere absence of permission. It must be reviewed before any grant.
@@ -644,18 +724,17 @@ def evaluate_policy(
             kind="independent_review",
             protected=True,
         )
-    if compatibility == "conflicts" and (
-        reference in state.sources
-        or reference in {clause["id"] for clause in state.advisory_clauses}
-    ):
+    if compatibility == "conflicts":
         # A model-classified conflict with operator prose is reviewed, never a
         # deterministic deny; exact compiled rules own hard prohibitions.
         if (
             corrections.get("contextual_restrictions") == "conflicts"
+            and grounding.get("confirmed_restriction_conflict") == "grounded"
             and not judge_scope_approval
         ):
             return result("deny")
-        need("model.denial", [], kind="independent_review", protected=True)
+        if opinion_blocks("restriction_conflict"):
+            need("model.denial", [], kind="independent_review", protected=True)
     if (
         profile in {"balanced", "bounded_autonomy"}
         and values.get("static_read")
@@ -678,7 +757,7 @@ def evaluate_policy(
             # Facts already prove this is a read. Missing original authority
             # belongs to Judge, not a redundant L1 permission classification.
             return result("escalate")
-    target_scope = state.assessment.get("target_scope", "unresolved")
+    target_scope = state.value("target_scope", "unresolved")
     lifecycle = state.process_lifecycle or {}
     if lifecycle.get("authenticated") is True and lifecycle.get("matched") is True:
         # Scope is established by the admitted spawn and authenticated registry,
@@ -686,11 +765,20 @@ def evaluate_policy(
         if not state.assessment:
             need("process.current_restrictions", ["contextual_restrictions", "risk"])
             return result("escalate")
-        if compatibility != "consistent":
+        if compatibility == "conflicts" and not any(
+            item.id == "model.denial" for item in obligations
+        ):
+            if opinion_blocks("restriction_conflict"):
+                need("process.current_restrictions", [], kind="independent_review")
+        elif compatibility == "unresolved" and profile == "strict":
             need("process.current_restrictions", [], kind="independent_review")
         risk = state.value("risk", "unknown")
-        if risk in {"high", "unknown"}:
-            need(f"risk.{risk}", [], kind="independent_review")
+        if risk == "high":
+            need("risk.high", [], kind="independent_review")
+        elif risk == "unknown":
+            # Registry ownership is permission to manage a process, not proof
+            # that stopping it has bounded operational impact.
+            need("risk.unknown", [], kind="independent_review")
         # This assessment deliberately omits task relationship and target:
         # authenticated spawn scope already owns those questions. Never fall
         # through into the generic intent.assessment path after a partial L1.
@@ -810,6 +898,25 @@ def evaluate_policy(
             "deterministic",
         )
 
+    if (
+        state.value("secret_argument") is True
+        and "disclose" in state.value("effects", [])
+        and not (
+            authority
+            and user_words
+            and state.assessment.get("authorization") == "explicit"
+        )
+        and not deterministic_grant
+        and not state.human_approved
+    ):
+        # Lower severity is not evidence that the user authorized disclosure.
+        # This survives generic risk/scope review until a scoped grant exists.
+        need(
+            "disclosure.authorization",
+            sorted(AUTHORITY_FIELDS),
+            kind="independent_review",
+        )
+
     # Common factual assessment, progressively broader scope defaults.
     if "relationship" not in state.assessment:
         if deterministic_grant and not obligations and not state.sources:
@@ -830,12 +937,18 @@ def evaluate_policy(
         return result("escalate" if assessed else "needs_assessment")
     relationship = state.assessment["relationship"]
     risk = state.value("risk", "unknown")
-    real_target_conflict = (
-        target_scope == "conflicts" and target_ref in admissible_targets
+    real_target_conflict = target_scope == "conflicts" and opinion_blocks(
+        "target_conflict"
     )
-    relationship_conflict = relationship == "conflicts_with_intent"
+    relationship_conflict = relationship == "conflicts_with_intent" and opinion_blocks(
+        "relationship_conflict"
+    )
     if not judge_scope_approval and (
-        (real_target_conflict and corrections.get("target_scope") == "conflicts")
+        (
+            real_target_conflict
+            and target_ref in admissible_targets
+            and corrections.get("target_scope") == "conflicts"
+        )
         or (
             corrections.get("relationship") in {"unrelated", "conflicts_with_intent"}
             and corrections.get("risk") in {"high", "critical"}
@@ -870,15 +983,33 @@ def evaluate_policy(
         or state.value("secret_argument") is True
     ):
         need("risk.high", [], kind="independent_review")
+    # A label recovered from a risk abstention resolves label ambiguity only.
+    # It cannot discharge a consequential boundary (external or irreversible
+    # observation, delete/disclose effects, irreversible reversibility, or a
+    # production mutation): treat such an action as still unassessed unless a
+    # deterministic grant or a human receipt for this action already covers it.
+    recovered_risk = bool(
+        (state.confidences.get("risk") or {}).get("abstention_fallback")
+    )
+    if (
+        recovered_risk
+        and requires_explicit_grant(state)
+        and not deterministic_grant
+        and not state.human_approved
+    ):
+        risk = "unknown"
     if (
         risk == "unknown"
         and profile != "bounded_autonomy"
         and mutation != "read_only"
         and not deterministic_grant
+        and not (profile == "balanced" and bounded_effects(state))
     ):
         # Intent alignment is not a completed risk assessment. Preserve the
         # earlier explicit-source/configured-grant paths, but do not convert
-        # an abstention on a mutating action into semantic permission.
+        # an abstention on a mutating action into semantic permission. When
+        # controller facts already bound the effects, a missing model label
+        # is not evidence of harm (balanced); strict still reviews it.
         need("risk.unknown", [], kind="independent_review")
     if obligations:
         return result("escalate")

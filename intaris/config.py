@@ -455,6 +455,25 @@ class EventStoreConfig:
         default_factory=lambda: _env_int("EVENT_STORE_FLUSH_INTERVAL", 30)
     )
 
+    spool_enabled: bool = field(
+        default_factory=lambda: _env_bool("EVENT_STORE_SPOOL_ENABLED", default=True)
+    )
+    spool_fsync: bool = field(
+        default_factory=lambda: _env_bool("EVENT_STORE_SPOOL_FSYNC", default=True)
+    )
+    spool_path: str = field(default_factory=lambda: _env("EVENT_STORE_SPOOL_PATH", ""))
+    spool_max_bytes: int = field(
+        default_factory=lambda: _env_int("EVENT_STORE_SPOOL_MAX_BYTES", 1024**3)
+    )
+    backend_check_interval: float = field(
+        default_factory=lambda: _env_float("EVENT_STORE_BACKEND_CHECK_INTERVAL", 5.0)
+    )
+
+    @property
+    def effective_spool_path(self) -> str:
+        """Default to a separate sibling of the filesystem event directory."""
+        return self.spool_path or self.filesystem_path.rstrip("/") + "-spool"
+
     # S3 chunk index cache lifetime. A short TTL avoids a prefix listing on
     # every read while still discovering chunks written by another process.
     s3_chunk_cache_ttl: float = field(

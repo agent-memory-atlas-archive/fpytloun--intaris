@@ -9,7 +9,12 @@ from intaris import judge_simulator
 from intaris.config import JudgeConfig
 from intaris.hybrid import Predicate, Rule, Truth, evaluate_policy, test_predicate
 from intaris.judge import JudgeReviewer
-from intaris.policy_evidence import CorrectedAssessment, Review, from_observations
+from intaris.policy_evidence import (
+    CorrectedAssessment,
+    Observation,
+    Review,
+    from_observations,
+)
 from tests.test_intent_aligned import state
 from tests.test_policy_evidence_runtime import response
 from tests.test_policy_evidence_runtime import runtime as runtime
@@ -102,7 +107,10 @@ def test_aligned_effect_matrix_routes_consequential_work_to_scope_review(
 def test_drift_and_severity_review_without_external_label(profile, updates, obligation):
     s = state(**updates)
     result = evaluate_policy([], s, profile, assessed=True)
-    if profile == "bounded_autonomy" and updates == {"risk": "high"}:
+    if profile == "bounded_autonomy" and updates in (
+        {"risk": "high"},
+        {"target_scope": "conflicts"},
+    ):
         assert result.outcome == "approve"
         return
     assert result.outcome == "escalate"
@@ -135,6 +143,11 @@ async def test_judge_corrects_model_interpretation_without_rewriting_l1(
         tool="edit",
         args={"file_path": "/repo/parser.py"},
     )
+    if profile == "bounded_autonomy" and original == "target":
+        # An unsupported first-level opinion is not a gate in this profile.
+        assert result["decision"] == "approve"
+        assert not result["evaluation_metadata"]["judge_required"]
+        return
     assert result["decision"] == "escalate"
     before = audit.get_by_call_id(result["call_id"], user_id="owner")[
         "evaluation_metadata"
@@ -333,8 +346,8 @@ def test_validated_medium_judge_does_not_downgrade_prior_denial(profile):
         ("supports_intent", "medium", ("approve", "approve", "approve")),
         ("unrelated", "low", ("escalate", "approve", "approve")),
         ("unrelated", "medium", ("escalate", "escalate", "approve")),
-        ("conflicts_with_intent", "low", ("escalate", "escalate", "escalate")),
-        ("conflicts_with_intent", "medium", ("escalate", "escalate", "escalate")),
+        ("conflicts_with_intent", "low", ("escalate", "escalate", "approve")),
+        ("conflicts_with_intent", "medium", ("escalate", "escalate", "approve")),
         ("unclear", "low", ("escalate", "approve", "approve")),
         ("supports_intent", "unknown", ("escalate", "escalate", "approve")),
         ("supports_intent", "high", ("escalate", "escalate", "approve")),
@@ -408,6 +421,30 @@ def test_confirmed_real_constraints_and_harm_block_all_profiles(profile):
         {"relationship": "conflicts_with_intent", "risk": "high"},
     ):
         s = state(**updates)
+        if updates.get("risk") == "high":
+            s.observations["external_or_irreversible"] = Observation(
+                value=True, source="classifier"
+            )
+        else:
+            prohibition = "Do not publish this target."
+            s.sources["session_intention"] = {
+                "origin": "client_assignment",
+                "text": prohibition,
+                "constraint_items": [
+                    {
+                        "kind": "restriction",
+                        "status": "current",
+                        "quote": prohibition,
+                    }
+                ],
+            }
+            s.assessment.update(
+                {
+                    "contextual_restrictions": "conflicts",
+                    "restriction_reference": "session_intention",
+                    "restriction_quote": prohibition,
+                }
+            )
         prior = evaluate_policy([], s, profile, assessed=True)
         correction = CorrectedAssessment.model_validate(
             {

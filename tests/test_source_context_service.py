@@ -301,7 +301,10 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
             wire.append(("judge" if judge else "l1-gpt", body))
             properties = schema["schema"]["properties"]
             fields = properties["classification"]["properties"] if judge else properties
-            labels = {field: VALUES[field] for field in fields}
+            labels = {
+                field: "" if field == "restriction_quote" else VALUES[field]
+                for field in fields
+            }
             for field, value in list(labels.items()):
                 if (
                     field
@@ -481,9 +484,11 @@ def test_actual_service_barrier_and_both_provider_payloads(service):
     assert l1
     for body in l1:
         serialized = json.dumps(body)
-        assert CANARY not in serialized
+        # Original instructions accompany the generated goal at L1 as well as
+        # Judge; provenance, not omission, prevents authority promotion.
+        assert CANARY in serialized
         assert "RAW CAPTURED TASK SOURCES" not in serialized
-        assert "generated_summary" not in serialized
+        assert "generated_summary" in serialized
         assert (
             next(
                 stage["model_view"]["version"]
@@ -625,7 +630,9 @@ def test_public_lifecycle_missing_ambiguous_and_truncated_referents(service, que
                             referent["content"] in row for row in simulator["originals"]
                         )
                         continue
-                    assert referent["ref"] not in text
+                    assert referent["ref"] in text
+                    assert "linked_non_authorizing_context" in text
+                    assert '\\"truncated\\": true' in text
         else:
             assert "patch A or publish patch B" in referent["content"]
             assert not referent["truncated"]
@@ -792,7 +799,13 @@ def test_mixed_wire_keeps_legacy_latest_user_shape_at_every_boundary(
         if stage == "judge":
             simulator = json.loads(prompt)
             assert simulator["originals"]
-            assert "session_intention" in simulator["reference_ids"]["sources"].values()
+            assert (
+                "original_assignment" in simulator["reference_ids"]["sources"].values()
+            )
+            assert (
+                "session_intention"
+                not in simulator["reference_ids"]["sources"].values()
+            )
             assert simulator["conversation_tail"]["citable"] is False
             continue
         expected = next(
@@ -1155,7 +1168,7 @@ def test_l1_v4_transport_action_first_and_frozen_judge(
     assert "UNTRUSTED_CLAIM" in l1_view
     assert l1_view.index("FLAT_ACTION_CANARY") < l1_view.index(intention_label)
     assert old_view.index("FLAT_ACTION_CANARY") > old_view.index("RICH INTENTION")
-    assert restriction in l1_view and CANARY not in l1_view
+    assert restriction in l1_view and CANARY in l1_view
     assert artifact["source_digest"] not in l1_view
     assert artifact["artifact_digest"] not in l1_view
     record_property("v3_prompt_bytes", len(old_view.encode()))
@@ -1177,10 +1190,10 @@ def test_l1_v4_transport_action_first_and_frozen_judge(
                 assert prompt.startswith(l1_view)
             assert prompt.index("FLAT_ACTION_CANARY") < prompt.index(intention_label)
             assert restriction in json.dumps(payload)
-            assert CANARY not in l1_view
+            assert CANARY in l1_view
             assert "RAW CAPTURED TASK SOURCES" not in prompt
-            assert CANARY not in prompt
-            assert "generated_summary" not in prompt
+            assert CANARY in prompt
+            assert "generated_summary" in prompt
         elif stage == "judge":
             simulator = json.loads(payload["messages"][1]["content"])
             assert "FLAT_ACTION_CANARY" in json.dumps(simulator["action"])

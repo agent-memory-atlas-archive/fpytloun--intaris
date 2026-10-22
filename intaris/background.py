@@ -1045,11 +1045,6 @@ class BackgroundWorker:
                         self.metrics.summary_audit_only_total += 1
                     if result.get("event_store_fallback"):
                         self.metrics.summary_event_store_fallback_total += 1
-                    # Notify on concerning L2 summaries
-                    if self._notification_dispatcher and self._should_notify_summary(
-                        result
-                    ):
-                        await self._notify_summary_alert(task, result)
                 elif task_type == "analysis":
                     result = await self._execute_analysis_task(task)
                     self.metrics.analyses_completed_total += 1
@@ -1199,9 +1194,36 @@ class BackgroundWorker:
         # generate_summary() makes synchronous LLM calls (up to 30s each,
         # potentially multiple per partition) that would block all HTTP
         # request processing, WebSocket pings, and barrier events.
-        result = await asyncio.to_thread(
-            generate_summary, self._db, llm, task, self._event_store
-        )
+        try:
+            result = await asyncio.to_thread(
+                generate_summary, self._db, llm, task, self._event_store
+            )
+        finally:
+            # A later partition or compaction failure must not hide a persisted
+            # earlier alert. The existing summary owns its delivery progress.
+            if self._notification_dispatcher:
+                await self._notify_pending_summaries(task)
+        # Reuse the existing durable queue: child summaries invalidate their
+        # parent's dependency snapshot even without new local parent activity.
+        if result.get("summary_id"):
+            with self._db.cursor() as cur:
+                cur.execute(
+                    "SELECT parent_session_id FROM sessions WHERE user_id = ? AND session_id = ?",
+                    (task["user_id"], task["session_id"]),
+                )
+                row = cur.fetchone()
+            if row and row["parent_session_id"]:
+                parent_id = row["parent_session_id"]
+                if not self._task_queue.cancel_duplicate(
+                    "summary", task["user_id"], parent_id
+                ):
+                    self._task_queue.enqueue(
+                        "summary",
+                        task["user_id"],
+                        session_id=parent_id,
+                        payload={"trigger": "manual"},
+                        priority=2,
+                    )
 
         # Propagate safety valve hits to metrics
         self.metrics.safety_valve_hits_total += drain_safety_valve_hits()
@@ -1290,6 +1312,89 @@ class BackgroundWorker:
 
         return result
 
+    def _enqueue_changed_parents(self) -> int:
+        """Recover a child update racing an already-running parent summary."""
+        from intaris.analytics_evidence import metadata
+        from intaris.analyzer import (
+            _budget_child_sessions,
+            _collect_child_data,
+            _get_child_sessions,
+        )
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self._config.lookback_days)
+        ).isoformat()
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT p.user_id, p.session_id FROM sessions p "
+                "JOIN sessions c ON c.user_id = p.user_id AND c.parent_session_id = p.session_id "
+                "JOIN session_summaries ss ON ss.user_id = c.user_id AND ss.session_id = c.session_id "
+                "WHERE ss.created_at >= ?",
+                (cutoff,),
+            )
+            parents = list(cur.fetchall())
+        enqueued = 0
+        for parent in parents:
+            children = _collect_child_data(
+                self._db,
+                parent["user_id"],
+                _get_child_sessions(self._db, parent["user_id"], parent["session_id"]),
+            )
+            children, _, _ = _budget_child_sessions(children)
+            dependencies = {c["session_id"]: c.get("summary_ids", []) for c in children}
+            with self._db.cursor() as cur:
+                cur.execute(
+                    "SELECT evidence_metadata FROM session_summaries WHERE user_id = ? "
+                    "AND session_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (parent["user_id"], parent["session_id"]),
+                )
+                previous = cur.fetchone()
+            if dependencies == metadata(
+                previous["evidence_metadata"] if previous else None
+            ).get("children", {}):
+                continue
+            if not self._task_queue.cancel_duplicate(
+                "summary", parent["user_id"], parent["session_id"]
+            ):
+                self._task_queue.enqueue(
+                    "summary",
+                    parent["user_id"],
+                    session_id=parent["session_id"],
+                    payload={"trigger": "manual"},
+                    priority=2,
+                )
+                enqueued += 1
+        return enqueued
+
+    async def _notify_pending_summaries(self, task: dict[str, Any]) -> None:
+        import json
+
+        from intaris.analytics_evidence import metadata
+
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT id, intent_alignment, risk_indicators, evidence_metadata "
+                "FROM session_summaries WHERE user_id = ? AND session_id = ? "
+                "ORDER BY created_at, id",
+                (task["user_id"], task["session_id"]),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            evidence = metadata(row["evidence_metadata"])
+            if not evidence or evidence.get("notification_sent"):
+                continue
+            row["risk_indicators"] = json.loads(row["risk_indicators"] or "[]")
+            if self._should_notify_summary(row):
+                if not await self._notify_summary_alert(task, row):
+                    continue
+            evidence["notification_sent"] = True
+            with self._db.cursor() as cur:
+                cur.execute(
+                    "UPDATE session_summaries SET evidence_metadata = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (json.dumps(evidence), task["user_id"], row["id"]),
+                )
+
     @staticmethod
     def _should_notify_summary(result: dict[str, Any]) -> bool:
         """Check if an L2 summary result warrants a notification.
@@ -1316,7 +1421,7 @@ class BackgroundWorker:
 
     async def _notify_summary_alert(
         self, task: dict[str, Any], result: dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """Send a summary_alert notification for a concerning L2 summary."""
         from intaris.notifications.providers import Notification
 
@@ -1359,8 +1464,10 @@ class BackgroundWorker:
                 session_id,
                 result.get("intent_alignment"),
             )
+            return True
         except Exception:
             logger.warning("Failed to send summary alert notification", exc_info=True)
+            return False
 
     async def _notify_analysis_alert(
         self, task: dict[str, Any], result: dict[str, Any]
@@ -1524,8 +1631,8 @@ class BackgroundWorker:
     async def _event_store_flusher(self) -> None:
         """Periodically flush event store buffers to storage.
 
-        Runs every EVENT_STORE_FLUSH_INTERVAL seconds (default 30s).
-        This bounds the maximum data loss window on hard crash.
+        Polls age/health deadlines once per second. With spooling enabled,
+        EVENT_STORE_FLUSH_INTERVAL bounds archival delay, not crash durability.
         """
         # Import here to get the flush interval from the event store config
         from intaris.config import load_config
@@ -1688,6 +1795,7 @@ class BackgroundWorker:
                 continue
 
             # Find (user_id, agent_id) pairs with new summaries since
+            self._enqueue_changed_parents()
             # their last analysis. Agent-scoped: each agent gets its own
             # analysis and behavioral profile.
             with self._db.cursor() as cur:
@@ -1778,7 +1886,7 @@ class BackgroundWorker:
         # re-enqueuing ancient sessions on every restart.
         if self.analyzer_ready:
             try:
-                enqueued = 0
+                enqueued = self._enqueue_changed_parents()
                 cutoff = (
                     datetime.now(timezone.utc)
                     - timedelta(days=self._config.lookback_days)

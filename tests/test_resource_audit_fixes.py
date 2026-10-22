@@ -235,7 +235,7 @@ def test_projection_batches_preserve_duplicates_gaps_and_atomicity(
     )
 
 
-def test_long_summary_history_prefilter_matches_previous_selection(audit_db):
+def test_long_legacy_compactions_do_not_hide_windows_with_unknown_coverage(audit_db):
     import json
 
     from intaris.analyzer import _get_session_summaries_for_analysis
@@ -263,7 +263,7 @@ def test_long_summary_history_prefilter_matches_previous_selection(audit_db):
         )
     with audit_db.cursor() as cur:
         cur.execute(
-            """SELECT session_id, summary_type, summary, intent_alignment,
+            """SELECT id, created_at, evidence_metadata, session_id, summary_type, summary, intent_alignment,
                       risk_indicators, tools_used, call_count, approved_count,
                       denied_count, escalated_count, window_start, window_end, trigger
                FROM session_summaries WHERE user_id = ? ORDER BY window_start ASC""",
@@ -273,14 +273,13 @@ def test_long_summary_history_prefilter_matches_previous_selection(audit_db):
     expected = {}
     for sid in ("compacted", "windows"):
         selected = [row for row in rows if row["session_id"] == sid]
-        compacted = [row for row in selected if row["summary_type"] == "compacted"]
-        expected[sid] = compacted or selected
+        expected[sid] = [row for row in selected if row["summary_type"] == "window"]
         for row in expected[sid]:
             for field in ("risk_indicators", "tools_used"):
                 row[field] = json.loads(row[field])
     result = _get_session_summaries_for_analysis(audit_db, user, None, 30)
     assert {sid: value["summaries"] for sid, value in result.items()} == expected
-    assert sum(len(value["summaries"]) for value in result.values()) == 122
+    assert sum(len(value["summaries"]) for value in result.values()) == 240
 
 
 def test_s3_cache_returns_immutable_snapshot_and_counts_chunks():
@@ -381,11 +380,13 @@ def test_concurrent_index_refresh_counts_only_published_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_queue_metrics_have_one_sampler_and_keep_ten_second_cadence(monkeypatch):
+async def test_queue_metrics_have_one_sampler_and_keep_ten_second_cadence(
+    monkeypatch, audit_db
+):
     from intaris.background import BackgroundWorker
     from intaris.config import AnalysisConfig
 
-    worker = BackgroundWorker(Mock(), AnalysisConfig(), task_queue=Mock())
+    worker = BackgroundWorker(audit_db, AnalysisConfig(), task_queue=Mock())
     worker._task_queue.get_queue_stats.return_value = {"pending": 7}
     worker._running = True
     sleeps = []
@@ -456,6 +457,8 @@ def test_sqlite_uncompacted_summary_scan_scales_linearly(tmp_path):
         with db.connection() as conn:
             plan = list(conn.execute("EXPLAIN QUERY PLAN " + query))
         assert not any("CORRELATED" in row[3] for row in plan)
-        assert any("LIST SUBQUERY" in row[3] for row in plan)
+        # Current evidence selection reads all rows once before choosing coverage;
+        # its indexed, non-correlated scan must retain linear scaling.
+        assert any("SEARCH selected" in row[3] for row in plan)
     finally:
         db.close()

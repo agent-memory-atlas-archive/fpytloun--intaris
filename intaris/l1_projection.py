@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 from intaris.redactor import redact
 from intaris.task_support import INSTRUCTION_SCOPE_GUIDANCE
 
-VERSION = "action-intention-view-v9"
+VERSION = "action-intention-view-v10"
 MODES = {"auto", "json", "lines"}
 
 # Schema carries label choices; prose carries their semantic distinctions.
@@ -155,7 +155,7 @@ def reference_labels(schema: dict) -> dict[str, dict[str, str]]:
 
 
 def classifier_view(artifact: dict, state) -> dict:
-    """The action, generated intention and relevant facts, without source replay."""
+    """The action and original instruction evidence, with fallible context."""
     observations = redact({k: o.value for k, o in state.observations.items()})
     current = artifact.get("current_request") or {}
     indices = set(current.get("item_indices", [])) if current else None
@@ -229,11 +229,12 @@ def classifier_view(artifact: dict, state) -> dict:
         "loaded_skills": runtime.get("loaded_skills"),
         "read_only_required": state.read_only_required,
     }
-    if artifact.get("context_mode") == "raw":
+    if artifact.get("context_mode") == "raw" or artifact.get("originals"):
         from intaris.evaluation_context import source_view
 
-        # Reuse the same captured, bounded originals as the canonical raw view.
-        # Never manufacture generated items or promote these bodies to grants.
+        # Rich extraction can be stale too. Use the canonical captured source
+        # view in every mode instead of hiding later original instructions from
+        # L1 while showing them only to Judge. References are not new grants.
         view["intention"]["source_context"] = source_view(artifact)
         sources = view["intention"]["source_context"]
         if (
@@ -308,10 +309,25 @@ def render(artifact: dict, state, mappings: dict) -> str:
             lines.append(
                 f"Reference {label}: generated constraint reference, not a grant"
             )
-    if any(
-        state.observations[k].coverage != "complete"
-        for k in ("paths", "mutation", "effects")
-        if k in state.observations
-    ) or artifact.get("status") not in {"ready", "summary_only"}:
+    source_gaps = (
+        bool(artifact.get("coverage", {}).get("missing"))
+        or bool(artifact.get("omitted_originals"))
+        or any(
+            row.get("truncated") or row.get("render_truncated")
+            for row in artifact.get("originals", [])
+        )
+    )
+    if (
+        any(
+            state.observations[k].coverage != "complete"
+            for k in ("paths", "mutation", "effects")
+            if k in state.observations
+        )
+        or source_gaps
+        or (
+            artifact.get("status") not in {"ready", "summary_only"}
+            and not artifact.get("originals")
+        )
+    ):
         lines.append("Gaps: intention or action facts incomplete")
     return "\n".join(lines)

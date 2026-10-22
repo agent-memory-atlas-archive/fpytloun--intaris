@@ -5,8 +5,10 @@ import json
 from typing import Literal
 
 import jsonschema
+from pydantic import Field
 
 from intaris.hybrid import EFFECTS, Assessment
+from intaris.inference_attribution import attributed
 from intaris.judge_simulator import JUDGE_OUTPUT_MAX_TOKENS
 from intaris.llm import STRUCTURED_OUTPUT_MAX_TOKENS
 from intaris.policy_evidence import AUTHORITY_FIELDS, Evidence, Review, audit_evidence
@@ -30,11 +32,22 @@ L1_DEFINITIONS = (
     "user's task and no reasonable step toward it; never use it for such steps. "
     "conflicts_with_intent contradicts the user's goal or restrictions. unclear "
     "means the evidence is insufficient. Judge the relationship against the "
-    "generated rich intention, including its active goal and constraints.\n"
+    "current original assignment and applicable constraints; generated intentions "
+    "are fallible context, not independent restrictions or permissions.\n"
     "effects: transmit means data or actions leave the user's environment to third "
     "parties: sending messages or email, writes to remote services, git push, "
     "deploy, purchases. Local files, /tmp, local containers, port-forwards, local "
-    "builds and tests are local: write or execute, never transmit.\n"
+    "builds and tests need not transmit; classify the whole call including nested "
+    "commands, uploads and remote/target overrides.\n"
+    "risk: actual operational impact of this call. unknown means impact evidence "
+    "is missing, never uncertainty about permission and never a tie between low "
+    "and medium. Permission is not your question.\n"
+    "contextual_restrictions: conflicts requires an identifiable instruction that "
+    "currently applies to this actor, operation and target; select its reference "
+    "and copy its exact prohibiting words into restriction_quote. A related or "
+    "superseded source, an assistant status report, or an earlier phase limit "
+    "already lifted is not a prohibition. unresolved means a real evidence gap, "
+    "not merely that this supporting step was not separately requested.\n"
 )
 
 AUTHORITY_DEFINITIONS = (
@@ -63,6 +76,14 @@ class PolicyAssessment(Assessment):
     target_scope: Literal["consistent", "conflicts", "unresolved"] = "unresolved"
     restriction_reference: str = "none"
     target_reference: str = "none"
+    # Verbatim words of the cited restriction. Optional on the wire: typed
+    # selective evaluators cannot emit free text, and grounding then relies on
+    # the intention generator's extracted prohibition items instead.
+    restriction_quote: str = Field(default="", max_length=800)
+
+
+# Free-text fields never become selective options and are never required.
+OPTIONAL_TEXT_FIELDS = frozenset({"restriction_quote"})
 
 
 def request(
@@ -85,6 +106,8 @@ def request(
     if state.advisory_clauses:
         # Context for an assessment that already happens, never a routing reason.
         fields |= {"contextual_restrictions", "restriction_reference"}
+    if "restriction_reference" in fields:
+        fields |= {"restriction_quote"}
     schema = PolicyAssessment.model_json_schema()
     properties = {key: schema["properties"][key] for key in sorted(fields)}
     if judge:
@@ -104,7 +127,6 @@ def request(
                     *(
                         source["ref"]
                         for source in (task_context or {}).get("originals", [])
-                        if (task_context or {}).get("context_mode") == "raw"
                     ),
                 ]
             )
@@ -137,7 +159,7 @@ def request(
     classification = {
         "type": "object",
         "properties": properties,
-        "required": list(properties),
+        "required": [key for key in properties if key not in OPTIONAL_TEXT_FIELDS],
         "additionalProperties": False,
     }
     wire = classification
@@ -270,7 +292,11 @@ def request(
         "has_operator_context": bool(state.advisory_clauses),
         "raw_sources": source_view(task_context)
         if task_context is not None
-        and (judge or task_context.get("context_mode") == "raw")
+        and (
+            judge
+            or task_context.get("context_mode") == "raw"
+            or task_context.get("originals")
+        )
         else None,
     }
     if task_context is not None or (strict_output and not judge):
@@ -305,7 +331,8 @@ def system_prompt(question: dict, *, include_schema: bool = True) -> str:
             "applicable constraints and actual targets. Generated constraints and "
             "status labels are fallible; when raw originals are supplied, use their "
             "provenance, chronology and stated scope to correct stale interpretations. "
-            "Select the supplied constraint/target reference on conflict, otherwise none."
+            "Select the supplied constraint/target reference on conflict, otherwise none; "
+            "none is not itself evidence of a conflict or of a missing fact."
             + (
                 "\nOutput schema: "
                 + json.dumps(
@@ -352,14 +379,16 @@ def system_prompt(question: dict, *, include_schema: bool = True) -> str:
             "Consequential means publication, destructive action, significant external "
             "mutation or sensitive export, even if low risk. Public read queries and pure "
             "code execution alone are routine. Mutation is actual whole-call state change, "
-            "not tool capability. Select only supplied references; none "
-            "means unresolved. Judge must answer every obligation, not generic within_scope. "
+            "not tool capability. Select only supplied references; none means no "
+            "identified applicable reference. Judge must answer every obligation, not "
+            "generic within_scope. "
             "Schema: " + json.dumps(question["schema"])
         )
     )
     return instructions
 
 
+@attributed("policy_assess")
 def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
     from intaris.evaluation_context import model_view, request_view
     from intaris.input_budget import located_source, source_sections
@@ -379,6 +408,8 @@ def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
                         for effect in EFFECTS - {"unknown"}
                     }
                 )
+            elif key in OPTIONAL_TEXT_FIELDS:
+                continue
             else:
                 options[key] = tuple(prop["enum"])
         payload, actual_view = request_view(

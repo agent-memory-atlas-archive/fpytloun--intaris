@@ -223,7 +223,9 @@ def _extract_user_text(event_type: str, data: dict[str, Any]) -> str | None:
 
 def _is_intention_eligible(event_type: str, data: dict[str, Any]) -> bool:
     """Resolve intention eligibility with a fail-safe legacy fallback."""
-    if event_type != "user_message":
+    if event_type != "user_message" and not (
+        event_type == "message" and data.get("role") == "user"
+    ):
         return True
     value = data.get("intention_eligible", True)
     return value if isinstance(value, bool) else False

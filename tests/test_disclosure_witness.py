@@ -71,7 +71,17 @@ def test_model_conflict_approval_gate(confidence, risk, disclose, expected):
             "bash", {"command": "printenv ORBIT_SERVICE_TOKEN"}, policy={}
         )
         evidence = evidence.model_copy(
-            update={"observations": from_observations(facts).observations}
+            update={
+                "observations": from_observations(facts).observations,
+                # state() grants an inbox deletion. That action-specific grant
+                # cannot be reused as authorization to print a credential.
+                "assessment": {
+                    **evidence.assessment,
+                    "authorization": "absent",
+                    "authorization_source": "none",
+                    "authorization_scope": "unclear",
+                },
+            }
         )
     prior = evaluate_policy([], evidence, "bounded_autonomy")
     assert any(o.id == "model.denial" for o in prior.outstanding_obligations)
@@ -169,4 +179,5 @@ def test_disclosure_survives_runtime_observers_and_persistence(runtime, command)
         }
     )
     assert evaluate_policy([], reviewed, "bounded_autonomy").outcome != "approve"
-    assert reviewed.value("risk") == "high"
+    assert reviewed.observations["risk"].value == "high"
+    assert "disclose" in reviewed.value("effects")

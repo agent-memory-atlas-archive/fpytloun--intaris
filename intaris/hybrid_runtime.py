@@ -401,9 +401,11 @@ class HybridRuntime:
         sessions,
         task_context=None,
         l1_input_projection="auto",
+        analytics_provenance=None,
     ):
         self.llm, self.jev, self.audit, self.sessions = llm, jev, audit, sessions
         self.task_context = task_context
+        self.analytics_provenance = analytics_provenance
         from intaris.l1_projection import resolve, strict_groq
 
         identity = getattr(llm, "routing_identity", {})
@@ -428,7 +430,11 @@ class HybridRuntime:
         artifact,
         overlay,
     ):
-        """Classify the action against intention; original scope belongs to Judge."""
+        """Classify action facts against the goal and captured original context."""
+        if (artifact or {}).get("fallback") == "mixed_no_user_evidence":
+            # No captured user scope exists: retain the exact mixed-input path,
+            # including its finite reference set rather than phantom raw sources.
+            artifact = None
         l1_artifact = {
             **(artifact or {"status": "summary_only", "items": []}),
             # Rich capture deliberately leaves this empty: selected task items
@@ -441,7 +447,8 @@ class HybridRuntime:
             else session.get("intention", ""),
             "parent_intention": parent_intention,
         }
-        # No raw fallback, dialogue, policy snapshot or historical actions in L1.
+        # Captured originals retain their origins; historical actions and policy
+        # decisions are not introduced as an independent authorization source.
         question = policy_assessment.request(
             state,
             result,
@@ -489,6 +496,7 @@ class HybridRuntime:
         controller_context: dict | None = None,
         process_lifecycle: dict | None = None,
         approved_edit_scopes: list[str] | None = None,
+        parent_alignment: dict | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
         user_id, session_id = session["user_id"], session["session_id"]
@@ -565,6 +573,7 @@ class HybridRuntime:
                 "advisory_clauses": snapshot.get("advisory_clauses", []),
                 "workflow_scope": workflow,
                 "process_lifecycle": process_lifecycle,
+                "parent_alignment": parent_alignment,
             }
         )
         previous = self.audit.find_hybrid_approval(
@@ -719,13 +728,17 @@ class HybridRuntime:
                 for item in artifact.get("items", []):
                     if (
                         item["kind"] in {"restriction", "disapproval", "uncertainty"}
-                        and item.get("status", item.get("temporal_status"))
-                        != "superseded"
                         and item["source_ref"] in raw_sources
                     ):
                         source = raw_sources[item["source_ref"]]
-                        source["constraint_kinds"] = sorted(
-                            {*source.get("constraint_kinds", []), item["kind"]}
+                        source.setdefault("constraint_items", []).append(
+                            {
+                                "kind": item["kind"],
+                                "status": item.get(
+                                    "temporal_status", item.get("status")
+                                ),
+                                "quote": item.get("quote"),
+                            }
                         )
                 if artifact.get("status") == "unavailable":
                     for source in raw_sources.values():
@@ -857,7 +870,12 @@ class HybridRuntime:
         now = datetime.now(timezone.utc)
         metadata = {
             "evaluation_policy_version": "hybrid_v1",
+            "analytics": {
+                "available_profile": self.analytics_provenance,
+                "l1_consumed": False,
+            },
             "process_lifecycle": process_lifecycle,
+            "parent_alignment": parent_alignment,
             "workflow_scope": workflow,
             **(
                 {"approved_workspace_scopes": approved_edit_scopes}
@@ -1035,6 +1053,7 @@ class HybridRuntime:
             outcome_override=override,
             evaluation_metadata=metadata,
             admission_snapshot=session,
+            profile_version=(self.analytics_provenance or {}).get("profile_version"),
         )
         decision, override, reasoning = (
             record["decision"],
@@ -1158,6 +1177,10 @@ class HybridRuntime:
             facts["command"] = redact({"command": facts["command"]})["command"]
         metadata = {
             "evaluation_policy_version": "hybrid_v1",
+            "analytics": {
+                "available_profile": self.analytics_provenance,
+                "l1_consumed": False,
+            },
             "operator_bound": True,
             "workflow_scope": workflow,
             "judge_required": False,
@@ -1221,6 +1244,7 @@ class HybridRuntime:
             outcome_override=override,
             evaluation_metadata=metadata,
             admission_snapshot=session,
+            profile_version=(self.analytics_provenance or {}).get("profile_version"),
         )
         self.sessions.increment_counter(
             session["session_id"], record["decision"], user_id=session["user_id"]

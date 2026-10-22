@@ -210,9 +210,9 @@ def test_l1_compact_judge_captured_originals_and_same_policy(runtime):
     }
     prompt = llm.generate.call_args.args[0][1]["content"]
     assert "OLD_REASONING" not in prompt
-    assert "TAIL_ORIGINAL" not in prompt
+    assert "TAIL_ORIGINAL" in prompt
     assert "RAW CAPTURED TASK SOURCES" not in prompt
-    assert "client_assignment" not in prompt
+    assert "client_assignment" in prompt
     artifact = treated["evaluation_metadata"]["task_context"]
     from tests.authorization_fixtures import add_supported_authorization_response
 
@@ -241,7 +241,7 @@ def test_l1_compact_judge_captured_originals_and_same_policy(runtime):
     assert analysis.generate.call_count == 1
 
 
-def test_failure_cached_and_never_falls_back_to_raw_history(runtime):
+def test_failed_extraction_cached_without_losing_original_instruction_context(runtime):
     sessions, audit, llm, baseline, sid = runtime
     sid += "-strict"
     sessions.create(
@@ -270,7 +270,8 @@ def test_failure_cached_and_never_falls_back_to_raw_history(runtime):
         # Raw evidence is independent of successful compact extraction.
         # Its origin remains explicit and cannot become a forged human grant.
         prompt = llm.generate.call_args.args[0][1]["content"]
-        assert "RAW_HISTORY_SECRET_SENTINEL" not in prompt
+        assert "RAW_HISTORY_SECRET_SENTINEL" in prompt
+        assert "client_user_claim" in prompt
         assert "RAW CAPTURED TASK SOURCES" not in prompt
         assert row["decision"] == "escalate"
     assert analysis.generate.call_count == 1

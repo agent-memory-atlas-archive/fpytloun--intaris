@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from intaris.hybrid import digest
+from intaris.inference_attribution import attributed
 from intaris.policy_activation import HybridError
 from intaris.redactor import redact
 from intaris.source_capture import MAX_SOURCE_CHARS, bound_sources
@@ -435,6 +436,7 @@ class TaskContext:
         body["source_digest"] = digest(body)
         return body
 
+    @attributed("source_context")
     def _extract(self, snapshot):
         if self.generation == "single":
             from intaris.intention_profile import adapt

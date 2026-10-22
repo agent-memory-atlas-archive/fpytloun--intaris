@@ -26,11 +26,13 @@ generated constraints, not reconstructed authority, contradicting its raw-source
 fallback and phase-scope guidance. It now uses original evidence and stated scope
 to correct stale generated interpretations when those originals are supplied.
 
-Judge no longer repeats the disputed extracted item/status index. When original
-instruction evidence is complete, its generated session summary is omitted as a
-redundant interpretation, with a presentation marker. Missing original-assignment
-coverage or truncated/omitted instruction rows retain summary fallback. Original
-source bodies, provenance, human decisions and reference mapping remain.
+Judge no longer repeats the disputed extracted item/status index. When at least
+one complete original instruction or human decision is available, its generated
+session summary is omitted as a redundant interpretation, with a presentation
+marker. Missing history or other truncated/omitted rows must not promote that
+summary into citable user authority. The existing summary fallback remains when
+no complete original instruction or human decision is available. Original source
+bodies, provenance, coverage and genuine restrictions remain unchanged.
 
 This changes model inputs, not permission policy. It does not establish that
 every helper operation is valid or override explicit operational restrictions.

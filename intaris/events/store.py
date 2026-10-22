@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator, Literal
 
 from intaris.config import EventStoreConfig
@@ -26,6 +27,14 @@ from intaris.events.backend import (
     FilesystemEventBackend,
     S3EventBackend,
     _events_to_ndjson,
+    _validate_path_component,
+    event_matches_filters,
+)
+from intaris.events.spool import (
+    EventSpool,
+    SpoolReadBackend,
+    batch_identity,
+    request_digest,
 )
 from intaris.metrics import Histogram
 
@@ -107,6 +116,21 @@ class EventStore:
             self._backend = FilesystemEventBackend(config)
         else:
             raise ValueError(f"Unsupported event store backend: {config.backend}")
+        self._spool = (
+            EventSpool(config, self._backend) if config.spool_enabled else None
+        )
+        if self._spool is not None:
+            self._backend = SpoolReadBackend(self._spool)
+        else:
+            spool_root = Path(config.effective_spool_path)
+            if (
+                any(spool_root.glob("batches/*.json"))
+                or any(spool_root.glob("exports/*.json"))
+                or any(spool_root.glob("deletions/*.json"))
+            ):
+                raise RuntimeError(
+                    "Cannot disable a nonempty event spool; drain it first"
+                )
 
         # Write buffer: (user_id, session_id) → list of events
         self._buffers: dict[tuple[str, str], list[dict]] = {}
@@ -156,6 +180,8 @@ class EventStore:
 
     def _session_lock(self, key: tuple[str, str]) -> threading.RLock:
         """Return a stable striped lock without per-session registry growth."""
+        if self._spool is not None:
+            return self._spool.session_lock(key)
         return self._session_locks[hash(key) % len(self._session_locks)]
 
     def metrics(self) -> dict[str, Any]:
@@ -174,6 +200,7 @@ class EventStore:
             }
         result["buffered_sessions"] = self.buffered_session_count
         result["buffered_events"] = self.buffered_event_count
+        result["spool"] = self._spool.metrics() if self._spool else {"enabled": False}
         backend_metrics = getattr(self._backend, "metrics", None)
         if callable(backend_metrics):
             result["backend"] = backend_metrics()
@@ -194,6 +221,165 @@ class EventStore:
     def set_session_store(self, session_store: Any) -> None:
         """Set the relational store used for durable sequence allocation."""
         self._session_store = session_store
+
+    @property
+    def spool_enabled(self) -> bool:
+        return self._spool is not None
+
+    def close(self) -> None:
+        """Release the local writer lock only after producers/flushers stop."""
+        if self._spool is not None:
+            self._spool.close()
+
+    def recover_spool(self) -> None:
+        """Resolve durable input batches before serving requests or producers."""
+        if self._spool is None:
+            if (
+                self._session_store is not None
+                and self._session_store.pending_spool_reservations()
+            ):
+                raise RuntimeError("Cannot disable spool with unarchived reservations")
+            return
+        spool = self._spool
+        spool.resume_deletions(self._invalidate_spool)
+        for key in spool.sessions():
+            with self._session_lock(key):
+                if self._session_store is not None:
+                    try:
+                        self._session_store.get(key[1], user_id=key[0])
+                    except ValueError:
+                        spool.delete(key, self._invalidate_spool)
+                        continue
+                for meta in spool.records(key):
+                    self._assign_spooled(spool.load(meta["batch_id"]))
+        if self._session_store is not None:
+            for reservation in self._session_store.pending_spool_reservations():
+                key = (reservation["user_id"], reservation["session_id"])
+                if any(
+                    r["batch_id"] == reservation["batch_id"] for r in spool.records(key)
+                ):
+                    continue
+                # A replaced/lost emptyDir is not silently accepted as recovery.
+                seqs = set(range(reservation["first_seq"], reservation["last_seq"] + 1))
+                archived = spool.backend.read_seqs(*key, seqs)
+                if len(archived) != len(seqs) or {e["seq"] for e in archived} != seqs:
+                    raise RuntimeError(
+                        "Missing event spool with unarchived reservations"
+                    )
+                source = archived[0].get("source")
+                originals = [
+                    {k: v for k, v in e.items() if k not in {"seq", "ts", "source"}}
+                    for e in archived
+                ]
+                if request_digest(originals, source) != reservation["digest"] or any(
+                    e.get("ts") != reservation["event_ts"] for e in archived
+                ):
+                    raise RuntimeError("Archived event reservation content mismatch")
+                self._session_store.archive_spool_reservations(
+                    *key, [reservation["batch_id"]]
+                )
+
+    def _assign_spooled(self, record: dict) -> list[int]:
+        assert self._spool is not None
+        if record.get("database_backed") and self._session_store is None:
+            raise RuntimeError("Database-backed spool recovery requires SessionStore")
+        key = (record["user_id"], record["session_id"])
+        if "first_seq" in record:
+            return list(range(record["first_seq"], record["last_seq"] + 1))
+        minimum = self._seq_counters.get(key)
+        if minimum is None:
+            minimum = self._backend.last_seq(*key)
+        if self._session_store is not None:
+            seqs = self._session_store.allocate_event_sequences(
+                key[1],
+                user_id=key[0],
+                user_message_flags=[
+                    self._is_user_message_event(e) for e in record["events"]
+                ],
+                minimum_last_seq=minimum,
+                latest_user_evidence=next(
+                    (
+                        {"source": "recording_client", "data": e.get("data")}
+                        for e in reversed(record["events"])
+                        if self._is_user_message_event(e)
+                    ),
+                    None,
+                ),
+                spool_reservation=record,
+            )
+        else:
+            seqs = list(range(minimum + 1, minimum + 1 + record["count"]))
+        self._spool.assign(
+            record, seqs, durable_reservation=self._session_store is not None
+        )
+        self._seq_counters[key] = max(self._seq_counters.get(key, 0), seqs[-1])
+        return seqs
+
+    def _append_spooled(
+        self,
+        user_id: str,
+        session_id: str,
+        events: list[dict],
+        source: str,
+        idempotency_key: str | None,
+    ) -> list[int]:
+        assert self._spool is not None
+        spool = self._spool
+        _validate_path_component(user_id, "user_id")
+        _validate_path_component(session_id, "session_id")
+        events = [
+            {k: v for k, v in event.items() if k not in {"seq", "ts", "source"}}
+            for event in events
+        ]
+        key = (user_id, session_id)
+        batch_id = batch_identity(*key, idempotency_key)
+        with self._session_lock(key):
+            spool.admit()
+            spool.check_session(key)
+            if idempotency_key and self._session_store is None:
+                raise RuntimeError("Idempotent spool appends require SessionStore")
+            if self._session_store is not None and idempotency_key:
+                existing = self._session_store.get_spool_reservation(*key, batch_id)
+                if existing:
+                    if existing["digest"] != request_digest(events, source):
+                        raise ValueError("Event batch idempotency payload mismatch")
+                    if existing["archived"] == 2:
+                        raise ValueError("Event recording was deleted")
+                    if existing["archived"]:
+                        return list(
+                            range(existing["first_seq"], existing["last_seq"] + 1)
+                        )
+            # Finish an earlier interrupted assignment before reserving more seqs.
+            for meta in spool.records(key):
+                if "first_seq" not in meta:
+                    self._assign_spooled(spool.load(meta["batch_id"]))
+            record = spool.prepare(
+                *key,
+                events,
+                source,
+                batch_id,
+                database_backed=self._session_store is not None,
+            )
+            repeated = "first_seq" in record
+            seqs = self._assign_spooled(record)
+            if spool.due(key):
+                self._flush_locked(key)
+            spool.admit()
+            enriched = [
+                {**e, "seq": seq, "ts": record["ts"], "source": source}
+                for e, seq in zip(record["events"], seqs)
+            ]
+        if self._event_bus is not None and not repeated:
+            for event in enriched:
+                self._event_bus.publish(
+                    {
+                        "type": "session_event",
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "event": event,
+                    }
+                )
+        return seqs
 
     def reconcile_session_user_message_state(self) -> int:
         """Reconstruct relational event high-water state from event logs.
@@ -260,6 +446,8 @@ class EventStore:
         session_id: str,
         events: list[dict[str, Any]],
         source: str = "intaris",
+        *,
+        idempotency_key: str | None = None,
     ) -> list[int]:
         """Append events to a session's event log.
 
@@ -278,6 +466,10 @@ class EventStore:
         """
         if not events:
             return []
+        if self._spool is not None:
+            return self._append_spooled(
+                user_id, session_id, events, source, idempotency_key
+            )
 
         now = datetime.now(timezone.utc).isoformat()
         assigned_seqs: list[int] = []
@@ -1064,17 +1256,38 @@ class EventStore:
         Called on server shutdown (lifespan cleanup) and by the
         periodic flush background task.
         """
-        with self._lock:
-            keys = list(self._buffers)
+        if self._spool is not None:
+            self._spool.probe(force=True)
+            self._spool.resume_deletions(self._invalidate_spool)
+            keys = self._spool.sessions()
+        else:
+            with self._lock:
+                keys = list(self._buffers)
         for key in keys:
             with self._session_lock(key):
                 self._flush_locked(key)
         with self._lock:
             pending = set(self._audit_reconcile_pending)
         self._reconcile_pending_audit(pending)
+        if self._spool is not None:
+            self._spool.recovered()
 
     def flush_stale(self) -> int:
         """Flush buffers that reached the configured maximum age."""
+        if self._spool is not None:
+            spool = self._spool
+            if spool.metrics()["backend_unavailable"]:
+                self.flush_all()
+                return 0
+            spool.probe()
+            flushed = 0
+            for key in spool.sessions():
+                with self._session_lock(key):
+                    if spool.due(key):
+                        flushed += sum(r["count"] for r in spool.records(key))
+                        self._flush_locked(key)
+            self._backend.sweep_cache()
+            return flushed
         cutoff = time.monotonic() - self._config.flush_interval
         with self._lock:
             keys = [
@@ -1103,6 +1316,10 @@ class EventStore:
         """Delete all events for a session (storage + buffer)."""
         key = (user_id, session_id)
         with self._session_lock(key):
+            if self._spool is not None:
+                self._spool.delete(key, self._invalidate_spool)
+                self._seq_counters.pop(key, None)
+                return
             with self._lock:
                 self._buffers.pop(key, None)
                 self._buffer_bytes.pop(key, None)
@@ -1110,8 +1327,18 @@ class EventStore:
                 self._seq_counters.pop(key, None)
         self._backend.delete_session(user_id, session_id)
 
+    def _invalidate_spool(self, key: tuple[str, str]) -> None:
+        if self._session_store is not None:
+            self._session_store.invalidate_spool_reservations(*key)
+
     def delete_all_for_user(self, user_id: str) -> None:
         """Delete all events for a user (storage + buffer)."""
+        if self._spool is not None:
+            for key in self._spool.sessions():
+                if key[0] == user_id:
+                    self.delete_session(*key)
+            self._spool.backend.delete_all_for_user(user_id)
+            return
         with self._lock:
             keys_to_remove = [k for k in self._buffers if k[0] == user_id]
         for key in keys_to_remove:
@@ -1133,19 +1360,15 @@ class EventStore:
         after_ts: str | None = None,
         before_ts: str | None = None,
     ) -> bool:
-        """Return True when the event matches the requested read filters."""
-        event_ts = event.get("ts", "")
-        if after_ts and event_ts < after_ts:
-            return False
-        if before_ts and event_ts > before_ts:
-            return False
-        if event_types and event.get("type") not in event_types:
-            return False
-        if sources and event.get("source") not in sources:
-            return False
-        if exclude_sources and event.get("source") in exclude_sources:
-            return False
-        return True
+        """Use the same filter for buffered and persisted history."""
+        return event_matches_filters(
+            event,
+            event_types=event_types,
+            sources=sources,
+            exclude_sources=exclude_sources,
+            after_ts=after_ts,
+            before_ts=before_ts,
+        )
 
     @staticmethod
     def _event_matches_payload_filters(
@@ -1315,12 +1538,16 @@ class EventStore:
     @property
     def buffered_session_count(self) -> int:
         """Number of sessions with buffered (unflushed) events."""
+        if self._spool is not None:
+            return len(self._spool.sessions())
         with self._lock:
             return len(self._buffers)
 
     @property
     def buffered_event_count(self) -> int:
         """Total number of buffered (unflushed) events across all sessions."""
+        if self._spool is not None:
+            return self._spool.metrics()["pending_events"]
         with self._lock:
             keys = list(self._buffers)
         total = 0
@@ -1332,6 +1559,32 @@ class EventStore:
 
     def _flush_locked(self, key: tuple[str, str]) -> None:
         """Flush one detached session buffer while holding its session lock."""
+        if self._spool is not None:
+
+            def confirmed(batch_ids: list[str]) -> None:
+                if self._session_store is not None:
+                    self._session_store.archive_spool_reservations(*key, batch_ids)
+
+            started = time.monotonic()
+            try:
+                chunks, events, size = self._spool.export(key, confirmed)
+            except Exception:
+                with self._metrics_lock:
+                    self._flush_failures_total += 1
+                raise
+            with self._metrics_lock:
+                self._flushes_total += chunks
+                self._flushed_events_total += events
+                self._flushed_bytes_total += size
+                self._last_flush_duration_ms = (time.monotonic() - started) * 1000
+                self._flush_latency.observe(self._last_flush_duration_ms)
+                if chunks:
+                    self._flush_batch_events.observe(events)
+                    self._flush_batch_bytes.observe(size)
+            if self._audit_store is not None:
+                self._audit_reconcile_pending.setdefault(key, 0)
+                self._reconcile_pending_audit({key})
+            return
         with self._lock:
             buf = self._buffers.pop(key, [])
             self._buffer_bytes.pop(key, None)

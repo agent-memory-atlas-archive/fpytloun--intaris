@@ -1309,6 +1309,9 @@ def test_search_cancellation_joins_construction(monkeypatch):
 class _FakeEvaluator:
     """Stub evaluator used for endpoint contract tests."""
 
+    def waits_for_alignment(self, *, user_id: str, session_id: str) -> bool:
+        return True
+
     def __init__(self, result: dict):
         self._result = result
 
@@ -1986,7 +1989,7 @@ class TestSessionEvents:
 
         event_store = client_no_auth.app.state.event_store
         event_store.flush_session(headers["X-User-Id"], session_id)
-        event_store._backend.delete_session(headers["X-User-Id"], session_id)
+        event_store.delete_session(headers["X-User-Id"], session_id)
         with _get_db().cursor() as cur:
             cur.execute(
                 "UPDATE sessions SET last_event_seq = 0 "
@@ -2051,7 +2054,7 @@ class TestSessionEvents:
 
         event_store = client_no_auth.app.state.event_store
         event_store.flush_session(headers["X-User-Id"], session_id)
-        event_store._backend.delete_session(headers["X-User-Id"], session_id)
+        event_store.delete_session(headers["X-User-Id"], session_id)
         with _get_db().cursor() as cur:
             cur.execute(
                 "UPDATE sessions SET last_event_seq = 42 "
@@ -2098,9 +2101,10 @@ class TestSessionEvents:
 
         event_store = client_no_auth.app.state.event_store
         event_store.flush_session(user_id, session_id)
-        event_store._backend.delete_session(user_id, session_id)
+        event_store.delete_session(user_id, session_id)
+        archive = event_store._spool.backend
         for start_seq, end_seq in chunks:
-            event_store._backend.append(
+            archive.append(
                 user_id,
                 session_id,
                 [
@@ -4110,6 +4114,8 @@ class TestAnalysisEndpoints:
         from intaris.background import TaskQueue
         from intaris.server import _get_db
 
+        # Endpoint admission is under test, not concurrent task consumption.
+        client_no_auth.portal.call(client_no_auth.app.state.background_worker.stop)
         user_id = "user-analysis-trigger"
         headers_a = {"X-User-Id": user_id, "X-Agent-Id": "agent-a"}
         headers_b = {"X-User-Id": user_id, "X-Agent-Id": "agent-b"}
@@ -4140,6 +4146,7 @@ class TestAnalysisEndpoints:
         from intaris.background import TaskQueue
         from intaris.server import _get_db
 
+        client_no_auth.portal.call(client_no_auth.app.state.background_worker.stop)
         user_id = "user-task-status"
         headers_a = {"X-User-Id": user_id, "X-Agent-Id": "agent-a"}
         headers_b = {"X-User-Id": user_id, "X-Agent-Id": "agent-b"}

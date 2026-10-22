@@ -74,8 +74,8 @@ def test_runtime_classifier_has_goal_full_action_not_source_replay(stores, proje
     assert "msg-731" in q["prompt"] and "msg-732" in q["prompt"]
     assert "Do not delete messages." in q["prompt"]
     assert not AUTHORITY_FIELDS & set(q["fields"])
-    for sentinel in ("RAW_HISTORY_SENTINEL", "OUTCOME_SENTINEL"):
-        assert sentinel not in q["prompt"]
+    assert "RAW_HISTORY_SENTINEL" in q["prompt"]
+    assert "OUTCOME_SENTINEL" not in q["prompt"]
     assert "SKILL_SENTINEL" in q["prompt"]
     assert artifact == before
 

@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from intaris.api import events as api
 from intaris.api.deps import SessionContext
@@ -31,6 +32,16 @@ from tests.test_api import (  # noqa: F401
 URL = "/api/v1/session/ingestion-session/events"
 HEADERS = {"X-User-Id": "ingestion-user"}
 KEY = "ingestion-session:batch:1"
+
+
+@pytest.fixture
+def legacy_client_no_auth(env_no_auth, monkeypatch):
+    """The legacy ledger remains supported when the spool is explicitly off."""
+    from intaris.server import create_app
+
+    monkeypatch.setenv("EVENT_STORE_SPOOL_ENABLED", "false")
+    with TestClient(create_app()) as client:
+        yield client
 
 
 @pytest.mark.parametrize(
@@ -108,7 +119,8 @@ def _age_claim():
         )
 
 
-def test_pending_survives_restart_and_retention(client_no_auth, monkeypatch):
+def test_pending_survives_restart_and_retention(legacy_client_no_auth, monkeypatch):
+    client_no_auth = legacy_client_no_auth
     _create_session(client_no_auth, "ingestion-session", HEADERS)
     assert _ledger().claim("ingestion-user", "ingestion-session", KEY)[0]
     append = Mock()
@@ -141,8 +153,9 @@ def test_pending_survives_restart_and_retention(client_no_auth, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancelled_async_request_keeps_sync_append_claim(
-    client_no_auth, monkeypatch
+    legacy_client_no_auth, monkeypatch
 ):
+    client_no_auth = legacy_client_no_auth
     _create_session(client_no_auth, "ingestion-session", HEADERS)
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     original = client_no_auth.app.state.event_store.append
@@ -193,7 +206,8 @@ async def test_cancelled_async_request_keeps_sync_append_claim(
     assert len(result) == 1
 
 
-def test_partial_failure_retains_claim(client_no_auth, monkeypatch):
+def test_partial_failure_retains_claim(legacy_client_no_auth, monkeypatch):
+    client_no_auth = legacy_client_no_auth
     _create_session(client_no_auth, "ingestion-session", HEADERS)
     original = client_no_auth.app.state.event_store.append
 

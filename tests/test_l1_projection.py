@@ -84,7 +84,7 @@ def test_inbox_golden_and_no_artifact_mutation():
     ]
 
 
-def test_json_preserves_action_and_generated_constraints_without_authority_replay():
+def test_json_preserves_action_and_original_constraints_without_grant_inference():
     artifact, state, result = specimen("inbox-inspection-only")
     q = policy_assessment.request(state, result, "", task_context=artifact)
     llm = Mock()
@@ -94,8 +94,8 @@ def test_json_preserves_action_and_generated_constraints_without_authority_repla
     body = json.loads(actual[1]["content"])
     assert body["action"]["arguments"] == state.value("arguments")
     assert any(
-        item["kind"] == "restriction" and item["text"] == "Do not delete messages."
-        for item in body["intention"]["items"]
+        "Do not delete messages." in item.get("content", "")
+        for item in body["intention"]["source_context"]["sources"]
     )
     assert "originals" not in body
     assert "authorization:" not in actual[0]["content"]
@@ -106,6 +106,8 @@ def test_json_preserves_action_and_generated_constraints_without_authority_repla
 @pytest.mark.parametrize("status", ["superseded", "current"])
 def test_superseded_task_keeps_context_without_restoring_goal(projection, status):
     artifact, state, result = specimen("inbox-inspection-only")
+    # Retain the generated-only fallback contract when original bodies are absent.
+    artifact["originals"] = []
     old = artifact["items"][0]
     old.update(
         kind="request",
@@ -149,6 +151,7 @@ def test_superseded_task_keeps_context_without_restoring_goal(projection, status
 @pytest.mark.parametrize("projection", ["json", "lines"])
 def test_historical_constraint_does_not_hide_later_withdrawal(projection):
     artifact, state, result = specimen("inbox-inspection-only")
+    artifact["originals"] = []
     old, later = artifact["items"][:2]
     old.update(kind="restriction", status="superseded", quote="Do not delete messages.")
     later.update(
@@ -229,6 +232,8 @@ def test_linked_structured_scope_and_uncertain_quote():
             "antecedent": {},
         }
     )
+    # The added uncertain quote has no captured original in this fixture.
+    artifact["coverage"]["missing"] = ["uncertain-quote"]
     q = policy_assessment.request(
         state, result, "", task_context=artifact, projection="lines"
     )
@@ -326,7 +331,7 @@ def test_nested_arguments_redaction_and_controls():
     assert l1_projection.flatten("targets", ["a, b", "c"]) == ['targets: "a, b", c']
 
 
-def test_status_scope_uncertainty_and_no_raw_fallback():
+def test_original_context_survives_generated_status_changes_without_creating_grants():
     artifact, state, result = specimen("inbox-bounded-request")
     approval = artifact["items"][-1]
     approval.update(status="revoked", temporal_status="historical", relation="revokes")
@@ -337,12 +342,12 @@ def test_status_scope_uncertainty_and_no_raw_fallback():
     )
     assert "Approval" not in q["prompt"]
     assert "missing-linked-scope" not in q["prompt"]
-    assert "RAW_BODY_SENTINEL" not in q["prompt"]
+    assert "RAW_BODY_SENTINEL" in q["prompt"]
     artifact["status"], artifact["items"] = "unavailable", []
     q = policy_assessment.request(
         state, result, "", task_context=artifact, projection="lines"
     )
-    assert "RAW_BODY_SENTINEL" not in q["prompt"]
+    assert "RAW_BODY_SENTINEL" in q["prompt"]
     assert "Approvals:" not in q["prompt"]
     assert q["prompt"].count("Gaps:") == 1
 

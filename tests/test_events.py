@@ -35,9 +35,10 @@ from intaris.metrics import Histogram
 
 @pytest.fixture
 def fs_config(tmp_path):
-    """EventStoreConfig pointing at a temp directory."""
+    """Legacy memory-buffer mode; default spool contracts have a dedicated suite."""
     return EventStoreConfig(
         enabled=True,
+        spool_enabled=False,
         backend="filesystem",
         filesystem_path=str(tmp_path / "events"),
         flush_size=5,
@@ -1640,6 +1641,7 @@ class TestEventStore:
     def test_slow_flush_does_not_block_other_sessions(self, tmp_path):
         config = EventStoreConfig(
             backend="filesystem",
+            spool_enabled=False,
             filesystem_path=str(tmp_path / "events"),
             flush_size=1,
             flush_interval=30,

@@ -65,7 +65,8 @@ def test_actual_service_projection_and_metadata(service, expected):
     if expected == "lines":
         assert prompt.startswith("Action: write\n")
         assert "Approved action:" not in prompt
-        assert "May I send exactly draft X to Y?" not in prompt
+        assert "May I send exactly draft X to Y?" in prompt
+        assert "linked_non_authorizing_context" in prompt
         assert "source_ref" not in prompt
         assert "authorization_source" not in metadata["policy_evidence"]["assessment"]
         # The separate single-profile service tests verify the linked proof.
@@ -85,7 +86,9 @@ def test_actual_service_projection_and_metadata(service, expected):
 def test_static_denial_has_no_projection_used(service):
     client, app, wire = service
     sid = create(client)
-    result = evaluate(client, sid, tool="bash", args={"command": "rm -rf /"})
+    result = evaluate(
+        client, sid, context={"chat_mode": "plan", "read_only_required": True}
+    )
     assert result["decision"] == "deny"
     info = result["evaluation_metadata"]["context_input"]
     assert info["l1_projection_requested"] == "lines"

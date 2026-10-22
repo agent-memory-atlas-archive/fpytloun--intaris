@@ -1,5 +1,6 @@
 """Evidence boundary: model inferences never replace controller observations."""
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -7,6 +8,21 @@ from pydantic import BaseModel, ConfigDict, Field
 AUTHORITY_FIELDS = frozenset(
     {"authorization", "authorization_source", "authorization_scope"}
 )
+
+# Item kinds the intention generator extracts as verbatim prohibitions.
+PROHIBITION_KINDS = frozenset({"restriction", "disapproval"})
+# Source origins that are interpretations of instructions, not instructions.
+INSTRUCTION_ORIGINS = frozenset(
+    {
+        "client_assignment",
+        "client_user_claim",
+        "recorded_user_event",
+        "recorded_client_user_message",
+        "human_resolution",
+    }
+)
+
+Grounding = Literal["grounded", "ungrounded", "unavailable"]
 
 
 class Frozen(BaseModel):
@@ -53,6 +69,10 @@ class CorrectedAssessment(Frozen):
         None
     )
     authorization_source: str | None = None
+    # Verbatim words of a confirmed restriction, copied from Judge's answer so
+    # the evidence layer can verify a confirmed conflict exactly like a first-
+    # level one. Never used to infer permission.
+    restriction_quote: str | None = None
 
     def validated_groups(
         self, state: "Evidence", evidence_refs: list[str]
@@ -156,6 +176,10 @@ class Evidence(Frozen):
     advisory_clauses: list[dict] = Field(default_factory=list)
     workflow_scope: dict | None = None
     process_lifecycle: dict | None = None
+    # Controller-owned parent/child compatibility fact for hybrid sessions:
+    # {"state": compatible|incompatible, "reason": str, "grounded": bool,
+    #  "overridden": bool}. Absent for root sessions and legacy policies.
+    parent_alignment: dict | None = None
 
     def value(self, key: str, default=None):
         if (
@@ -274,3 +298,108 @@ def audit_evidence(state: Evidence) -> dict:
     payload["observations"] = redact(payload["observations"])
     payload["sources"] = redact(payload["sources"])
     return payload
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def quote_in(text: Any, quote: Any) -> bool:
+    """Whitespace- and case-insensitive containment of a verbatim quote."""
+    if not isinstance(text, str) or not isinstance(quote, str):
+        return False
+    needle = _normalize(quote)
+    return bool(needle) and needle in _normalize(text)
+
+
+def ground_reference(state: Evidence, reference: Any, quote: Any = None) -> Grounding:
+    """Decide deterministically whether a cited restriction exists.
+
+    Grounded when the reference is an operator clause, or a captured source
+    that either contains the verbatim quote or carries a current prohibition
+    item extracted by the intention generator. Generated summaries, ``none``
+    and unknown references never ground a conflict.
+    """
+    if not isinstance(reference, str):
+        return "ungrounded"
+    if reference in {clause["id"] for clause in state.advisory_clauses}:
+        return "grounded"
+    source = state.sources.get(reference)
+    if source is None or source.get("origin") not in INSTRUCTION_ORIGINS:
+        return "ungrounded"
+    body = source.get("text", source.get("content"))
+    if not isinstance(body, str):
+        return "unavailable"
+    if isinstance(quote, str) and quote.strip():
+        if not quote_in(body, quote):
+            return "ungrounded"
+        matching = [
+            item
+            for item in source.get("constraint_items", [])
+            if quote_in(item.get("quote"), quote)
+        ]
+        if matching and not any(item.get("status") == "current" for item in matching):
+            return "ungrounded"
+        return "grounded"
+    if any(
+        item.get("status") == "current"
+        and item.get("kind") in PROHIBITION_KINDS
+        and quote_in(body, item.get("quote"))
+        for item in source.get("constraint_items", [])
+    ):
+        return "grounded"
+    # A named authoritative instruction is not disproved by the absence of a
+    # free-form quote (typed providers cannot emit one). Keep this uncertainty
+    # reviewable rather than treating missing verification as permission.
+    return "unavailable"
+
+
+def ground(state: Evidence) -> dict[str, Grounding]:
+    """Verification layer between classification and policy.
+
+    Model-asserted conflicts are opinions until anchored in evidence. The
+    result never changes the stored assessment; policy decides, per profile,
+    how much an ungrounded opinion may block.
+    """
+    assessment = state.assessment
+    grounding: dict[str, Grounding] = {}
+    if state.value("contextual_restrictions") == "conflicts":
+        grounding["restriction_conflict"] = ground_reference(
+            state,
+            assessment.get("restriction_reference"),
+            assessment.get("restriction_quote"),
+        )
+        observed = state.observations.get("contextual_restrictions")
+        if observed is not None and observed.value == "conflicts":
+            grounding["restriction_conflict"] = "grounded"
+    if state.value("target_scope") == "conflicts":
+        targets = {"action"} | {
+            ref
+            for observation in state.observations.values()
+            for ref in observation.references
+        }
+        grounding["target_conflict"] = (
+            grounding.get("restriction_conflict", "ungrounded")
+            if assessment.get("target_reference") in targets
+            else "ungrounded"
+        )
+        observed = state.observations.get("target_scope")
+        if observed is not None and observed.value == "conflicts":
+            grounding["target_conflict"] = "grounded"
+    if assessment.get("relationship") == "conflicts_with_intent":
+        # A relationship conflict is only as grounded as the restriction it
+        # relies on; the label alone cites nothing.
+        grounding["relationship_conflict"] = grounding.get(
+            "restriction_conflict", "ungrounded"
+        )
+    corrected = state.review.corrected_assessment if state.review else None
+    if corrected is not None and corrected.contextual_restrictions == "conflicts":
+        grounding["confirmed_restriction_conflict"] = ground_reference(
+            state, corrected.restriction_reference, corrected.restriction_quote
+        )
+    alignment = state.parent_alignment or {}
+    if alignment.get("state") == "incompatible" and not alignment.get("overridden"):
+        grounding["alignment_conflict"] = (
+            "grounded" if alignment.get("grounded") is True else "ungrounded"
+        )
+    return grounding

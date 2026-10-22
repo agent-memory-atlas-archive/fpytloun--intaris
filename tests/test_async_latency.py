@@ -159,7 +159,7 @@ def test_mounted_paired_contention_latency(api, monkeypatch, tmp_path):
 
                         queue.get_queue_stats.side_effect = stats
                         worker = BackgroundWorker(
-                            Mock(), AnalysisConfig(), task_queue=queue
+                            srv._get_db(), AnalysisConfig(), task_queue=queue
                         )
                         worker._running = True
 

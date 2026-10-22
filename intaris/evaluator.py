@@ -550,6 +550,24 @@ class Evaluator:
             ),
         }
 
+    def waits_for_alignment(self, *, user_id: str, session_id: str) -> bool:
+        """Whether the active policy needs a compatibility verdict before admission.
+
+        This is a latency hint, not permission: evaluation reloads the policy
+        and still enforces instructions, hazards and lifecycle hard stops.
+        """
+        try:
+            session = self._sessions.get(session_id, user_id=user_id)
+        except ValueError:
+            # Admission, not this latency hint, owns HTTP not-found handling.
+            return True
+        policy = session.get("policy") or {}
+        snapshot = policy.get("active_policy") or {}
+        return not (
+            policy.get("evaluation_policy_version") == "hybrid_v1"
+            and (snapshot.get("profile") or policy.get("profile")) == "bounded_autonomy"
+        )
+
     def _evaluation_flow(
         self,
         *,
@@ -672,6 +690,11 @@ class Evaluator:
             and session.get("status") == "active"
             and session.get("alignment_state") in {"pending", "error"}
             and session.get("parent_session_id")
+            and (
+                (active.get("active_policy") or {}).get("profile")
+                or active.get("profile", "balanced")
+            )
+            != "bounded_autonomy"
             and (
                 self._alignment_barrier is None
                 or not self._alignment_barrier.has_pending(user_id, session_id)
@@ -845,6 +868,10 @@ class Evaluator:
             "error",
         }
         alignment_unready = session.get("alignment_state") in {"pending", "error"}
+        # Hybrid sessions carry a classified misalignment into policy as a fact
+        # (reviewed by Judge through the normal pipeline). Legacy sessions keep
+        # the human hard stop below.
+        hybrid_misalignment: dict[str, Any] | None = None
         if (
             not forced_legacy
             and not operator_bound
@@ -857,19 +884,25 @@ class Evaluator:
                 else None
             )
             if durable_misaligned:
-                if alignment_unready:
+                active_profile = (active.get("active_policy") or {}).get(
+                    "profile"
+                ) or active.get("profile", "balanced")
+                if alignment_unready and active_profile != "bounded_autonomy":
                     raise HybridError(
                         "alignment_unavailable",
                         session.get("alignment_reason")
-                        or "Parent/child alignment review is pending or unavailable; retry evaluation.",
+                        or "Parent/child classification is unavailable; retry evaluation.",
                         503,
                         retryable=True,
                     )
-                misalignment_reason = (
-                    session.get("alignment_reason")
-                    or misalignment_reason
-                    or "Child intention requires human acknowledgment of parent alignment."
-                )
+                hybrid_misalignment = {
+                    "state": "unavailable" if alignment_unready else "incompatible",
+                    "reason": session.get("alignment_reason")
+                    or "Parent/child compatibility classification is unavailable.",
+                    "grounded": False,
+                    "overridden": False,
+                }
+                misalignment_reason = None
             if misalignment_reason:
                 alignment_decision = (
                     "deny" if unattended else clamp_outcome("escalate", minimum_outcome)
@@ -1012,14 +1045,13 @@ class Evaluator:
 
         # Lookup behavioral profile for context injection
         profile_version: int | None = None
+        profile = None
         if self._analysis_enabled and self._db is not None:
             profile = self.get_behavioral_context(user_id, agent_id)
             if profile:
                 profile_version = profile.get("profile_version")
-                # Inject context for high+ risk profiles (score >= 9)
-                if (profile.get("risk_level") or 0) >= 9:
-                    context = dict(context) if context else {}
-                    context["behavioral_alert"] = profile.get("context_summary", "")
+                # Analytics is advisory evidence for existing Judge reviews,
+                # never historical prose or permission changes in L1.
 
         # Redact secrets from args
         args_redacted = redact(args)
@@ -1080,6 +1112,16 @@ class Evaluator:
                 from intaris.evaluation_context import parent_scope_evidence
 
                 parent_intention = parent_scope_evidence(parent_session)
+                if hybrid_misalignment is not None:
+                    from intaris.alignment import (
+                        alignment_grounding,
+                        parent_instruction_bodies,
+                    )
+
+                    hybrid_misalignment["grounded"] = alignment_grounding(
+                        hybrid_misalignment["reason"],
+                        parent_instruction_bodies(parent_session),
+                    )
 
                 # Parent lifecycle cascade: if parent is terminated or
                 # suspended, auto-suspend the child session. This prevents
@@ -1132,6 +1174,19 @@ class Evaluator:
                 sessions=self._sessions,
                 task_context=self._task_context,
                 l1_input_projection=self._l1_input_projection,
+                analytics_provenance=(
+                    {
+                        k: profile[k]
+                        for k in (
+                            "profile_version",
+                            "analysis_id",
+                            "actor",
+                            "expires_at",
+                        )
+                    }
+                    if profile
+                    else None
+                ),
             ).evaluate(
                 session=session,
                 agent_id=agent_id,
@@ -1148,6 +1203,7 @@ class Evaluator:
                 controller_context=controller_context,
                 process_lifecycle=process_lifecycle,
                 approved_edit_scopes=edit_scopes,
+                parent_alignment=hybrid_misalignment,
             )
             hybrid_meta = hybrid_result.get("evaluation_metadata") or {}
             if (
@@ -1615,32 +1671,77 @@ class Evaluator:
             Profile dict with risk_level, context_summary, profile_version,
             or None if no profile exists.
         """
-        if self._db is None:
+        if self._db is None or not self._analysis_enabled:
             return None
 
         try:
-            with self._db.cursor() as cur:
-                # Try agent-specific profile first
-                if agent_id:
-                    cur.execute(
-                        "SELECT risk_level, context_summary, profile_version "
-                        "FROM behavioral_profiles "
-                        "WHERE user_id = ? AND agent_id = ?",
-                        (user_id, agent_id),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        return dict(row)
+            from datetime import datetime, timedelta, timezone
 
-                # Fall back to user-level profile (agent_id='')
+            from intaris.analytics_evidence import VERSION, metadata
+
+            with self._db.cursor() as cur:
                 cur.execute(
-                    "SELECT risk_level, context_summary, profile_version "
-                    "FROM behavioral_profiles "
-                    "WHERE user_id = ? AND agent_id = ''",
-                    (user_id,),
+                    "SELECT bp.*, ba.evidence_metadata FROM behavioral_profiles bp "
+                    "JOIN behavioral_analyses ba ON ba.id = bp.last_analysis_id "
+                    "AND ba.user_id = bp.user_id "
+                    "WHERE bp.user_id = ? AND bp.agent_id = ?",
+                    (user_id, agent_id or ""),
                 )
                 row = cur.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            row = dict(row)
+            evidence = metadata(row["evidence_metadata"])
+            if evidence.get("version") != VERSION:
+                return None
+            updated = datetime.fromisoformat(
+                str(row["updated_at"]).replace("Z", "+00:00")
+            )
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            expires = updated + timedelta(days=self._analysis_config.lookback_days)
+            if datetime.now(timezone.utc) >= expires:
+                return None
+            alerts = row.get("active_alerts") or []
+            if isinstance(alerts, str):
+                alerts = json.loads(alerts)
+            fresh_alerts = []
+            for alert in alerts:
+                observed = alert.get("observed_at")
+                if not observed:
+                    continue
+                observed = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+                if observed.tzinfo is None:
+                    observed = observed.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < observed + timedelta(
+                    days=self._analysis_config.lookback_days
+                ):
+                    fresh_alerts.append(alert)
+            alerts = sorted(
+                fresh_alerts, key=lambda a: a.get("severity", 1), reverse=True
+            )
+            bounded = [
+                {
+                    "severity": a.get("severity"),
+                    "detail": str(a.get("detail", ""))[:500],
+                    "session_ids": a.get("session_ids", [])[:8],
+                    "analysis_id": a.get("analysis_id"),
+                    "observed_at": a.get("observed_at"),
+                }
+                for a in alerts[:5]
+            ]
+            return {
+                "risk_level": max([1] + [a.get("severity", 1) for a in alerts]),
+                "profile_version": row["profile_version"],
+                "analysis_id": row["last_analysis_id"],
+                "actor": agent_id,
+                "updated_at": updated.isoformat(),
+                "expires_at": expires.isoformat(),
+                "active_alerts": bounded,
+                "omitted_alerts": max(0, len(alerts) - 5),
+                "coverage_status": evidence.get("status", "unknown"),
+                "context_summary": "",  # Never inject unrestricted generated prose.
+            }
         except Exception:
             logger.debug("Failed to lookup behavioral profile", exc_info=True)
             return None
@@ -2198,14 +2299,18 @@ class Evaluator:
                 )
                 if actual_view["overflow"]:
                     raise ValueError("Final legacy LLM model input exceeds budget")
+                from intaris.inference_attribution import llm_attribution
                 from intaris.input_budget import located_source, source_sections
 
-                with source_sections(
-                    located_source(
-                        messages[1]["content"],
-                        (context or {}).get("raw_task_sources"),
-                        path=("messages", 1, "content"),
-                    )
+                with (
+                    llm_attribution(operation="evaluation"),
+                    source_sections(
+                        located_source(
+                            messages[1]["content"],
+                            (context or {}).get("raw_task_sources"),
+                            path=("messages", 1, "content"),
+                        )
+                    ),
                 ):
                     raw = self._llm.generate(
                         payload["messages"],

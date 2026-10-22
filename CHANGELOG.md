@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-22
+
+### Added
+
+- **Crash-durable event spool** -- A default-enabled local spool preserves acknowledged
+  event batches across process/container crashes, with duplicate-safe sequence
+  reservations, pending-event reads, immutable archive uploads and restart recovery.
+  File and directory fsync are enabled by default; `EVENT_STORE_SPOOL_FSYNC=false`
+  explicitly trades host-crash durability for lower append latency.
+  See [local event spool](docs/event-spool.md) for storage, single-process ownership,
+  archive-outage admission gates and drain-before-rollout requirements.
+- **Inference accounting attribution** -- Optional content-free operation, session,
+  task and request correlation headers for Cognis-managed inference; standalone
+  providers do not receive them.
+- **Public container images** -- Publish multi-architecture server images to
+  `ghcr.io/fpytloun/intaris` for main and stable releases.
+
+### Fixed
+
+- Preserve resolver, exact approval scope and intention eligibility in analytics;
+  merge event/audit messages without hiding restrictions and retain bounded read targets.
+- Keep fresh windows after compaction, track late evidence and resolution updates,
+  refresh parent dependencies, and attribute child activity to its direct actor.
+- Validate L3 citations against rendered evidence, report coverage gaps, and prevent
+  incomplete clean results from clearing actionable profiles.
+- Deliver complete summary findings to notifications and supply fresh bounded
+  analytics evidence only to existing Judge reviews, without changing L1 or routing.
+  See [analytics evidence and limitations](docs/analytics-evidence.md).
+- **Evaluation source fidelity** -- Supply original task instructions to first-pass
+  evaluation, keep generated intent subordinate to original user scope, and assess
+  child alignment as compatibility rather than strict containment.
+- **Fact-first policy review** -- Separate factual assessment from controller policy
+  routing, recover diffuse-risk abstentions, and preserve fail-closed restriction
+  retries and refusal provenance without treating invalid restrictions as missing
+  user permission.
+- **Disclosure authorization** -- Preserve the requirement for an explicit scoped
+  user grant when a Judge lowers the severity of observed credential disclosure.
+  Severity-only review cannot authorize printing secrets.
+- **Capacity recovery** -- Refresh unknown model capacity before constructing a
+  partial inference view, and retain exact mixed-input fallback references when
+  no captured user evidence exists.
+- **Recovered history and bounded reads** -- Tolerate recovered event timestamps,
+  retain evidence coverage when bounding analytics reads, and add an ordered
+  tenant audit-pagination index.
+- **Spool recovery fencing** -- Preserve archive-read recovery gates and fence
+  incomplete recording deletion so accepted events cannot be resurrected.
+- **Source distribution hygiene** -- Exclude private deployment automation from
+  source distributions, including builds made from a private checkout.
+- **Public examples** -- Use reserved domains for reconstructed benchmark contacts
+  and remove record-local references and captured confirmation wording from reports.
+  Historical model measurements were not rerun for these example changes.
+
 ## [0.13.0] - 2026-10-19
 
 ### Release status

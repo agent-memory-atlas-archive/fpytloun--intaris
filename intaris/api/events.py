@@ -378,6 +378,91 @@ async def append_events(
     # Determine source from request header or default
     source = request.headers.get("X-Intaris-Source", "client")
 
+    if idempotency_key:
+        _validate_idempotency_key(session_id, idempotency_key)
+        from intaris.events.spool import batch_identity, request_digest
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+
+        reservation = await asyncio.to_thread(
+            SessionStore(_get_db()).get_spool_reservation,
+            ctx.user_id,
+            session_id,
+            batch_identity(ctx.user_id, session_id, idempotency_key),
+        )
+        if reservation:
+            digest = request_digest(
+                [{"type": e.type, "data": e.data} for e in events], source
+            )
+            if reservation["digest"] != digest or reservation["archived"] == 2:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Event retry conflicts with its reservation",
+                    headers={ERROR_HEADER: "append_uncertain"},
+                )
+            if reservation["archived"] == 1:
+                return EventAppendResponse(
+                    count=reservation["last_seq"] - reservation["first_seq"] + 1,
+                    first_seq=reservation["first_seq"],
+                    last_seq=reservation["last_seq"],
+                )
+            if event_store.spool_enabled is not True:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Event retry requires spool recovery",
+                    headers={ERROR_HEADER: "append_uncertain"},
+                )
+
+    if event_store.spool_enabled is True:
+        if idempotency_key:
+            _validate_idempotency_key(session_id, idempotency_key)
+            # Pre-spool receipts remain valid; ambiguous old claims cannot
+            # safely be converted into fresh sequence allocations.
+            legacy = _get_idempotency_store().get(
+                ctx.user_id, session_id, idempotency_key
+            )
+            if legacy:
+                if legacy["status"] == "completed":
+                    return _response_from_record(legacy)
+                raise HTTPException(
+                    status_code=409,
+                    detail="Legacy append outcome is uncertain",
+                    headers={ERROR_HEADER: "append_uncertain"},
+                )
+        from intaris.events.spool import SpoolUnavailable
+
+        try:
+            seqs = await asyncio.to_thread(
+                event_store.append,
+                ctx.user_id,
+                session_id,
+                [{"type": e.type, "data": e.data} for e in events],
+                source=source,
+                idempotency_key=idempotency_key,
+            )
+        except SpoolUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+                headers={ERROR_HEADER: "append_uncertain"},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+                headers={ERROR_HEADER: "append_uncertain"},
+            ) from exc
+        except Exception as exc:
+            logger.exception("Spool append failed for %s", session_id)
+            raise HTTPException(
+                status_code=500,
+                detail="Event append outcome is uncertain",
+                headers={ERROR_HEADER: "append_uncertain"},
+            ) from exc
+        return EventAppendResponse(
+            count=len(seqs), first_seq=seqs[0], last_seq=seqs[-1]
+        )
+
     idempotency_store: EventAppendIdempotencyStore | None = None
     claimed_idempotency = False
     if idempotency_key:

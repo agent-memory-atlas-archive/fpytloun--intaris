@@ -15,10 +15,10 @@ from intaris.input_budget import (
 from intaris.policy_evidence import from_observations
 
 
-def question(projection):
+def question(projection, mode="raw"):
     artifact = {
         "status": "unavailable",
-        "context_mode": "raw",
+        "context_mode": mode,
         "items": [],
         "originals": [
             {
@@ -47,11 +47,12 @@ def question(projection):
 
 
 @pytest.mark.parametrize("projection", ["lines", "json"])
+@pytest.mark.parametrize("mode", ["raw", "single", "rich"])
 @pytest.mark.parametrize("capacity", [Capacity(), Capacity(max_input_tokens=32000)])
 def test_raw_sources_are_fitted_without_losing_action_or_restrictions(
-    projection, capacity
+    projection, mode, capacity
 ):
-    q = question(projection)
+    q = question(projection, mode)
     calls = []
 
     class LLM:
@@ -97,7 +98,8 @@ def test_unregistered_payload_cannot_authorize_truncating_user_evidence():
 
 
 @pytest.mark.parametrize("projection", ["lines", "json"])
-def test_actual_jev_wire_is_fitted_before_transport(projection):
+@pytest.mark.parametrize("mode", ["raw", "single", "rich"])
+def test_actual_jev_wire_is_fitted_before_transport(projection, mode):
     from tests.test_jev import _client
 
     client, requests = _client({"answers": {}})
@@ -105,7 +107,7 @@ def test_actual_jev_wire_is_fitted_before_transport(projection):
         # The transport intentionally returns no classification. Verify the
         # real serialized request, independently of response parsing.
         with pytest.raises(ValueError, match="missing answer"):
-            policy_assessment.classify(None, client, question(projection))
+            policy_assessment.classify(None, client, question(projection, mode))
     finally:
         client.close()
     assert len(requests) == 1

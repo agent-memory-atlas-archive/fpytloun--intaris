@@ -58,6 +58,7 @@ def response(kwargs, *, high=False, conflict=False, unresolved=False):
         "effects": ["write"],
         "environment": "development",
         "operation": "write",
+        "restriction_quote": "",
     }
     answer = {key: values[key] for key in properties}
     if review:
@@ -358,7 +359,8 @@ def test_selective_jev_requests_only_outstanding_fields(runtime, monkeypatch):
     try:
         result, _, _ = classify(None, client, question)
         assert result["contextual_restrictions"] == "consistent"
-        assert set(seen) == set(question["fields"])
+        # Typed classification cannot emit optional free-form quotes.
+        assert set(seen) == set(question["fields"]) - {"restriction_quote"}
         assert not {"mutation", "effects"} & set(seen)
         assert not {
             "authorization",

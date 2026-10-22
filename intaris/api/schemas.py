@@ -609,6 +609,7 @@ class SessionSummaryRecord(BaseModel):
     denied_count: int = 0
     escalated_count: int = 0
     created_at: str
+    evidence_metadata: dict[str, Any] | None = None
 
 
 class AgentSummaryRecord(BaseModel):
@@ -646,6 +647,7 @@ class AnalysisRecord(BaseModel):
     findings: list[dict[str, Any]]
     recommendations: list[dict[str, Any]] | None = None
     created_at: str
+    evidence_metadata: dict[str, Any] | None = None
 
 
 class AnalysisListResponse(BaseModel):

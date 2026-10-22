@@ -465,6 +465,7 @@ class SessionStore:
         user_message_flags: list[bool],
         minimum_last_seq: int = 0,
         latest_user_evidence: dict[str, Any] | None = None,
+        spool_reservation: dict[str, str] | None = None,
     ) -> list[int]:
         """Allocate event sequences and advance durable user-message state."""
         if not user_message_flags:
@@ -486,6 +487,36 @@ class SessionStore:
             " RETURNING last_event_seq" if self._db.backend == "postgresql" else ""
         )
         with self._db.cursor() as cur:
+            if spool_reservation is not None:
+                reservation = spool_reservation
+                cur.execute(
+                    "INSERT INTO event_spool_reservations "
+                    "(user_id, session_id, batch_id, digest, spool_id, event_ts, "
+                    "first_seq, last_seq) VALUES (?, ?, ?, ?, ?, ?, 0, 0) "
+                    "ON CONFLICT (user_id, session_id, batch_id) DO NOTHING",
+                    (
+                        user_id,
+                        session_id,
+                        reservation["batch_id"],
+                        reservation["digest"],
+                        reservation["spool_id"],
+                        reservation["ts"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    cur.execute(
+                        "SELECT * FROM event_spool_reservations "
+                        "WHERE user_id = ? AND session_id = ? AND batch_id = ?",
+                        (user_id, session_id, reservation["batch_id"]),
+                    )
+                    existing = dict(cur.fetchone())
+                    if existing["digest"] != reservation["digest"]:
+                        raise ValueError("Event batch idempotency payload mismatch")
+                    if existing["event_ts"] != reservation["ts"]:
+                        raise ValueError("Event batch reservation timestamp mismatch")
+                    if existing["last_seq"] - existing["first_seq"] + 1 != count:
+                        raise ValueError("Event batch reservation size mismatch")
+                    return list(range(existing["first_seq"], existing["last_seq"] + 1))
             cur.execute(
                 f"""
                 UPDATE sessions
@@ -528,8 +559,64 @@ class SessionStore:
                     (session_id, user_id),
                 )
             row = cur.fetchone()
+            if spool_reservation is not None:
+                end = int(row["last_event_seq"])
+                cur.execute(
+                    "UPDATE event_spool_reservations SET first_seq = ?, last_seq = ? "
+                    "WHERE user_id = ? AND session_id = ? AND batch_id = ?",
+                    (
+                        end - count + 1,
+                        end,
+                        user_id,
+                        session_id,
+                        spool_reservation["batch_id"],
+                    ),
+                )
         last_seq = int(row["last_event_seq"])
         return list(range(last_seq - count + 1, last_seq + 1))
+
+    def get_spool_reservation(
+        self, user_id: str, session_id: str, batch_id: str
+    ) -> dict[str, Any] | None:
+        """Read an assignment without advancing sequence or user-message state."""
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM event_spool_reservations "
+                "WHERE user_id = ? AND session_id = ? AND batch_id = ?",
+                (user_id, session_id, batch_id),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def pending_spool_reservations(self) -> list[dict[str, Any]]:
+        """Return pending reservation metadata for startup reconciliation."""
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM event_spool_reservations WHERE archived = 0 "
+                "ORDER BY user_id, session_id, first_seq"
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def archive_spool_reservations(
+        self, user_id: str, session_id: str, batch_ids: list[str]
+    ) -> None:
+        """Retain retry receipts after their exact payloads have been archived."""
+        with self._db.cursor() as cur:
+            for batch_id in batch_ids:
+                cur.execute(
+                    "UPDATE event_spool_reservations SET archived = 1 "
+                    "WHERE user_id = ? AND session_id = ? AND batch_id = ?",
+                    (user_id, session_id, batch_id),
+                )
+
+    def invalidate_spool_reservations(self, user_id: str, session_id: str) -> None:
+        """Keep retry identities but prevent explicit deletion being replayed."""
+        with self._db.cursor() as cur:
+            cur.execute(
+                "UPDATE event_spool_reservations SET archived = 2 "
+                "WHERE user_id = ? AND session_id = ?",
+                (user_id, session_id),
+            )
 
     def observe_user_message(
         self,

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 WORKFLOW = (
     Path(__file__).parents[1] / ".github" / "workflows" / "docker-publish.yml"
 ).read_text()

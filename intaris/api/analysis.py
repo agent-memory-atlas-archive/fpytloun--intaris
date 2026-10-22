@@ -583,7 +583,7 @@ async def get_session_summaries(
         for row in intaris_rows:
             d = dict(row)
             # Parse JSON fields
-            for field in ("tools_used", "risk_indicators"):
+            for field in ("tools_used", "risk_indicators", "evidence_metadata"):
                 if d.get(field):
                     try:
                         d[field] = json.loads(d[field])
@@ -909,7 +909,12 @@ async def list_analyses(
         items = []
         for row in rows:
             d = dict(row)
-            for field in ("sessions_scope", "findings", "recommendations"):
+            for field in (
+                "sessions_scope",
+                "findings",
+                "recommendations",
+                "evidence_metadata",
+            ):
                 if d.get(field):
                     try:
                         d[field] = json.loads(d[field])

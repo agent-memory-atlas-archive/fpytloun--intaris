@@ -187,7 +187,8 @@ def test_validated_current_indices_drive_both_projections(service, request):
             for line in lines
         )
         assert "selection: not_current" in prompt
-        assert prompt.count("Do not deploy.") == 1
+        # One extracted restriction plus its unchanged original source.
+        assert prompt.count("Do not deploy.") == 2
         assert "RAW CAPTURED TASK SOURCES" not in prompt
         assert "CONVERSATION TAIL" not in prompt
         assert "UNSUPPORTED_QUOTE" not in prompt
@@ -257,7 +258,7 @@ def test_unavailable_single_profile_uses_profile_specific_fallback(
     # Raw evidence is now independent of successful compact extraction.
     # Unknown compact scope stays unknown; source origins still govern grants.
     assert "UNAVAILABLE_ORIGINAL_CANARY" in json.dumps(artifact["originals"])
-    assert "UNAVAILABLE_ORIGINAL_CANARY" not in prompt
+    assert "UNAVAILABLE_ORIGINAL_CANARY" in prompt
     assert "Incomplete generated summary." not in prompt
     assert "RAW CAPTURED TASK SOURCES" not in prompt
     if projection == "lines":
@@ -295,8 +296,10 @@ def test_linked_single_confirmation_preserves_non_authorizing_antecedent(
     assert approval["antecedent"]["origin"] == "linked_non_authorizing_context"
     if projection == "lines":
         assert "Approved action:" not in prompt
-        assert proposal not in prompt
+        assert proposal in prompt
+        assert "linked_non_authorizing_context" in prompt
         assert "RAW CAPTURED TASK SOURCES" not in prompt
     else:
         payload = rich_json(prompt)
-        assert proposal not in json.dumps(payload)
+        assert proposal in json.dumps(payload)
+        assert "linked_non_authorizing_context" in json.dumps(payload)

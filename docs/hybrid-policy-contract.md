@@ -1,5 +1,38 @@
 # Hybrid policy protocol v1
 
+## Fact-first profile correction (`builtin-v10`)
+
+Classification is profile-independent. Profiles weigh the same observations and
+assessment; the classifier neither grants permission nor selects the outcome.
+`risk=unknown` denotes missing impact evidence, not absence of a separate request
+for a supporting step. Impact and instruction compliance remain distinct.
+
+Bounded autonomy ignores unsupported task-relationship, target-alignment and
+parent-compatibility opinions. It does **not** ignore a reported explicit
+instruction violation merely because the classifier omitted its citation.
+Such conflicts remain reviewable in every profile. Grounding diagnostics report
+`grounded`, `ungrounded` or `unavailable`; they verify provenance and quote
+existence, not semantic applicability. Configured denies, read-only ceilings,
+human refusals, checkpoints and known hazardous effects remain protected.
+
+For authenticated admitted-spawn lifecycle operations, unresolved task relevance
+alone is no longer a reason to ask for permission again in balanced or bounded
+autonomy. Explicit restriction conflicts and uncertain/high operational impact
+still require review. Ownership is not proof that termination is harmless.
+
+Hybrid parent alignment is carried as `Evidence.parent_alignment` and evaluated
+by the same deterministic policy. Judge reviews `alignment.compatibility`
+through the ordinary action-bound review path, not a second alignment-specific
+Judge invocation. Bounded autonomy does not wait for an unavailable alignment
+classifier in the HTTP handler or evaluator; other action checks still run.
+Legacy session-level alignment acknowledgment retains its existing behavior.
+
+The optional JSON `restriction_quote` is bounded free text. Enum-only typed
+providers do not emit it. Only original instruction sources and advisory clauses
+can ground a reported prohibition; generated text and bare target references
+cannot. Missing authoritative bodies stay distinguishable from unsupported
+opinions. Earlier independent restrictions are not discarded.
+
 ## Live-acceptance correction schema delta
 
 `builtin-v3` / `classification-v3` keep the public request API unchanged. Model

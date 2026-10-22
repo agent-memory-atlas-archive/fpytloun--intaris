@@ -16,12 +16,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import threading
 import time
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, BinaryIO, Iterator, Protocol
 from urllib.parse import quote
 
 from intaris.config import EventStoreConfig
@@ -102,7 +105,12 @@ def _ndjson_to_events(data: bytes) -> list[dict]:
     return events
 
 
-def _event_matches_filters(
+def _file_digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def event_matches_filters(
     event: dict,
     *,
     event_types: set[str] | None = None,
@@ -111,8 +119,19 @@ def _event_matches_filters(
     after_ts: str | None = None,
     before_ts: str | None = None,
 ) -> bool:
-    """Return True when the event matches the requested read filters."""
+    """Match filters without inventing chronology for recovered envelopes.
+
+    Unknown timestamps remain visible in sequence-based reads, but cannot
+    establish membership in a time-bounded snapshot.
+    """
     event_ts = event.get("ts", "")
+    if (after_ts or before_ts) and (not isinstance(event_ts, str) or not event_ts):
+        return False
+    if after_ts or before_ts:
+        try:
+            datetime.fromisoformat(event_ts.replace("Z", "+00:00"))
+        except ValueError:
+            return False
     if after_ts and event_ts < after_ts:
         return False
     if before_ts and event_ts > before_ts:
@@ -256,6 +275,65 @@ class FilesystemEventBackend:
     def __init__(self, config: EventStoreConfig) -> None:
         self._base_path = Path(config.filesystem_path)
         self._base_path.mkdir(parents=True, exist_ok=True)
+
+    def probe(self) -> None:
+        """Check archive write availability without touching existing chunks."""
+        path = self._base_path / f".probe-{uuid.uuid4().hex}"
+        try:
+            with path.open("xb") as stream:
+                stream.write(b"probe")
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            path.unlink(missing_ok=True)
+
+    def append_file(
+        self,
+        user_id: str,
+        session_id: str,
+        start: int,
+        end: int,
+        path: Path,
+        *,
+        destination: str | None = None,
+    ) -> None:
+        """Commit an immutable sealed spool file without loading it into RAM."""
+        target = Path(
+            destination or self.chunk_destination(user_id, session_id, start, end)
+        )
+        if not target.resolve().is_relative_to(self._base_path.resolve()):
+            raise ValueError("Spool destination escapes archive directory")
+        directory = target.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / f".upload-{uuid.uuid4().hex}"
+        try:
+            with path.open("rb") as source, temporary.open("xb") as output:
+                os.chmod(temporary, 0o600)
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                if _file_digest(path) != _file_digest(target):
+                    raise RuntimeError("Immutable event chunk collision")
+            # Persist newly created parent directories and the final file entry.
+            for parent in (directory, directory.parent, self._base_path):
+                descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def chunk_destination(
+        self, user_id: str, session_id: str, start: int, end: int
+    ) -> str:
+        return str(
+            self._session_dir_for_write(user_id, session_id)
+            / _chunk_filename(start, end)
+        )
 
     def _resolve_under_base(self, *parts: str) -> Path:
         """Resolve a path under the backend base directory."""
@@ -411,7 +489,7 @@ class FilesystemEventBackend:
             for event in reversed(events):
                 if event.get("seq", 0) >= before_seq:
                     continue
-                if _event_matches_filters(
+                if event_matches_filters(
                     event,
                     event_types=event_types,
                     sources=sources,
@@ -450,7 +528,7 @@ class FilesystemEventBackend:
         for _, _, chunk_path in reversed(chunks):
             events = _ndjson_to_events(chunk_path.read_bytes())
             for event in reversed(events):
-                if _event_matches_filters(
+                if event_matches_filters(
                     event,
                     event_types=event_types,
                     sources=sources,
@@ -729,13 +807,51 @@ class S3EventBackend:
     def append(self, user_id: str, session_id: str, events: list[dict]) -> None:
         if not events:
             return
-        prefix = self._write_prefix(user_id, session_id)
-        start_seq = events[0]["seq"]
-        end_seq = events[-1]["seq"]
-        filename = _chunk_filename(start_seq, end_seq)
-        key = prefix + filename
+        self._append_payload(
+            user_id,
+            session_id,
+            events[0]["seq"],
+            events[-1]["seq"],
+            _events_to_ndjson(events),
+        )
 
-        body = _events_to_ndjson(events)
+    def probe(self) -> None:
+        """Check S3 reachability and bucket access before accepting spool writes."""
+        self._client.head_bucket(Bucket=self._bucket)
+
+    def append_file(
+        self,
+        user_id: str,
+        session_id: str,
+        start: int,
+        end: int,
+        path: Path,
+        *,
+        destination: str | None = None,
+    ) -> None:
+        """Upload a sealed chunk using a seekable file body."""
+        with path.open("rb") as body:
+            self._append_payload(user_id, session_id, start, end, body, destination)
+
+    def chunk_destination(
+        self, user_id: str, session_id: str, start: int, end: int
+    ) -> str:
+        return self._write_prefix(user_id, session_id) + _chunk_filename(start, end)
+
+    def _append_payload(
+        self,
+        user_id: str,
+        session_id: str,
+        start_seq: int,
+        end_seq: int,
+        body: bytes | BinaryIO,
+        destination: str | None = None,
+    ) -> None:
+        key = destination or self.chunk_destination(
+            user_id, session_id, start_seq, end_seq
+        )
+
+        size = len(body) if isinstance(body, bytes) else os.fstat(body.fileno()).st_size
         started_at = time.monotonic()
         wrote_object = False
         object_version = ""
@@ -753,12 +869,27 @@ class S3EventBackend:
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             if status != 412:
                 raise
-            existing = self._download_object(key)
-            if existing != body:
+            # A lost PUT response is retried with exactly the same sealed bytes.
+            if isinstance(body, bytes):
+                expected_digest = hashlib.sha256(body).hexdigest()
+            else:
+                body.seek(0)
+                expected_digest = hashlib.file_digest(body, "sha256").hexdigest()
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            with self._cache_lock:
+                self._get_requests += 1
+            existing = response["Body"]
+            digest = hashlib.sha256()
+            try:
+                while chunk := existing.read(1024 * 1024):
+                    digest.update(chunk)
+            finally:
+                existing.close()
+            if digest.hexdigest() != expected_digest:
                 raise RuntimeError(
                     f"Immutable event chunk collision for s3://{self._bucket}/{key}"
                 ) from exc
-            object_version = hashlib.sha256(body).hexdigest()
+            object_version = expected_digest
         finally:
             self._operation_latency["put"].observe(
                 (time.monotonic() - started_at) * 1000
@@ -767,16 +898,21 @@ class S3EventBackend:
                 self._put_requests += 1
         if wrote_object:
             with self._cache_lock:
-                self._bytes_written += len(body)
+                self._bytes_written += size
         if not object_version:
-            object_version = hashlib.sha256(body).hexdigest()
+            if isinstance(body, bytes):
+                object_version = hashlib.sha256(body).hexdigest()
+            else:
+                body.seek(0)
+                object_version = hashlib.file_digest(body, "sha256").hexdigest()
         with self._cache_lock:
             self._object_versions[key] = object_version
         try:
-            self._event_cache.put(
-                self._object_cache_key(key, version=object_version),
-                body,
-            )
+            # Large spool files are cached lazily on read, not copied into RAM.
+            if isinstance(body, bytes):
+                self._event_cache.put(
+                    self._object_cache_key(key, version=object_version), body
+                )
         except OSError:
             logger.warning(
                 "Could not populate event cache after S3 write", exc_info=True
@@ -898,7 +1034,7 @@ class S3EventBackend:
             for event in reversed(events):
                 if event.get("seq", 0) >= before_seq:
                     continue
-                if _event_matches_filters(
+                if event_matches_filters(
                     event,
                     event_types=event_types,
                     sources=sources,
@@ -935,7 +1071,7 @@ class S3EventBackend:
             data = self._get_object(key)
             events = _ndjson_to_events(data)
             for event in reversed(events):
-                if _event_matches_filters(
+                if event_matches_filters(
                     event,
                     event_types=event_types,
                     sources=sources,

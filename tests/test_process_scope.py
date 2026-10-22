@@ -160,6 +160,10 @@ def test_partial_lifecycle_assessment_is_resolved_by_contextual_judge(profile, v
         }
     )
     initial = evaluate_policy([], state, profile, assessed=True)
+    if profile in {"balanced", "bounded_autonomy"}:
+        assert initial.outcome == "approve"
+        assert initial.permission_basis == "task_process_lifecycle"
+        return
     assert initial.outcome == "escalate"
     assert {o.id for o in initial.outstanding_obligations} == {
         "process.current_restrictions"

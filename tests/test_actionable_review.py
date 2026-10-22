@@ -255,7 +255,7 @@ def test_ask_scope_correction_does_not_erase_restrictions_or_critical_risk(basis
     assert evaluate_policy([], state).outcome == "deny"
 
 
-def test_explanation_contract_does_not_require_verbatim_restriction_quote():
+def test_restriction_refusal_repairs_a_quote_missing_from_its_cited_source():
     model = MagicMock()
     model._model = "judge"
     invalid = reply(
@@ -290,9 +290,9 @@ def test_explanation_contract_does_not_require_verbatim_restriction_quote():
         latest_user="Never submit a booking.",
     )
     answer, _ = classify(model, question)
-    # Quotations are diagnostic, not a second execution prerequisite.
-    assert answer.restriction_quote == "User prohibited booking."
-    assert model.generate.call_count == 1
+    assert answer.user_would == "ask"
+    assert answer.restriction_quote == "Never submit a booking."
+    assert model.generate.call_count == 2
     assert {"action_summary", "explanation", "restriction_quote"} <= set(
         schema(1)["schema"]["required"]
     )

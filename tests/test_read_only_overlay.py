@@ -468,7 +468,12 @@ def test_alignment_escalation_cannot_bypass_explicit_read_only_ceiling(
         barrier = Mock()
         barrier.is_misaligned.return_value = "Child is unrelated"
         evaluator._alignment_barrier = barrier
-    llm.generate.return_value = answer(mutation)
+    response = json.loads(answer(mutation))
+    if mutation == "unclear":
+        # Low-risk execute with no unknown effects proves read-only in the
+        # current evidence model; this case exercises genuinely unproven effects.
+        response["effects"] = ["unknown"]
+    llm.generate.return_value = json.dumps(response)
     result = evaluator.evaluate(
         user_id="owner",
         session_id="child",

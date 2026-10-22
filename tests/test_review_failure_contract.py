@@ -247,7 +247,9 @@ def test_real_unattended_reviewer_keeps_authorization_outage_unresolved(
     assert record["user_decision"] is None
 
 
-@pytest.mark.parametrize("first_vote", ["ask", "approve", "refuse"])
+@pytest.mark.parametrize(
+    "first_vote", ["ask", "approve", "refuse", "unverified_refuse", "unverified_ask"]
+)
 def test_real_balanced_review_distinguishes_task_support_from_human_choice(
     api, monkeypatch, first_vote
 ):
@@ -269,7 +271,11 @@ def test_real_balanced_review_distinguishes_task_support_from_human_choice(
         client.post(
             "/api/v1/intention",
             headers=headers,
-            json={"session_id": "routine-review", "intention": task},
+            json={
+                "session_id": "routine-review",
+                "intention": task,
+                "original_assignment": task,
+            },
         ).status_code
         == 200
     )
@@ -279,31 +285,38 @@ def test_real_balanced_review_distinguishes_task_support_from_human_choice(
     )
 
     llm = Mock(_timeout_ms=4000)
+    unverified = first_vote.startswith("unverified_")
     llm.generate.return_value = json.dumps(
         reply(
-            user_would=first_vote,
+            user_would=first_vote.removeprefix("unverified_"),
             basis="irreversible_unclear"
             if first_vote == "ask"
             else "restriction_conflict"
-            if first_vote == "refuse"
+            if first_vote == "refuse" or unverified
             else "routine_within_task",
             risk="low",
             question="Which recipient should receive this?"
-            if first_vote == "ask"
+            if first_vote in {"ask", "unverified_ask"}
             else "",
             explanation="A recipient choice remains."
             if first_vote == "ask"
             else "The user prohibited this file."
             if first_vote == "refuse"
             else "This is routine task-related evidence handling.",
-            cites=[],
-            restriction_quote="",
+            cites=[1] if first_vote == "refuse" or unverified else [],
+            restriction_quote=(
+                "Do not write test-evidence.json."
+                if first_vote == "refuse"
+                else "A previous guard blocked this action."
+                if unverified
+                else ""
+            ),
         )
     )
     audit = AuditStore(server._get_db())
     reviewer = JudgeReviewer(
         llm=llm,
-        config=JudgeConfig(mode="advisory"),
+        config=JudgeConfig(mode="auto" if unverified else "advisory"),
         audit_store=audit,
         session_store=evaluator._sessions,
         evaluator=evaluator,
@@ -330,17 +343,32 @@ def test_real_balanced_review_distinguishes_task_support_from_human_choice(
             "approve": "approve",
             "ask": "escalate",
             "refuse": "deny",
+            "unverified_refuse": "escalate",
+            "unverified_ask": "escalate",
         }[first_vote]
     )
     # One contextual Judge, with no citation/authorization follow-up.
-    assert llm.generate.call_count == 1
+    assert llm.generate.call_count == (2 if unverified else 1)
     if first_vote == "approve":
         emit.assert_not_awaited()
         record = audit.get_by_call_id(result.json()["call_id"], user_id="owner")
         metadata = record["evaluation_metadata"]
         assert metadata["policy_evidence"]["review"]["user_would"] == first_vote
         assert "authorization_check" not in metadata["stages"][-1]
-    elif first_vote == "ask":
+    elif first_vote == "ask" or unverified:
         emit.assert_awaited_once()
+        if unverified:
+            record = audit.get_by_call_id(result.json()["call_id"], user_id="owner")
+            assert record["user_decision"] is None
+            assert record["resolved_by"] is None
+            assert result.json()["risk"] == record["risk"]
+            assert "review-validation failure" in result.json()["reasoning"]
+            assert "withheld permission" in result.json()["reasoning"]
+            assert (
+                "Permission for this action has not been verified"
+                not in result.json()["reasoning"]
+            )
+            stage = record["evaluation_metadata"]["stages"][-1]
+            assert stage["classification"]["basis"] == "review_unavailable"
     else:
         emit.assert_not_awaited()

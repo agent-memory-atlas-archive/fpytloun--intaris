@@ -2,7 +2,9 @@
 
 import json
 import sqlite3
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from intaris.alignment import check_intention_alignment
 from intaris.audit import AuditStore
@@ -49,10 +51,14 @@ def test_first_classifier_receives_original_evidence_on_real_wire():
     assert "not human authorization" in payload["state"]["evaluation_rules"]
 
 
-def stores(tmp_path):
+def stores(tmp_path, profile="balanced"):
     db = Database(DBConfig(path=str(tmp_path / "admission.db")))
     store = SessionStore(db)
-    policy = {"evaluation_policy_version": "hybrid_v1", "interaction_mode": "none"}
+    policy = {
+        "evaluation_policy_version": "hybrid_v1",
+        "interaction_mode": "none",
+        "profile": profile,
+    }
     store.create(
         user_id="admission-owner",
         session_id="admission-parent",
@@ -69,8 +75,9 @@ def stores(tmp_path):
     return db, store
 
 
-def test_durable_conflict_reason_survives_worker_restart(tmp_path):
-    db, store = stores(tmp_path)
+@pytest.mark.parametrize("profile", ["balanced", "bounded_autonomy"])
+def test_durable_conflict_reason_reaches_policy_after_worker_restart(tmp_path, profile):
+    db, store = stores(tmp_path, profile)
     assert store.set_alignment_state(
         "admission-child",
         user_id="admission-owner",
@@ -78,19 +85,107 @@ def test_durable_conflict_reason_survives_worker_restart(tmp_path):
         reason="Original instruction explicitly forbids delegation.",
     )
     # No in-memory barrier: emulate another worker reading the durable result.
-    result = Evaluator(
-        llm=MagicMock(),
-        session_store=SessionStore(db),
-        audit_store=AuditStore(db),
-    ).evaluate(
+    with patch(
+        "intaris.hybrid_runtime.HybridRuntime.evaluate",
+        return_value={
+            "decision": "approve",
+            "risk": "low",
+            "reasoning": "Policy result",
+        },
+    ) as runtime:
+        result = Evaluator(
+            llm=MagicMock(),
+            session_store=SessionStore(db),
+            audit_store=AuditStore(db),
+        ).evaluate(
+            user_id="admission-owner",
+            session_id="admission-child",
+            agent_id=None,
+            tool="read",
+            args={"file_path": "/repo/findings.md"},
+        )
+    assert result["decision"] == "approve"
+    fact = runtime.call_args.kwargs["parent_alignment"]
+    assert fact["state"] == "incompatible"
+    assert fact["reason"] == "Original instruction explicitly forbids delegation."
+    assert fact["grounded"] is False  # prose alone is not an original citation
+
+
+@pytest.mark.parametrize("state", ["pending", "error"])
+def test_bounded_autonomy_does_not_wait_for_alignment_opinion(tmp_path, state):
+    db, store = stores(tmp_path, "bounded_autonomy")
+    store.set_alignment_state(
+        "admission-child",
         user_id="admission-owner",
+        state=state,
+        reason="Compatibility classifier unavailable.",
+    )
+    with patch(
+        "intaris.hybrid_runtime.HybridRuntime.evaluate",
+        return_value={
+            "decision": "approve",
+            "risk": "low",
+            "reasoning": "Policy result",
+        },
+    ) as runtime:
+        Evaluator(
+            llm=MagicMock(),
+            session_store=store,
+            audit_store=AuditStore(db),
+        ).evaluate(
+            user_id="admission-owner",
+            session_id="admission-child",
+            agent_id=None,
+            tool="read",
+            args={"file_path": "/repo/findings.md"},
+        )
+    fact = runtime.call_args.kwargs["parent_alignment"]
+    assert fact["state"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "profile,waits", [("balanced", True), ("bounded_autonomy", False)]
+)
+def test_actual_http_handler_alignment_wait_uses_profile(tmp_path, profile, waits):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from intaris.api.deps import SessionContext
+    from intaris.api.evaluate import _evaluate
+    from intaris.api.schemas import EvaluateRequest
+
+    db, store = stores(tmp_path, profile)
+    evaluator = Evaluator(
+        llm=MagicMock(), session_store=store, audit_store=AuditStore(db)
+    )
+    barrier = SimpleNamespace(wait=AsyncMock())
+    http = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(alignment_barrier=barrier))
+    )
+    request = EvaluateRequest(
         session_id="admission-child",
-        agent_id=None,
         tool="read",
         args={"file_path": "/repo/findings.md"},
     )
-    assert result["decision"] == "deny"
-    assert result["reasoning"] == "Original instruction explicitly forbids delegation."
+    ctx = SessionContext(user_id="admission-owner")
+    with (
+        patch("intaris.server._get_evaluator", return_value=evaluator),
+        patch.object(
+            evaluator,
+            "evaluate_async",
+            new=AsyncMock(side_effect=RuntimeError("dispatch-reached")),
+        ) as dispatch,
+        pytest.raises(
+            HTTPException, match="Internal error during evaluation"
+        ) as failure,
+    ):
+        asyncio.run(_evaluate(request, http, ctx))
+    assert failure.value.status_code == 500
+    dispatch.assert_awaited_once()
+    assert barrier.wait.await_count == int(waits)
 
 
 def test_stale_result_cannot_replace_reason_or_another_tenant(tmp_path):

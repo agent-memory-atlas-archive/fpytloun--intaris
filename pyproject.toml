@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "intaris"
-version = "0.13.0"
+version = "0.14.0"
 description = "Guardrails service for AI agents — safety evaluation, audit, and approval workflows"
 readme = "README.md"
 license = "LicenseRef-BSL-1.1"
@@ -82,3 +82,6 @@ addopts = "-m 'not e2e'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["intaris"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.gitea"]

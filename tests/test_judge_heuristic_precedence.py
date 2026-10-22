@@ -8,7 +8,7 @@ from intaris.classifier import secret_argument_disclosure
 from intaris.config import JudgeConfig
 from intaris.hybrid import Predicate, Rule, evaluate_policy
 from intaris.judge import JudgeReviewer
-from intaris.policy_evidence import Review, from_observations
+from intaris.policy_evidence import CorrectedAssessment, Review, from_observations
 from tests.test_intent_first_defaults import model_response
 from tests.test_policy_evidence_runtime import runtime as runtime
 
@@ -47,8 +47,8 @@ def evidence(risk="high", verdict="approve", **observations):
         {
             "tool": "bash",
             "risk": risk,
-            "secret_argument": True,
-            "effects": ["disclose"],
+            "secret_argument": False,
+            "effects": ["read"],
             "mutation": "read_only",
             **observations,
         }
@@ -91,6 +91,85 @@ def test_unreviewed_critical_heuristic_routes_to_judge_not_irrevocable_denial():
     assert "model.risk.critical" in [o.id for o in result.outstanding_obligations]
 
 
+@pytest.mark.parametrize("profile", ["strict", "balanced", "bounded_autonomy"])
+@pytest.mark.parametrize("authorization", ["absent", "implicit", "explicit"])
+def test_secret_disclosure_requires_scoped_user_grant_after_severity_review(
+    profile, authorization
+):
+    state = evidence(secret_argument=True, effects=["disclose"])
+    state = state.model_copy(
+        update={
+            "sources": {
+                "latest_user_message": {
+                    "origin": "recorded_user_event",
+                    "independent_grant": True,
+                }
+            },
+            "assessment": {
+                **state.assessment,
+                "authorization": authorization,
+                "authorization_source": "latest_user_message",
+                "authorization_scope": "within_scope",
+            },
+        }
+    )
+    result = evaluate_policy([], state, profile, assessed=True)
+    assert result.outcome == ("approve" if authorization == "explicit" else "escalate")
+    assert (
+        "disclosure.authorization" in [o.id for o in result.outstanding_obligations]
+    ) == (authorization != "explicit")
+    assert state.observations["risk"].value == "high"
+    assert state.value("risk") == "medium"
+
+
+@pytest.mark.parametrize(
+    "origin,independent,authorization,outcome",
+    [
+        ("recorded_user_event", True, "explicit", "approve"),
+        ("recorded_user_event", True, "implicit", "escalate"),
+        ("recorded_user_event", False, "explicit", "escalate"),
+        ("linked_non_authorizing_context", True, "explicit", "escalate"),
+        ("generated_summary", True, "explicit", "escalate"),
+    ],
+)
+def test_disclosure_only_obligation_accepts_valid_authority_correction(
+    origin, independent, authorization, outcome
+):
+    state = evidence(risk="medium", secret_argument=True, effects=["disclose"])
+    state = state.model_copy(
+        update={
+            "review": None,
+            "sources": {
+                "message:grant": {
+                    "origin": origin,
+                    "independent_grant": independent,
+                }
+            },
+        }
+    )
+    prior = evaluate_policy([], state, "bounded_autonomy", assessed=True)
+    assert [o.id for o in prior.outstanding_obligations] == ["disclosure.authorization"]
+    state = state.model_copy(
+        update={
+            "review": Review(
+                obligation_ids=["disclosure.authorization"],
+                evidence_refs=["message:grant"],
+                user_would="approve",
+                risk="medium",
+                basis="explicit_request",
+                corrected_assessment=CorrectedAssessment(
+                    authorization=authorization,
+                    authorization_source="message:grant",
+                    authorization_scope="within_scope",
+                ),
+            )
+        }
+    )
+    assert (
+        evaluate_policy([], state, "bounded_autonomy", assessed=True).outcome == outcome
+    )
+
+
 def test_judge_risk_recomputes_classification_based_policy_predicates():
     rule = Rule(
         id="danger",
@@ -131,30 +210,29 @@ def test_exact_deny_checkpoint_and_read_only_constraint_still_bind():
 
 
 @pytest.mark.asyncio
-async def test_live_judge_corrects_secret_heuristic_without_rewriting_audit(runtime):
+async def test_live_judge_corrects_severity_heuristic_without_rewriting_audit(runtime):
     sessions, audit, llm, evaluator, sid = runtime
     llm.generate.side_effect = lambda *a, **kw: model_response(
         kw,
         risk="high",
-        effects=["read", "disclose"],
+        effects=["delete"],
         relationship="supports_intent",
         contextual_restrictions="consistent",
         target_scope="consistent",
     )
-    # Inert evaluation only: this fixture filename triggers the secret heuristic.
+    # Inert evaluation only: no proposed command is ever executed.
     result = evaluator.evaluate(
         user_id="owner",
         session_id=sid,
         agent_id=None,
         tool="bash",
-        args={"command": "git show HEAD:secrets.example"},
+        args={"command": "rm -rf /"},
     )
     assert result["decision"] == "escalate"
     before = audit.get_by_call_id(result["call_id"], user_id="owner")[
         "evaluation_metadata"
     ]["policy_evidence"]
-    assert before["observations"]["secret_argument"]["value"] is True
-    assert before["observations"]["risk"]["value"] == "high"
+    assert before["observations"]["risk"]["value"] == "critical"
     llm.generate.side_effect = None
     llm.generate.return_value = json.dumps(
         {
@@ -164,8 +242,8 @@ async def test_live_judge_corrects_secret_heuristic_without_rewriting_audit(runt
             "basis": "routine_within_task",
             "cites": [],
             "question": "",
-            "action_summary": "Inspect the repository's documented example fixture.",
-            "explanation": "The named file contains examples, not live credentials.",
+            "action_summary": "Evaluate the inert severity regression fixture.",
+            "explanation": "Synthetic review response; the proposed command never runs.",
         }
     )
     reviewer = JudgeReviewer(

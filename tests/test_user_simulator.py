@@ -123,7 +123,7 @@ def test_bounded_known_read_does_not_require_applicability():
 @pytest.mark.parametrize("profile", ["strict", "balanced", "bounded_autonomy"])
 @pytest.mark.parametrize(
     "fact",
-    [{"configured_deny": True}, {"risk": "critical"}, {"read_only_required": True}],
+    [{"configured_deny": True}, {"read_only_required": True}],
 )
 def test_simulator_cannot_override_controller_denies(profile, fact):
     evidence = state(**fact)
@@ -132,6 +132,19 @@ def test_simulator_cannot_override_controller_denies(profile, fact):
         update={"review": simulator.receipt(evidence, prior, answer())}
     )
     assert evaluate_policy([], reviewed, profile, assessed=True).outcome == "deny"
+
+
+@pytest.mark.parametrize("profile", ["strict", "balanced", "bounded_autonomy"])
+def test_simulator_can_correct_risk_without_erasing_original_observation(profile):
+    evidence = state(risk="critical")
+    prior = evaluate_policy([], evidence, profile, assessed=True)
+    assert prior.outcome == "escalate"
+    reviewed = evidence.model_copy(
+        update={"review": simulator.receipt(evidence, prior, answer())}
+    )
+    assert reviewed.observations["risk"].value == "critical"
+    assert reviewed.value("risk") == "low"
+    assert evaluate_policy([], reviewed, profile, assessed=True).outcome == "approve"
 
 
 @pytest.mark.parametrize("profile", ["strict", "balanced"])

@@ -176,7 +176,13 @@ async def _evaluate(
     alignment_barrier = getattr(http_request.app.state, "alignment_barrier", None)
     from intaris.evaluation_override import force_legacy
 
-    if alignment_barrier is not None and not force_legacy():
+    if (
+        alignment_barrier is not None
+        and not force_legacy()
+        and _get_evaluator().waits_for_alignment(
+            user_id=ctx.user_id, session_id=request.session_id
+        )
+    ):
         await alignment_barrier.wait(ctx.user_id, request.session_id)
 
     try:

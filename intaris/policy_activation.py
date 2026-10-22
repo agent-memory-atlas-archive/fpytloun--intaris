@@ -20,6 +20,7 @@ from intaris.hybrid import (
     digest,
     validate_rules,
 )
+from intaris.inference_attribution import attributed
 
 COMPILER_VERSION = "compiler-v4"
 
@@ -65,6 +66,7 @@ class PolicyCompiler:
         self._cache: OrderedDict[str, list[dict]] = OrderedDict()
         self._lock = threading.Lock()
 
+    @attributed("policy_compile")
     def compile(self, tenant: str, clauses: list[dict], scope: dict) -> list[dict]:
         from intaris.config import build_policy_compiler_llm_config
         from intaris.llm import LLMClient

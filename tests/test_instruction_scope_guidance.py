@@ -68,4 +68,4 @@ def test_shared_guidance_preserves_refusals_conditions_and_no_automatic_revocati
     assert "does not automatically revoke" in INSTRUCTION_SCOPE_GUIDANCE
     assert "real human refusal remains binding" in INSTRUCTION_SCOPE_GUIDANCE
     assert "agent\nclaims" in INSTRUCTION_SCOPE_GUIDANCE
-    assert "action-intention-view-v9" == l1_projection.VERSION
+    assert "action-intention-view-v10" == l1_projection.VERSION

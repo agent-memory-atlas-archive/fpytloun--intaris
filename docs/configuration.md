@@ -287,6 +287,11 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 | `EVENT_STORE_ENABLED` | `true` | Master switch for session recording |
 | `EVENT_STORE_BACKEND` | `filesystem` | Storage backend: `filesystem` or `s3` |
 | `EVENT_STORE_PATH` | `~/.intaris/events` | Filesystem backend storage path |
+| `EVENT_STORE_SPOOL_ENABLED` | `true` | Stage local pending batches before acknowledging; one writer/replica only |
+| `EVENT_STORE_SPOOL_FSYNC` | `true` | Sync spool files/directories; disable only when host-crash durability is not required |
+| `EVENT_STORE_SPOOL_PATH` | `${EVENT_STORE_PATH}-spool` | Separate local spool directory; default `~/.intaris/events-spool`, including with S3 |
+| `EVENT_STORE_SPOOL_MAX_BYTES` | `1073741824` | Admission budget including working headroom; full spool stops writes, never evicts |
+| `EVENT_STORE_BACKEND_CHECK_INTERVAL` | `5` | Seconds between backend probes; a failed probe/read/upload stops admission until recovery |
 | `EVENT_STORE_FLUSH_SIZE` | `100` | Events per chunk before flushing |
 | `EVENT_STORE_FLUSH_BYTES` | `4194304` | Approximate serialized bytes per chunk before flushing |
 | `EVENT_STORE_FLUSH_INTERVAL` | `30` | Seconds between periodic flushes |
@@ -297,6 +302,25 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 | `EVENT_CACHE_TTL_SECONDS` | `604800` | Remove chunks not accessed within this interval |
 | `EVENT_CACHE_TOUCH_INTERVAL_SECONDS` | `3600` | Minimum interval between persistent access-time updates |
 | `EVENT_CACHE_SWEEP_INTERVAL_SECONDS` | `60` | Minimum interval between cache eviction sweeps |
+
+Spooling is enabled by default and is **not an offline-write queue**. Startup
+requires a reachable backend; known backend failures stop new writes. Because
+uploads are batched and probes are periodic, an outage may be detected after
+earlier requests have already been acknowledged locally. Those files remain
+available for recovery. Probes verify connectivity/access, not a guarantee that
+the next write will succeed. The existing flush settings control S3 chunk size
+and archival latency, independently of local durability.
+
+`EVENT_STORE_SPOOL_FSYNC=true` is the default and syncs spool files and directory
+updates before their commit boundaries. Set it to `false` to skip those barriers
+while retaining flushed writes, checksums, and atomic replacement. This retains
+process/container-restart protection while the host kernel and volume survive,
+but acknowledged data can be lost or inconsistently persisted after a node/kernel
+crash, reboot, or power loss. It does not change database or archive durability.
+
+Use a dedicated disk-backed volume, not the immutable cache directory or tmpfs.
+See [Local event spool](event-spool.md) for crash guarantees, deployment mounts,
+capacity, drain requirements, and failure tests.
 
 ### S3 Backend
 

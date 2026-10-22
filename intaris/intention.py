@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 from intaris.audit import AuditStore
 from intaris.db import Database
+from intaris.inference_attribution import attributed
 from intaris.llm import STRUCTURED_OUTPUT_MAX_TOKENS, LLMClient
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
@@ -168,6 +169,7 @@ class IntentionGenerationFailure(Exception):
         super().__init__("Rich intention generation unavailable")
 
 
+@attributed("intention")
 def generate_intention(
     *,
     llm: LLMClient,

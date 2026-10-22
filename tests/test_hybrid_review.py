@@ -103,8 +103,17 @@ def test_unsupported_shell_syntax_retains_critical_detection(stores, version, co
         tool="bash",
         args={"command": command},
     )
-    assert result["decision"] == "deny"
-    assert not llm.generate.called
+    assert result["decision"] == ("deny" if version == "legacy" else "escalate")
+    if version == "hybrid_v1":
+        evidence = result["evaluation_metadata"]["policy_evidence"]
+        assert evidence["observations"]["risk"]["value"] == "critical"
+        assert "model.risk.critical" in [
+            o["id"] for o in result["evaluation_metadata"]["outstanding_obligations"]
+        ]
+    if version == "legacy":
+        llm.generate.assert_not_called()
+    else:
+        llm.generate.assert_called_once()
 
 
 @pytest.mark.parametrize("aligned", [True, False])
@@ -149,10 +158,15 @@ def test_child_alignment_without_analysis_and_human_acknowledgment(stores, align
     result = evaluator.evaluate(**request)
     assert result["decision"] == ("approve" if aligned else "escalate")
     if not aligned:
-        assert result["path"] == "alignment"
+        assert "alignment.compatibility" in [
+            o["id"] for o in result["evaluation_metadata"]["outstanding_obligations"]
+        ]
         audit.resolve_escalation(result["call_id"], "approve", user_id="owner")
         assert evaluator.evaluate(**request)["decision"] == "approve"
-    assert sessions.get("child", user_id="owner")["alignment_state"] == "ready"
+    # Exact action approval does not grant permanent compatibility to the child.
+    assert sessions.get("child", user_id="owner")["alignment_state"] == (
+        "ready" if aligned else "misaligned"
+    )
     assert llm.generate.call_count == 1  # Alignment only; static reads bypass L1.
 
 

@@ -47,7 +47,19 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+from intaris.analytics_evidence import (
+    PROMPT_VERSION,
+    VERSION,
+    aggregate_dispositions,
+    merge_messages,
+    message_from_audit,
+    metadata,
+    select_summaries,
+    statistics,
+)
+from intaris.analytics_sources import SourceProgress, source_revision
 from intaris.db import Database
+from intaris.inference_attribution import llm_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -439,7 +451,7 @@ def generate_summary(
         children_needing_summaries = [
             c
             for c in children
-            if c.get("summary_count", 0) == 0
+            if c.get("summary_stale", c.get("summary_count", 0) == 0)
             and c.get("last_activity_at")
             and c.get("created_at")
             and c.get("last_activity_at") > c.get("created_at")
@@ -471,9 +483,8 @@ def generate_summary(
             # Exclude children without summaries — don't use raw metadata.
             # These children either had no data or their summaries failed.
             unsummarized_ids = {c["session_id"] for c in children_needing_summaries}
-            children = [c for c in children if c["session_id"] not in unsummarized_ids]
             logger.info(
-                "Parent session %s: excluding %d unsummarized children "
+                "Parent session %s: recording gaps for %d unsummarized children "
                 "after %d re-checks",
                 session_id,
                 len(unsummarized_ids),
@@ -503,16 +514,11 @@ def generate_summary(
     window_start = _get_window_start(db, user_id, session_id, session)
     window_end = now
 
-    # Fetch all audit records for the tail window (no limit — the
-    # partitioner handles splitting large data into context-budget-aware
-    # windows). No data is ever silently dropped.
-    tool_calls = audit_store.get_window(
-        session_id,
-        user_id=user_id,
-        from_ts=window_start,
-        to_ts=window_end,
-        record_types={"tool_call"},
-        limit=0,
+    # Discover identities across history, then hydrate only uncovered payloads.
+    # The partitioner still processes all selected evidence without dropping it.
+    progress = SourceProgress.load(db, user_id, session_id)
+    tool_calls, reasoning_records = _read_uncovered_audit(
+        audit_store, progress, user_id, session_id, session["created_at"], window_end
     )
     if len(tool_calls) > 2000:
         logger.warning(
@@ -521,18 +527,16 @@ def generate_summary(
             session_id,
         )
 
-    reasoning_records = audit_store.get_window(
-        session_id,
-        user_id=user_id,
-        from_ts=window_start,
-        to_ts=window_end,
-        record_types={"reasoning"},
-        limit=0,
-    )
-
     # ── Step 3: Try event-enriched path ───────────────────────────
+    event_read: dict[str, Any] = {}
     conversation = _get_session_events(
-        event_store, user_id, session_id, window_start, window_end
+        event_store,
+        user_id,
+        session_id,
+        None,
+        window_end,
+        coverage=event_read,
+        progress=progress,
     )
     event_enriched = bool(conversation)
     # Track if event store was available but returned no data (fallback)
@@ -546,15 +550,28 @@ def generate_summary(
     for rec in reasoning_records:
         content = rec.get("content", "")
         if content.startswith("User message:"):
-            if not event_enriched:
-                user_messages.append(rec)
+            user_messages.append(rec)
         else:
             agent_reasoning.append(rec)
+
+    if event_enriched:
+        conversation = merge_messages(conversation, user_messages)
+    dependencies = {c["session_id"]: c.get("summary_ids", []) for c in child_data}
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT evidence_metadata FROM session_summaries "
+            "WHERE user_id = ? AND session_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id, session_id),
+        )
+        previous = cur.fetchone()
+    child_changed = dependencies != metadata(
+        previous["evidence_metadata"] if previous else None
+    ).get("children", {})
 
     # Any data in the window is sufficient to generate a summary.
     # Even a single tool call or user message is worth analyzing.
     has_sufficient_data = bool(
-        conversation or tool_calls or user_messages or agent_reasoning
+        conversation or tool_calls or user_messages or agent_reasoning or child_changed
     )
 
     # Count existing windows once (used for both early-exit and window numbering)
@@ -570,6 +587,7 @@ def generate_summary(
                 session_id=session_id,
                 session=session,
                 child_data=child_data,
+                task_id=task.get("id"),
             )
             if compaction_result:
                 return compaction_result
@@ -618,6 +636,7 @@ def generate_summary(
     tail_stats: dict[str, Any] = {}
     last_window_number = 0
     windows_generated = 0
+    generated_summaries: list[dict[str, Any]] = []
 
     if event_enriched:
         # Event-enriched path: partition into context-budget-aware windows
@@ -672,13 +691,19 @@ def generate_summary(
                 child_sessions=child_data if i == len(partitions) - 1 else None,
                 conversation=p_conversation,
             )
+            original_prompt = user_prompt
             user_prompt = _apply_prompt_budget(
                 user_prompt,
                 label="summary_prompt_event_enriched",
             )
 
             try:
-                raw_response = llm.generate(
+                raw_response, operation_id = _generate_attributed(
+                    llm,
+                    operation="summary_window",
+                    session_id=session_id,
+                    task_id=task.get("id"),
+                    operation_key=str(window_number),
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -699,22 +724,37 @@ def generate_summary(
                 )
                 raise
 
-            # Per-partition stats (M1 fix: computed from partitioned data)
-            p_approved = sum(
-                1 for tc in p_tool_calls if tc.get("decision") == "approve"
+            p_stats = statistics(
+                [c for c in p_tool_calls if not c.get("_resolution_update")]
             )
-            p_denied = sum(1 for tc in p_tool_calls if tc.get("decision") == "deny")
-            p_escalated = sum(
-                1 for tc in p_tool_calls if tc.get("decision") == "escalate"
+            result["evidence_metadata"] = _window_evidence(
+                p_tool_calls,
+                p_reasoning,
+                p_conversation,
+                dependencies if i == len(partitions) - 1 else {},
+                now,
             )
-            p_stats = {
-                "total": len(p_tool_calls),
-                "approved_count": p_approved,
-                "denied_count": p_denied,
-                "escalated_count": p_escalated,
-            }
+            result["evidence_metadata"]["operation_id"] = operation_id
+            result["evidence_metadata"]["event_snapshot_seq"] = (
+                _verified_event_prefix(
+                    db,
+                    user_id,
+                    session_id,
+                    event_read.get("represented_prefix", 0),
+                    p_conversation,
+                )
+                if i == len(partitions) - 1 and user_prompt == original_prompt
+                else 0
+            )
+            result["evidence_metadata"]["event_read"] = event_read
+            result["evidence_metadata"]["prompt_truncated"] = (
+                user_prompt != original_prompt
+            )
+            result["evidence_metadata"]["coverage_gaps"] = _child_coverage_gaps(
+                child_data
+            )
 
-            _store_summary(
+            summary_id = _store_summary(
                 db,
                 user_id=user_id,
                 session_id=session_id,
@@ -725,6 +765,7 @@ def generate_summary(
                 result=result,
                 stats=p_stats,
             )
+            generated_summaries.append({"summary_id": summary_id, **result})
 
             try:
                 session_store.increment_summary_count(session_id, user_id=user_id)
@@ -816,13 +857,19 @@ def generate_summary(
                 if i == len(fallback_partitions) - 1
                 else None,
             )
+            original_prompt = user_prompt
             user_prompt = _apply_prompt_budget(
                 user_prompt,
                 label="summary_prompt_audit_only",
             )
 
             try:
-                raw_response = llm.generate(
+                raw_response, operation_id = _generate_attributed(
+                    llm,
+                    operation="summary_window",
+                    session_id=session_id,
+                    task_id=task.get("id"),
+                    operation_key=str(window_number),
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -843,22 +890,29 @@ def generate_summary(
                 )
                 raise
 
-            # Per-partition stats
-            p_approved = sum(
-                1 for tc in p_tool_calls if tc.get("decision") == "approve"
+            p_stats = statistics(
+                [c for c in p_tool_calls if not c.get("_resolution_update")]
             )
-            p_denied = sum(1 for tc in p_tool_calls if tc.get("decision") == "deny")
-            p_escalated = sum(
-                1 for tc in p_tool_calls if tc.get("decision") == "escalate"
+            result["evidence_metadata"] = _window_evidence(
+                p_tool_calls,
+                p_reasoning + p_messages,
+                [],
+                dependencies if i == len(fallback_partitions) - 1 else {},
+                now,
             )
-            p_stats = {
-                "total": len(p_tool_calls),
-                "approved_count": p_approved,
-                "denied_count": p_denied,
-                "escalated_count": p_escalated,
-            }
+            result["evidence_metadata"]["operation_id"] = operation_id
+            # No conversation was summarized here. Keep the verified prefix
+            # in earlier durable windows; a failed/empty read proves nothing.
+            result["evidence_metadata"]["event_snapshot_seq"] = 0
+            result["evidence_metadata"]["event_read"] = event_read
+            result["evidence_metadata"]["prompt_truncated"] = (
+                user_prompt != original_prompt
+            )
+            result["evidence_metadata"]["coverage_gaps"] = _child_coverage_gaps(
+                child_data
+            )
 
-            _store_summary(
+            summary_id = _store_summary(
                 db,
                 user_id=user_id,
                 session_id=session_id,
@@ -869,6 +923,7 @@ def generate_summary(
                 result=result,
                 stats=p_stats,
             )
+            generated_summaries.append({"summary_id": summary_id, **result})
 
             try:
                 session_store.increment_summary_count(session_id, user_id=user_id)
@@ -906,25 +961,39 @@ def generate_summary(
     total_windows = _count_prior_summaries(db, user_id, session_id)
 
     if total_windows > 1:
-        compaction_result = _generate_compaction(
-            db,
-            llm,
-            user_id=user_id,
-            session_id=session_id,
-            session=session,
-            child_data=child_data,
-        )
+        try:
+            compaction_result = _generate_compaction(
+                db,
+                llm,
+                user_id=user_id,
+                session_id=session_id,
+                session=session,
+                child_data=child_data,
+                task_id=task.get("id"),
+            )
+        except Exception:
+            if not generated_summaries:
+                raise
+            logger.exception("Compaction failed; persisted windows remain available")
+            compaction_result = None
         if compaction_result:
             # Annotate with event-enriched info
             compaction_result["event_enriched"] = event_enriched
             compaction_result["event_store_fallback"] = event_store_fallback
             compaction_result["windows_generated"] = windows_generated
             compaction_result["children_compressed"] = children_compressed
+            compaction_result["generated_summaries"] = generated_summaries + [
+                compaction_result.copy()
+            ]
             return compaction_result
 
     # If we only generated tail window(s), return that info
     if tail_window_generated:
         return {
+            "summary_id": generated_summaries[-1]["summary_id"],
+            "risk_indicators": tail_result.get("risk_indicators", []),
+            "summary": tail_result.get("summary", ""),
+            "generated_summaries": generated_summaries,
             "summary_type": "window",
             "intent_alignment": tail_result.get("intent_alignment"),
             "risk_indicators_count": len(tail_result.get("risk_indicators", [])),
@@ -995,8 +1064,9 @@ def run_analysis(
     analysis_type = analysis_type_map.get(triggered_by, "on_demand")
 
     # Fetch session summaries for this user+agent within lookback window
+    direct_coverage: dict[str, Any] = {}
     summaries_by_session = _get_session_summaries_for_analysis(
-        db, user_id, agent_id, lookback_days
+        db, user_id, agent_id, lookback_days, coverage=direct_coverage
     )
 
     if len(summaries_by_session) < 2:
@@ -1015,6 +1085,63 @@ def run_analysis(
         agent_id=agent_id,
         lookback_days=lookback_days,
         summaries_by_session=summaries_by_session,
+    )
+    selected_count = len(summaries_by_session)
+    omitted_sessions = []
+    while len(user_prompt) > _L3_MAX_WINDOW_CHARS - _CONTEXT_OVERHEAD:
+        omitted_sessions.append(next(reversed(summaries_by_session)))
+        summaries_by_session.pop(omitted_sessions[-1])
+        if not summaries_by_session:
+            raise ValueError("No session evidence fits the L3 budget")
+        user_prompt = _build_analysis_prompt(
+            user_id=user_id,
+            agent_id=agent_id,
+            lookback_days=lookback_days,
+            summaries_by_session=summaries_by_session,
+        )
+    cited_sessions = set(summaries_by_session)
+    gaps = direct_coverage.get("missing_session_ids", []) + direct_coverage.get(
+        "stale_session_ids", []
+    )
+    for sid, data in summaries_by_session.items():
+        for child in data.get("children", []):
+            if child.get("summary_ids"):
+                cited_sessions.add(child["session_id"])
+            if child.get("coverage_gap"):
+                gaps.append(child["session_id"])
+        if any(
+            not metadata(s.get("evidence_metadata"))
+            or metadata(s.get("evidence_metadata")).get("prompt_truncated")
+            or metadata(s.get("evidence_metadata")).get("coverage_gaps")
+            for s in data["summaries"]
+        ):
+            gaps.append(sid)
+    evidence_metadata = {
+        "version": VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "actor": agent_id,
+        "lookback_days": lookback_days,
+        "rendered_session_ids": sorted(cited_sessions),
+        "summary_ids": [
+            s["id"] for d in summaries_by_session.values() for s in d["summaries"]
+        ],
+        "coverage_gaps": sorted(set(gaps)),
+        "omitted_session_ids": omitted_sessions,
+        "selection_limit_reached": direct_coverage.get(
+            "selection_limit_reached", selected_count >= _MAX_L3_SESSIONS
+        ),
+        "model": (
+            llm.routing_identity
+            if isinstance(getattr(llm, "routing_identity", None), dict)
+            else None
+        ),
+    }
+    user_prompt += "\nCoverage metadata: " + json.dumps(
+        {
+            "gaps": len(gaps),
+            "omitted_sessions": len(omitted_sessions),
+            "selection_limit_reached": evidence_metadata["selection_limit_reached"],
+        }
     )
 
     # Call the LLM
@@ -1040,7 +1167,11 @@ def run_analysis(
     t0 = time.monotonic()
 
     try:
-        raw_response = llm.generate(
+        raw_response, operation_id = _generate_attributed(
+            llm,
+            operation="l3",
+            session_id=None,
+            task_id=task.get("id"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1069,6 +1200,7 @@ def run_analysis(
 
     # Store the analysis
     analysis_id = str(uuid.uuid4())
+    evidence_metadata["operation_id"] = operation_id
     now = datetime.now(timezone.utc).isoformat()
     session_ids = list(summaries_by_session.keys())
     findings = result.get("findings", [])
@@ -1092,6 +1224,36 @@ def run_analysis(
             )
         if "session_ids" not in finding:
             finding["session_ids"] = []
+
+    validated_findings = []
+    drops = []
+    for index, finding in enumerate(findings):
+        citations = finding.get("session_ids")
+        if (
+            not isinstance(citations, list)
+            or not citations
+            or any(not isinstance(s, str) or s not in cited_sessions for s in citations)
+        ):
+            drops.append(
+                {
+                    "index": index,
+                    "severity": finding["severity"],
+                    "reason": "invalid_or_missing_citations",
+                }
+            )
+        else:
+            validated_findings.append(finding)
+    findings = validated_findings
+    if risk_score >= 7 and not any(f["severity"] >= 7 for f in findings):
+        drops.append({"severity": risk_score, "reason": "ungrounded_elevated_risk"})
+    evidence_metadata["validation_drops"] = drops
+    incomplete = bool(
+        drops
+        or gaps
+        or omitted_sessions
+        or evidence_metadata["selection_limit_reached"]
+    )
+    evidence_metadata["status"] = "incomplete" if incomplete else "validated"
 
     # Normalize recommendations — the LLM may return plain strings
     # instead of {action, priority, rationale} objects in fallback mode.
@@ -1120,8 +1282,8 @@ def run_analysis(
             """
             INSERT INTO behavioral_analyses
                 (id, user_id, agent_id, analysis_type, sessions_scope,
-                 risk_level, findings, recommendations, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 risk_level, findings, recommendations, created_at, evidence_metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 analysis_id,
@@ -1133,19 +1295,27 @@ def run_analysis(
                 json.dumps(findings),
                 json.dumps(recommendations),
                 now,
+                json.dumps(evidence_metadata),
             ),
         )
 
     # Update behavioral profile
-    _update_profile(
-        db,
-        user_id=user_id,
-        agent_id=agent_id,
-        risk_level=risk_score,
-        context_summary=result.get("context_summary", ""),
-        findings=findings,
-        analysis_id=analysis_id,
-    )
+    # An ungrounded or incomplete clean output must not erase actionable history.
+    if not incomplete or any(f["severity"] >= 7 for f in findings):
+        _update_profile(
+            db,
+            user_id=user_id,
+            agent_id=agent_id,
+            risk_level=max([risk_score] + [f["severity"] for f in findings]),
+            context_summary=(
+                "Incomplete evidence; do not infer safety."
+                if incomplete
+                else result.get("context_summary", "")
+            ),
+            findings=findings,
+            analysis_id=analysis_id,
+            preserve_alerts=incomplete,
+        )
 
     logger.info(
         "Cross-session analysis completed: user=%s agent=%s "
@@ -1166,10 +1336,118 @@ def run_analysis(
         "recommendations_count": len(recommendations),
         "sessions_analyzed": len(session_ids),
         "context_summary": result.get("context_summary"),
+        "evidence_metadata": evidence_metadata,
     }
 
 
 # ── Internal helpers ──────────────────────────────────────────────────
+
+
+def _generate_attributed(
+    llm, *, operation, session_id, task_id, operation_key="", **kwargs
+):
+    """Scope the synchronous call, including client repair and retry attempts."""
+    with llm_attribution(
+        operation=operation,
+        session_id=session_id,
+        task_id=task_id,
+        operation_id=(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"intaris:{task_id}:{operation}:{session_id}:{operation_key}",
+            ).hex
+            if task_id
+            else None
+        ),
+    ) as scope:
+        return llm.generate(**kwargs), scope.operation_id
+
+
+def _child_coverage_gaps(children):
+    gaps = [
+        {
+            "session_id": c["session_id"],
+            "missing_or_stale": bool(c.get("coverage_gap")),
+            "compressed": bool(c.get("_compressed")),
+        }
+        for c in children
+        if c.get("coverage_gap") or c.get("_compressed")
+    ]
+    if children:
+        omitted = children[0].get("_total_children", len(children)) - len(children)
+        if omitted > 0:
+            gaps.append({"omitted_children": omitted})
+    return gaps
+
+
+def _read_uncovered_audit(
+    store: Any,
+    progress: SourceProgress,
+    user_id: str,
+    session_id: str,
+    start: str,
+    end: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Only hydrate uncovered source payloads, never evaluation snapshots."""
+    calls, reasoning = [], []
+    for page in store.iter_analytics_revisions(
+        session_id, user_id=user_id, from_ts=start, to_ts=end
+    ):
+        ids = [
+            record["call_id"]
+            for record in page
+            if (
+                progress.call_status(record)[0]
+                if record["record_type"] == "tool_call"
+                else progress.reasoning_uncovered(record)
+            )
+        ]
+        for record in store.get_analytics_payloads(
+            session_id, user_id=user_id, call_ids=ids
+        ):
+            # Use the hydrated revision if a resolution changed during discovery.
+            if record["record_type"] == "tool_call":
+                uncovered, changed = progress.call_status(record)
+                if uncovered:
+                    if changed:
+                        record["_resolution_update"] = True
+                    calls.append(record)
+            elif progress.reasoning_uncovered(record):
+                reasoning.append(record)
+    return calls, reasoning
+
+
+def _window_evidence(calls, reasoning, events, children, observed_at):
+    timestamps = [r.get("timestamp") for r in calls + reasoning] + [
+        e.get("ts") for e in events
+    ]
+    timestamps = sorted(str(t) for t in timestamps if t)
+    return {
+        "version": VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "observed_at": observed_at,
+        "calls": {c["call_id"]: source_revision(c) for c in calls},
+        "reasoning_ids": [r["call_id"] for r in reasoning]
+        + [e["source_call_id"] for e in events if e.get("source_call_id")],
+        "event_seqs": [e["seq"] for e in events if e.get("seq") is not None],
+        "children": children,
+        "dispositions": statistics(calls),
+        "call_dispositions": {
+            c["call_id"]: {
+                "decision": c.get("decision"),
+                "effective_decision": c.get("effective_decision"),
+                "user_decision": c.get("user_decision"),
+                "resolved_at": c.get("resolved_at"),
+            }
+            for c in calls
+        },
+        "resolution_updates": [
+            c["call_id"] for c in calls if c.get("_resolution_update")
+        ],
+        "execution": "unknown",
+        "source_start": timestamps[0] if timestamps else None,
+        "source_end": timestamps[-1] if timestamps else None,
+    }
 
 
 def _get_window_start(
@@ -1293,6 +1571,12 @@ def _store_summary(
         trigger = "manual"
 
     with db.cursor() as cur:
+        if summary_type == "compacted":
+            cur.execute(
+                "DELETE FROM session_summaries WHERE user_id = ? AND session_id = ? "
+                "AND summary_type = 'compacted'",
+                (user_id, session_id),
+            )
         cur.execute(
             """
             INSERT INTO session_summaries
@@ -1300,8 +1584,8 @@ def _store_summary(
                  trigger, summary_type, summary, tools_used,
                  intent_alignment, risk_indicators, call_count,
                  approved_count, denied_count, escalated_count,
-                 created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, evidence_metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary_id,
@@ -1320,6 +1604,9 @@ def _store_summary(
                 stats.get("denied_count", 0),
                 stats.get("escalated_count", 0),
                 now,
+                json.dumps(result.get("evidence_metadata"))
+                if result.get("evidence_metadata")
+                else None,
             ),
         )
 
@@ -1381,8 +1668,13 @@ def _get_child_sessions(
         )
         rows = [dict(row) for row in cur.fetchall()]
 
-    total_children = len(rows)
-    if total_children > _MAX_CHILD_SESSIONS:
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND parent_session_id = ?",
+            (user_id, parent_session_id),
+        )
+        total_children = cur.fetchone()[0]
+    if len(rows) > _MAX_CHILD_SESSIONS:
         rows = rows[:_MAX_CHILD_SESSIONS]
         logger.warning(
             "Parent session %s: safety valve hit (%d children, cap %d)",
@@ -1394,6 +1686,16 @@ def _get_child_sessions(
     # Always attach total count so the LLM knows the full delegation scope
     for row in rows:
         row["_total_children"] = total_children
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(window_end) AS covered FROM session_summaries "
+                "WHERE user_id = ? AND session_id = ? AND summary_type = 'window'",
+                (user_id, row["session_id"]),
+            )
+            coverage = cur.fetchone()["covered"]
+        row["summary_stale"] = not coverage or str(coverage) < str(
+            row.get("last_activity_at") or ""
+        )
 
     return rows
 
@@ -1418,6 +1720,7 @@ def _collect_child_data(
         child_sid = child["session_id"]
         entry: dict[str, Any] = {
             "session_id": child_sid,
+            "agent_id": child.get("agent_id"),
             "intention": child.get("intention", ""),
             "status": child.get("status", "unknown"),
             "total_calls": child.get("total_calls", 0),
@@ -1426,83 +1729,29 @@ def _collect_child_data(
             "escalated_count": child.get("escalated_count", 0),
             "created_at": child.get("created_at", ""),
             "last_activity_at": child.get("last_activity_at", ""),
+            "_total_children": child.get("_total_children", len(children)),
         }
 
-        # Try to get the best summary
         with db.cursor() as cur:
-            # First try compacted
             cur.execute(
-                """
-                SELECT summary, intent_alignment, risk_indicators,
-                       tools_used
-                FROM session_summaries
-                WHERE user_id = ? AND session_id = ?
-                  AND summary_type = 'compacted'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
+                "SELECT * FROM session_summaries WHERE user_id = ? AND session_id = ? "
+                "ORDER BY created_at, id",
                 (user_id, child_sid),
             )
-            row = cur.fetchone()
-
-            if row:
-                entry["summary_source"] = "compacted"
-                summary_text = row["summary"] or ""
-                entry["summary"] = _apply_safety_valve(
-                    summary_text,
-                    _MAX_SUMMARY_CHARS,
-                    label="child_summary",
-                )
-                entry["intent_alignment"] = row["intent_alignment"]
-                ri = row["risk_indicators"]
-                if ri and isinstance(ri, str):
-                    try:
-                        ri = json.loads(ri)
-                    except (json.JSONDecodeError, TypeError):
-                        ri = []
-                entry["risk_indicators"] = ri or []
-            else:
-                # Try latest window summary
-                cur.execute(
-                    """
-                    SELECT summary, intent_alignment, risk_indicators,
-                           tools_used
-                    FROM session_summaries
-                    WHERE user_id = ? AND session_id = ?
-                      AND summary_type = 'window'
-                    ORDER BY window_end DESC
-                    LIMIT 1
-                    """,
-                    (user_id, child_sid),
-                )
-                row = cur.fetchone()
-
-                if row:
-                    entry["summary_source"] = "window"
-                    summary_text = row["summary"] or ""
-                    entry["summary"] = _apply_safety_valve(
-                        summary_text,
-                        _MAX_SUMMARY_CHARS,
-                        label="child_summary",
-                    )
-                    entry["intent_alignment"] = row["intent_alignment"]
-                    ri = row["risk_indicators"]
-                    if ri and isinstance(ri, str):
-                        try:
-                            ri = json.loads(ri)
-                        except (json.JSONDecodeError, TypeError):
-                            ri = []
-                    entry["risk_indicators"] = ri or []
-                else:
-                    # No summary available — exclude this child entirely.
-                    # Only properly analyzed children are included.
-                    logger.debug(
-                        "Child session %s has no summary, excluding "
-                        "from parent analysis",
-                        child_sid,
-                    )
-                    continue  # Skip — don't append to child_data
-
+            selected = select_summaries([dict(r) for r in cur.fetchall()])
+        entry["summary_ids"] = [r["id"] for r in selected]
+        entry["coverage_gap"] = bool(child.get("summary_stale")) or not selected
+        entry["summary_source"] = "compaction_and_uncovered_windows"
+        entry["summary"] = "\n".join(r["summary"] for r in selected)
+        entry["intent_alignment"] = _worst_alignment(
+            [r["intent_alignment"] for r in selected]
+        )
+        entry["risk_indicators"] = []
+        for selected_row in selected:
+            indicators = selected_row.get("risk_indicators")
+            if isinstance(indicators, str):
+                indicators = json.loads(indicators)
+            entry["risk_indicators"].extend(indicators or [])
         child_data.append(entry)
 
     return child_data
@@ -1584,12 +1833,36 @@ def _budget_child_sessions(
     return sorted_children, full_count, compressed_count
 
 
+def _verified_event_prefix(db, user_id, session_id, read_prefix, current_entries):
+    """Intersect successfully read evidence with completed, untruncated windows."""
+    represented = {e.get("seq") for e in current_entries}
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT evidence_metadata FROM session_summaries WHERE user_id = ? "
+            "AND session_id = ? AND summary_type = 'window'",
+            (user_id, session_id),
+        )
+        for row in cur.fetchall():
+            evidence = metadata(row["evidence_metadata"])
+            if evidence.get("version") == VERSION and not evidence.get(
+                "prompt_truncated"
+            ):
+                represented.update(evidence.get("event_seqs", []))
+    prefix = 0
+    while prefix < read_prefix and prefix + 1 in represented:
+        prefix += 1
+    return prefix
+
+
 def _get_session_events(
     event_store: Any,
     user_id: str,
     session_id: str,
     after_ts: str | None,
     before_ts: str | None,
+    *,
+    coverage: dict[str, Any] | None = None,
+    progress: SourceProgress | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch and process session events for L2 analysis enrichment.
 
@@ -1598,7 +1871,10 @@ def _get_session_events(
     last by seq per part.id), extracts assistant text and user messages, and
     returns a sorted list of conversation entries.
 
-    Returns an empty list on any failure (M5 fix — graceful fallback).
+    Returns an empty list on failure. Optional coverage distinguishes failure
+    from an empty filtered read. Only a contiguous represented prefix starting
+    at sequence 1 can be certified; filtered-out or deduplicated sequences are
+    conservatively gaps, never inferred from the session's high-water mark.
 
     Args:
         event_store: EventStore instance (or None).
@@ -1611,18 +1887,75 @@ def _get_session_events(
         List of conversation entries (``{ts, role, text, seq}`` dicts
         sorted by seq).
     """
+    if coverage is not None:
+        coverage.update(status="unavailable", represented_prefix=0)
     if event_store is None:
         return []
 
+    # Keep only uncovered payloads and the latest streaming part per identity.
+    # Covered events still participate in read/prefix certification by identity.
+    raw_seqs: set[int] = set()
+    covered_entries: set[int] = set()
+    retained: dict[int, dict] = {}
+    latest_parts: dict[str, int] = {}
     try:
-        raw_events = event_store.read(
-            user_id,
-            session_id,
-            event_types={"part", "message", "user_message", "assistant_message"},
-            after_ts=after_ts,
-            before_ts=before_ts,
-        )
+        cursor = 0
+        while True:
+            page = event_store.read(
+                user_id,
+                session_id,
+                after_seq=cursor,
+                limit=128,
+                event_types={"part", "message", "user_message", "assistant_message"},
+                after_ts=after_ts,
+                before_ts=before_ts,
+            )
+            for event in page:
+                seq = event.get("seq", 0)
+                raw_seqs.add(seq)
+                data = event.get("data") or {}
+                kind = event.get("type")
+                content = None
+                if kind == "part":
+                    part = data.get("part") or {}
+                    if part.get("type") != "text":
+                        continue
+                    part_id = part.get("id")
+                    if part_id:
+                        previous = latest_parts.get(part_id)
+                        if previous is not None:
+                            retained.pop(previous, None)
+                            covered_entries.discard(previous)
+                        latest_parts[part_id] = seq
+                    content = part.get("text", "")
+                elif kind == "user_message" or (
+                    kind == "message" and data.get("role") == "user"
+                ):
+                    content = data.get("content") or data.get("text", "")
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            p.get("text", "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                elif kind == "assistant_message":
+                    content = data.get("content", "")
+                if not content:
+                    continue
+                if progress is not None and not progress.event_uncovered(event):
+                    covered_entries.add(seq)
+                else:
+                    retained[seq] = event
+            if len(page) < 128:
+                break
+            next_cursor = page[-1]["seq"]
+            if next_cursor <= cursor:
+                raise ValueError("Event pagination did not advance")
+            cursor = next_cursor
+        raw_events = list(retained.values())
     except Exception:
+        if coverage is not None:
+            coverage["status"] = "failed"
         logger.warning(
             "Event store read failed for %s/%s, falling back to audit_log",
             user_id,
@@ -1631,7 +1964,9 @@ def _get_session_events(
         )
         return []
 
-    if not raw_events:
+    if coverage is not None:
+        coverage["status"] = "read"
+    if not raw_seqs:
         return []
 
     from intaris.sanitize import sanitize_for_prompt
@@ -1688,6 +2023,8 @@ def _get_session_events(
     conversation: list[dict[str, Any]] = []
 
     # User messages from event store
+    from intaris.events.resolve import _is_intention_eligible
+
     for event in user_events:
         data = event.get("data") or {}
         content = data.get("content") or data.get("text", "")
@@ -1707,6 +2044,7 @@ def _get_session_events(
                 "role": "user",
                 "text": content,
                 "seq": event.get("seq", 0),
+                "intention_eligible": _is_intention_eligible(event.get("type"), data),
             }
         )
 
@@ -1751,6 +2089,18 @@ def _get_session_events(
     # Sort by seq (primary ordering key)
     conversation.sort(key=lambda e: e["seq"])
 
+    if coverage is not None:
+        # The filtered API does not certify skipped source records. In
+        # particular, a successful empty read is not a verified event prefix.
+        represented = {e["seq"] for e in conversation} | covered_entries
+        prefix = 0
+        if after_ts is None:
+            while prefix + 1 in represented:
+                prefix += 1
+        coverage["represented_prefix"] = prefix
+        coverage["returned_events"] = len(raw_seqs)
+        coverage["represented_entries"] = len(represented)
+        coverage["unrepresented_events"] = len(raw_seqs - represented)
     return conversation
 
 
@@ -2155,7 +2505,12 @@ def _build_conversation_section(
         )
 
         if role == "user":
-            line = f'[{ts}] USER: "{text}"'
+            label = (
+                "USER"
+                if entry.get("intention_eligible", True)
+                else "CONTEXT (not intention-eligible)"
+            )
+            line = f'[{ts}] {label}: "{text}"'
         elif role == "assistant":
             # C1 fix: wrap assistant text in boundary tags
             line = f"[{ts}] ASSISTANT: \u27e8assistant_text\u27e9{text}\u27e8/assistant_text\u27e9"
@@ -2189,6 +2544,17 @@ def _compress_tool_calls(tool_calls: list[dict[str, Any]]) -> list[str]:
             parts = [f"{tool}({n}x)" for tool, n in by_tool.items()]
             ts = pending_reads[0].get("timestamp", "")[:19]
             lines.append(f"[{ts}] Approved reads: {', '.join(parts)}")
+            targets = sorted(
+                {
+                    _summarize_args(r.get("args_redacted"), classification="read")
+                    for r in pending_reads
+                }
+            )
+            lines[-1] += (
+                "; "
+                f"Read targets (redacted): {'; '.join(targets[:16])}; "
+                f"omitted target groups={max(0, len(targets) - 16)}"
+            )
         pending_reads.clear()
 
     for tc in tool_calls:
@@ -2196,7 +2562,12 @@ def _compress_tool_calls(tool_calls: list[dict[str, Any]]) -> list[str]:
         classification = tc.get("classification", "")
 
         # Writes, denies, escalations — always verbatim
-        if decision != "approve" or classification != "read":
+        if (
+            decision != "approve"
+            or classification != "read"
+            or tc.get("user_decision")
+            or _scan_content_flags(tc.get("args_redacted"))
+        ):
             flush_reads()
             lines.append(_format_tool_call(tc))
         else:
@@ -2222,10 +2593,14 @@ def _format_tool_call(tc: dict[str, Any]) -> str:
     reasoning = tc.get("reasoning", "")
     classification = tc.get("classification", "write")
 
-    # Show user resolution for escalations
+    # A resolution is not a new instruction or proof of execution.
     user_decision = tc.get("user_decision")
-    if decision == "escalate" and user_decision:
-        decision = f"escalate→user:{user_decision}"
+    if user_decision:
+        decision = (
+            f"{decision}→{tc.get('resolved_by') or 'unknown'}:{user_decision}"
+            f" [scope={tc.get('resolution_scope') or 'unknown'};"
+            f" resolved_at={tc.get('resolved_at') or 'unknown'}]"
+        )
 
     # Classification-aware args summary
     args_brief = _summarize_args(tc.get("args_redacted"), classification=classification)
@@ -2238,6 +2613,9 @@ def _format_tool_call(tc: dict[str, Any]) -> str:
     )
 
     line = f'[{ts}] {tool}({args_brief}) -> {decision}{risk_str} "{reasoning_brief}"'
+    line += f" [proposal={tc.get('call_id', 'unavailable')}; execution=unknown]"
+    if tc.get("_resolution_update"):
+        line += " [resolution update to an earlier proposal; not a new attempt]"
     if tc.get("maximum_outcome") is not None:
         line += (
             f" [raw={tc.get('raw_decision')}; "
@@ -2262,7 +2640,9 @@ def _format_tool_call(tc: dict[str, Any]) -> str:
         # Collapse newlines/carriage returns for line-oriented format
         safe_note = user_note.replace("\r", " ").replace("\n", " ").strip()
         note_brief = _apply_safety_valve(safe_note, _USER_NOTE_LIMIT, label="user_note")
-        line += f' [user: "{note_brief}"]'
+        line += (
+            f' [resolution note ({tc.get("resolved_by") or "unknown"}): "{note_brief}"]'
+        )
 
     return line
 
@@ -2380,13 +2760,9 @@ def _build_summary_prompt(
     elif user_messages:
         # No hard cap — all messages included, budget handled by partitioner.
         parts.append("== User Messages ==")
-        for msg in user_messages:
-            ts = (msg.get("timestamp") or "")[:19]
-            content = msg.get("content", "")
-            # Strip "User message:" prefix
-            if content.startswith("User message:"):
-                content = content[len("User message:") :].strip()
-            parts.append(f'[{ts}] "{content}"')
+        parts.append(
+            _build_conversation_section([message_from_audit(m) for m in user_messages])
+        )
         parts.append("")
 
     # Tool calls (compressed — reads batched, writes/denies/escalations verbatim)
@@ -2426,6 +2802,9 @@ def _build_summary_prompt(
     unique_tools = sorted({tc.get("tool", "unknown") for tc in tool_calls})
 
     parts.append("== Window Statistics ==")
+    parts.append(
+        "Known dispositions (not execution): " + json.dumps(statistics(tool_calls))
+    )
     parts.append(
         f"Total calls: {len(tool_calls)}, "
         f"Approved: {approved}, Denied: {denied}, Escalated: {escalated}"
@@ -2489,7 +2868,10 @@ def _append_child_section(
         status = child.get("status", "unknown")
         is_compressed = child.get("_compressed", False)
 
-        if source in ("compacted", "window"):
+        parts.append(
+            f"Actor: {child.get('agent_id')} | Coverage gap: {child.get('coverage_gap', False)}"
+        )
+        if source in ("compacted", "window", "compaction_and_uncovered_windows"):
             if is_compressed:
                 # Compressed format: shorter summary, indicator names only
                 label = "compressed"
@@ -2581,6 +2963,7 @@ def _generate_compaction(
     session_id: str,
     session: dict[str, Any],
     child_data: list[dict[str, Any]],
+    task_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Generate a compacted summary from all window summaries.
 
@@ -2597,11 +2980,11 @@ def _generate_compaction(
             """
             SELECT id, summary, intent_alignment, risk_indicators,
                    tools_used, call_count, approved_count, denied_count,
-                   escalated_count, window_start, window_end, trigger
+                   escalated_count, window_start, window_end, trigger, evidence_metadata
             FROM session_summaries
             WHERE user_id = ? AND session_id = ?
               AND summary_type = 'window'
-            ORDER BY window_start ASC
+            ORDER BY created_at ASC, id ASC
             """,
             (user_id, session_id),
         )
@@ -2609,6 +2992,21 @@ def _generate_compaction(
 
     if len(window_rows) <= 1:
         return None  # No compaction needed
+
+    child_refs = {c["session_id"]: c.get("summary_ids", []) for c in child_data}
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT evidence_metadata FROM session_summaries WHERE user_id = ? "
+            "AND session_id = ? AND summary_type = 'compacted'",
+            (user_id, session_id),
+        )
+        previous = cur.fetchone()
+    previous_evidence = metadata(previous["evidence_metadata"] if previous else None)
+    if (
+        set(previous_evidence.get("window_ids", [])) == {r["id"] for r in window_rows}
+        and previous_evidence.get("children", {}) == child_refs
+    ):
+        return None
 
     # Parse JSON fields in window rows
     for row in window_rows:
@@ -2637,7 +3035,9 @@ def _generate_compaction(
         child_sessions=child_data,
         session=session,
     )
-    user_prompt = _apply_prompt_budget(user_prompt, label="compaction_prompt")
+    bounded_prompt = _apply_prompt_budget(user_prompt, label="compaction_prompt")
+    if bounded_prompt != user_prompt:
+        raise ValueError("Compaction evidence exceeds prompt budget")
 
     from intaris.llm import parse_json_response
     from intaris.prompts_analysis import (
@@ -2652,7 +3052,12 @@ def _generate_compaction(
     )
 
     try:
-        raw_response = llm.generate(
+        raw_response, operation_id = _generate_attributed(
+            llm,
+            operation="compaction",
+            session_id=session_id,
+            task_id=task_id,
+            operation_key=",".join(r["id"] for r in window_rows),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -2671,24 +3076,6 @@ def _generate_compaction(
         )
         raise
 
-    # Supersede: delete any existing compacted summary
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM session_summaries
-            WHERE user_id = ? AND session_id = ?
-              AND summary_type = 'compacted'
-            """,
-            (user_id, session_id),
-        )
-        deleted = cur.rowcount
-    if deleted:
-        logger.info(
-            "Compaction supersede: deleted %d old compacted summary for session %s",
-            deleted,
-            session_id,
-        )
-
     # Aggregate stats across all windows
     total_calls = sum(r.get("call_count", 0) for r in window_rows)
     total_approved = sum(r.get("approved_count", 0) for r in window_rows)
@@ -2702,9 +3089,33 @@ def _generate_compaction(
         "escalated_count": total_escalated,
     }
 
-    # Window range: session start to now
-    window_start = session.get("created_at", datetime.now(timezone.utc).isoformat())
-    window_end = datetime.now(timezone.utc).isoformat()
+    # Bounds describe the selected sources, never wall-clock completion.
+    window_start = min(
+        metadata(r.get("evidence_metadata")).get("source_start") or r["window_start"]
+        for r in window_rows
+    )
+    window_end = max(
+        metadata(r.get("evidence_metadata")).get("source_end") or r["window_end"]
+        for r in window_rows
+    )
+    result["evidence_metadata"] = {
+        "version": VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "window_ids": [r["id"] for r in window_rows],
+        "coverage_gaps": _child_coverage_gaps(child_data)
+        + [
+            {"summary_id": r["id"], "coverage": "unknown_or_incomplete"}
+            for r in window_rows
+            if not metadata(r.get("evidence_metadata"))
+            or metadata(r.get("evidence_metadata")).get("prompt_truncated")
+            or metadata(r.get("evidence_metadata")).get("coverage_gaps")
+        ],
+        "operation_id": operation_id,
+        **aggregate_dispositions(window_rows),
+        "children": {c["session_id"]: c.get("summary_ids", []) for c in child_data},
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "execution": "unknown",
+    }
 
     summary_id = _store_summary(
         db,
@@ -2738,6 +3149,8 @@ def _generate_compaction(
     return {
         "summary_id": summary_id,
         "summary_type": "compacted",
+        "risk_indicators": result.get("risk_indicators", []),
+        "summary": result.get("summary", ""),
         "intent_alignment": result.get("intent_alignment"),
         "risk_indicators_count": len(result.get("risk_indicators", [])),
         "call_count": total_calls,
@@ -2790,6 +3203,14 @@ def _build_compaction_prompt(
     # ── Cross-window aggregates (architect recommendation) ────────
     # Surfaces cumulative patterns invisible at the per-window level.
     parts.append("== Cross-Window Aggregates ==")
+    aggregate = aggregate_dispositions(window_summaries)
+    parts.append(
+        "Known final dispositions (not execution): "
+        + json.dumps(aggregate["dispositions"])
+    )
+    parts.append(
+        f"Windows with unknown final statistics: {aggregate['unknown_statistics_windows']}"
+    )
     agg_calls = sum(ws.get("call_count", 0) for ws in window_summaries)
     agg_denied = sum(ws.get("denied_count", 0) for ws in window_summaries)
     agg_escalated = sum(ws.get("escalated_count", 0) for ws in window_summaries)
@@ -2876,6 +3297,8 @@ def _get_session_summaries_for_analysis(
     user_id: str,
     agent_id: str | None,
     lookback_days: int,
+    *,
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Fetch session summaries grouped by session for L3 analysis.
 
@@ -2896,10 +3319,9 @@ def _get_session_summaries_for_analysis(
                 SELECT s.session_id, s.intention, s.status, s.total_calls,
                        s.approved_count, s.denied_count, s.escalated_count,
                        s.created_at, s.last_activity_at, s.agent_id,
-                       s.intention_source
+                       s.intention_source, s.parent_session_id, s.last_event_seq
                 FROM sessions s
                 WHERE s.user_id = ? AND COALESCE(s.agent_id, '') = ?
-                  AND s.parent_session_id IS NULL
                   AND s.last_activity_at >= ?
                 ORDER BY s.last_activity_at DESC
                 LIMIT ?
@@ -2912,10 +3334,9 @@ def _get_session_summaries_for_analysis(
                 SELECT s.session_id, s.intention, s.status, s.total_calls,
                        s.approved_count, s.denied_count, s.escalated_count,
                        s.created_at, s.last_activity_at, s.agent_id,
-                       s.intention_source
+                       s.intention_source, s.parent_session_id, s.last_event_seq
                 FROM sessions s
                 WHERE s.user_id = ?
-                  AND s.parent_session_id IS NULL
                   AND s.last_activity_at >= ?
                 ORDER BY s.last_activity_at DESC
                 LIMIT ?
@@ -2923,6 +3344,12 @@ def _get_session_summaries_for_analysis(
                 (user_id, cutoff, _MAX_L3_SESSIONS),
             )
         sessions = [dict(row) for row in cur.fetchall()]
+    if coverage is not None:
+        coverage.update(
+            missing_session_ids=[],
+            stale_session_ids=[],
+            selection_limit_reached=len(sessions) >= _MAX_L3_SESSIONS,
+        )
 
     if not sessions:
         return {}
@@ -2934,24 +3361,15 @@ def _get_session_summaries_for_analysis(
     with db.cursor() as cur:
         cur.execute(
             f"""
-            SELECT session_id, summary_type, summary, intent_alignment,
+            SELECT id, created_at, evidence_metadata, session_id, summary_type, summary, intent_alignment,
                    risk_indicators, tools_used, call_count, approved_count,
                    denied_count, escalated_count, window_start, window_end,
                    trigger
             FROM session_summaries AS selected
             WHERE user_id = ? AND session_id IN ({placeholders})
-              AND (
-                  summary_type = 'compacted'
-                  OR session_id NOT IN (
-                      SELECT session_id FROM session_summaries
-                      WHERE user_id = ?
-                        AND session_id IN ({placeholders})
-                        AND summary_type = 'compacted'
-                  )
-              )
             ORDER BY window_start ASC
             """,
-            [user_id] + session_ids + [user_id] + session_ids,
+            [user_id] + session_ids,
         )
         summary_rows = [dict(row) for row in cur.fetchall()]
 
@@ -2973,24 +3391,52 @@ def _get_session_summaries_for_analysis(
     # For each session, prefer compacted summary if available
     summaries_by_session: dict[str, list[dict[str, Any]]] = {}
     for sid, rows in raw_by_session.items():
-        compacted = [r for r in rows if r.get("summary_type") == "compacted"]
-        if compacted:
-            # Use the compacted summary (should be exactly one)
-            summaries_by_session[sid] = compacted
-        else:
-            # Fall back to window summaries
-            summaries_by_session[sid] = [
-                r for r in rows if r.get("summary_type") != "compacted"
-            ]
+        summaries_by_session[sid] = select_summaries(rows)
 
     # Build result: only sessions that have summaries
     result: dict[str, dict[str, Any]] = {}
     for sess in sessions:
         sid = sess["session_id"]
+        if coverage is not None:
+            if sid not in summaries_by_session:
+                coverage["missing_session_ids"].append(sid)
+            else:
+                from intaris.audit import AuditStore
+
+                progress = SourceProgress.load(db, user_id, sid)
+                uncovered = False
+                for page in AuditStore(db).iter_analytics_revisions(
+                    sid,
+                    user_id=user_id,
+                    from_ts=sess["created_at"],
+                    to_ts=datetime.now(timezone.utc).isoformat(),
+                ):
+                    uncovered = any(
+                        progress.call_status(r)[0]
+                        if r["record_type"] == "tool_call"
+                        else progress.reasoning_uncovered(r)
+                        for r in page
+                    )
+                    if uncovered:
+                        break
+                observed_event_seq = max(
+                    [0]
+                    + [
+                        metadata(r.get("evidence_metadata")).get(
+                            "event_snapshot_seq", 0
+                        )
+                        for r in raw_by_session[sid]
+                    ]
+                )
+                if uncovered or (sess.get("last_event_seq") or 0) > observed_event_seq:
+                    coverage["stale_session_ids"].append(sid)
         if sid in summaries_by_session:
             result[sid] = {
                 "session": sess,
                 "summaries": summaries_by_session[sid],
+                "children": _collect_child_data(
+                    db, user_id, _get_child_sessions(db, user_id, sid)
+                ),
             }
 
     return result
@@ -3060,6 +3506,16 @@ def _build_analysis_prompt(
             parts.append(
                 f"\nSession {sid} ({created} -> {last_active_brief}, status: {status}):"
             )
+            parts.append(
+                f"  Direct actor: {sess.get('agent_id')}; parent context: {sess.get('parent_session_id')}"
+            )
+            # Delegated context is separate from this actor's own statistics.
+            for child in data.get("children", []):
+                parts.append(
+                    f"  Delegated context session {child['session_id']}, "
+                    f"actor={child.get('agent_id')}, coverage_gap={child.get('coverage_gap')}: "
+                    f"{child.get('summary', '')}"
+                )
             parts.append(f'  Intention: "{intention}"')
             parts.append(
                 f"  Stats: {sess.get('total_calls', 0)} calls "
@@ -3175,7 +3631,9 @@ def _build_analysis_prompt(
 
 
 def _worst_alignment(alignments: list[str]) -> str:
-    """Return the worst alignment from a list."""
+    """Return the worst alignment, or unknown when no evidence exists."""
+    if not alignments:
+        return "unclear"
     priority = {"misaligned": 0, "unclear": 1, "partially_aligned": 2, "aligned": 3}
     worst = min(alignments, key=lambda a: priority.get(a, 1))
     return worst
@@ -3190,6 +3648,7 @@ def _update_profile(
     context_summary: str,
     findings: list[dict[str, Any]],
     analysis_id: str,
+    preserve_alerts: bool = False,
 ) -> None:
     """Update (or create) the behavioral profile for a user+agent.
 
@@ -3200,8 +3659,26 @@ def _update_profile(
 
     # Extract active alerts from elevated+ findings (severity >= 7)
     active_alerts = [
-        f for f in findings if coerce_risk_score(f.get("severity", 1)) >= 7
+        {**f, "analysis_id": analysis_id, "observed_at": now}
+        for f in findings
+        if coerce_risk_score(f.get("severity", 1)) >= 7
     ]
+    if preserve_alerts:
+        # An incomplete refresh may add valid concerns, but cannot clear prior
+        # validated concerns. Their original dates prevent extending influence.
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT active_alerts FROM behavioral_profiles WHERE user_id = ? AND agent_id = ?",
+                (user_id, agent_id or ""),
+            )
+            prior = cur.fetchone()
+        prior_alerts = json.loads(prior["active_alerts"] or "[]") if prior else []
+        active_alerts += [
+            a for a in prior_alerts if a.get("observed_at") and a.get("analysis_id")
+        ]
+        risk_level = max(
+            [1] + [coerce_risk_score(a.get("severity", 1)) for a in active_alerts]
+        )
 
     # Atomic upsert — avoids TOCTOU race on PostgreSQL where
     # concurrent analysis tasks for the same (user_id, agent_id)

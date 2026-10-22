@@ -50,7 +50,12 @@ def test_admitted_spawn_then_exact_cleanup_with_real_capability(api, review_clea
         json={
             "session_id": scope.session_id,
             "intention": "Use a temporary helper to inspect the task",
-            "policy": {"evaluation_policy_version": "hybrid_v1", "profile": "balanced"},
+            "policy": {
+                "evaluation_policy_version": "hybrid_v1",
+                # Fact-first balanced routing tolerates unresolved restriction
+                # opinions; strict retains the independent-review branch.
+                "profile": "strict" if review_cleanup else "balanced",
+            },
         },
     )
     assert response.status_code == 200, response.text

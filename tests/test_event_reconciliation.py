@@ -78,6 +78,7 @@ def test_upgrade_reconciles_historical_user_message_state(tmp_path):
         source="legacy-service",
     ) == [1, 2]
     historical_store.flush_all()
+    historical_store.close()
 
     upgraded_db = Database(DBConfig(path=str(db_path)))
     sessions = SessionStore(upgraded_db)
@@ -119,6 +120,7 @@ def test_upgrade_reconciles_historical_user_message_state(tmp_path):
 
     restarted_db = Database(DBConfig(path=str(db_path)))
     restarted_sessions = SessionStore(restarted_db)
+    startup_store.close()
     restarted_store = EventStore(event_config)
     restarted_store.set_session_store(restarted_sessions)
     assert restarted_store.reconcile_session_user_message_state() == 2

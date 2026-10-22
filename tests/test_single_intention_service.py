@@ -92,7 +92,8 @@ def test_confirmation_proof_through_app_and_l1_lines(service, form):
     _, state, _ = specimen("inbox-inspection-only")
     rendered = l1_projection.render(artifact, state, {})
     assert "Approved action:" not in rendered
-    assert action not in rendered
+    assert action in rendered
+    assert "linked_non_authorizing_context" in rendered
     if form == "single_permission":
         assert value["quote"] == "yes"
         assert value["kind"] == "approval"

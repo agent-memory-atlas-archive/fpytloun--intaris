@@ -141,7 +141,9 @@ def valid_answer(schema: dict) -> dict:
     """Shape-only local answer; never used as evidence of model correctness."""
     return {
         key: (
-            [prop["items"]["enum"][0]] if prop["type"] == "array" else prop["enum"][0]
+            [prop["items"]["enum"][0]]
+            if prop["type"] == "array"
+            else prop.get("enum", [""])[0]
         )
         for key, prop in schema["properties"].items()
     }

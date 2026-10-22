@@ -474,6 +474,8 @@ class TestGenerateIntention:
             enabled=True,
             backend="filesystem",
             filesystem_path=str(tmp_path / "events"),
+            # Independent clients cannot share a local single-writer spool.
+            spool_path=str(tmp_path / "other-spool"),
             flush_size=1,
             flush_interval=30,
         )
@@ -512,6 +514,8 @@ class TestGenerateIntention:
         session = session_store.get("sess-1", user_id="user-1")
         assert session["intention"] == "Initial"
         assert session["latest_user_message_seq"] > source_seq
+        other_store.close()
+        other_db.close()
 
     def test_later_eligible_message_wins_after_stale_cas(
         self, db, session_store, event_store

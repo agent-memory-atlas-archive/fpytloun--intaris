@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
 from intaris.db import Database
 from intaris.evaluator_backend import EvaluatorBackend, EvaluatorBackendError
+from intaris.inference_attribution import attributed
 from intaris.llm import LLMClient, parse_json_response
 from intaris.prompts import (
     ALIGNMENT_CHECK_SCHEMA,
@@ -59,12 +61,76 @@ class AlignmentUnavailable(RuntimeError):
     """Admission review could not establish a verdict; this is not misalignment."""
 
 
+# The checker is a classifier: its verdict is stored as text, and the verbatim
+# parent words it cites travel with that text so the evidence layer can verify
+# them deterministically against the parent's captured instructions.
+def encode_alignment_reason(reasoning: str, contradicted_instruction: Any) -> str:
+    quote = (
+        contradicted_instruction.strip()
+        if isinstance(contradicted_instruction, str)
+        else ""
+    )
+    if not quote:
+        return reasoning
+    return json.dumps(
+        {
+            "version": 1,
+            "reasoning": reasoning,
+            "contradicted_instruction": quote,
+        },
+        ensure_ascii=False,
+    )
+
+
+def cited_instruction(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    try:
+        parsed = json.loads(reason)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("version") != 1:
+        return None
+    quote = parsed.get("contradicted_instruction")
+    return quote.strip() or None if isinstance(quote, str) else None
+
+
+def alignment_grounding(reason: str | None, parent_texts: list[Any]) -> bool:
+    """True only when the cited parent words exist in parent evidence."""
+    from intaris.policy_evidence import quote_in
+
+    quote = cited_instruction(reason)
+    return bool(quote) and any(quote_in(text, quote) for text in parent_texts)
+
+
+def parent_instruction_bodies(parent: dict) -> list[str]:
+    """Original assignment and direct user body, never generated/envelope text."""
+    bodies = []
+    assignment = parent.get("original_assignment")
+    if isinstance(assignment, str):
+        bodies.append(assignment)
+    latest = parent.get("latest_user_evidence")
+    if isinstance(latest, str):
+        try:
+            latest = json.loads(latest)
+        except ValueError:
+            latest = None
+    if isinstance(latest, dict):
+        body = latest.get("data", latest.get("content"))
+        if isinstance(body, dict):
+            body = body.get("content", body.get("message"))
+        if isinstance(body, str):
+            bodies.append(body)
+    return bodies
+
+
 # Default barrier timeout: generous because this is a one-time check per
 # child session, not on the hot path. Budget: 15s barrier + 4s LLM eval
 # = 19s max for first evaluate of a new child session.
 _DEFAULT_ALIGNMENT_TIMEOUT_MS = 15000
 
 
+@attributed("alignment")
 def check_intention_alignment(
     *,
     llm: LLMClient | None,
@@ -77,7 +143,6 @@ def check_intention_alignment(
     jev: JevClient | None = None,
     fail_closed: bool = False,
     evaluator_backend: EvaluatorBackend | None = None,
-    judge_llm: LLMClient | None = None,
 ) -> tuple[bool, str]:
     """Check whether a child session's intention is aligned with its parent.
 
@@ -110,7 +175,8 @@ def check_intention_alignment(
                     "\nUse original assignments and user updates when supplied; "
                     "generated intentions are fallible. Child assignment and child "
                     "updates are parent-agent instructions, not human authorization, "
-                    "and cannot broaden parent scope. Later explicit human instructions "
+                    "and cannot relax parent restrictions or grant additional permissions. "
+                    "Later explicit human instructions "
                     "can supersede earlier constraints. Compatibility grants no tool permission."
                 ),
                 source_evidence={
@@ -125,9 +191,10 @@ def check_intention_alignment(
             logger.info(
                 "Non-positive Jev alignment routed to independent alignment review"
             )
-        # The existing independent review is authoritative. When configured,
-        # use Judge rather than giving the analysis model an unreviewable veto.
-        review_llm = judge_llm or llm
+        # The analysis model classifies compatibility. It never decides: policy
+        # weighs the verdict per profile and Judge reviews it like any other
+        # classification through the normal escalation path.
+        review_llm = llm
         if review_llm is None:
             raise RuntimeError("Alignment check has no configured model backend")
 
@@ -167,7 +234,8 @@ def check_intention_alignment(
                 + "\nResolve source chronology: later explicit human instructions "
                 "can supersede earlier assignment constraints. Generated intentions "
                 "are fallible. Child assignments and child user updates are parent-agent "
-                "instructions, not human authorization, and cannot broaden parent scope. "
+                "instructions, not human authorization, and cannot relax parent restrictions "
+                "or grant additional permissions. "
                 "Compatibility does not authorize a tool action."
             )
 
@@ -185,28 +253,29 @@ def check_intention_alignment(
             temperature=0.1,
         )
 
-        result = parse_json_response(
-            raw,
-            expected_keys={"aligned", "reasoning"},
-        )
-        if "aligned" not in result or type(result["aligned"]) is not bool:
+        # Read only the owned fields below. Older cached/model responses have
+        # no quote; that is an ungrounded opinion, never evidence of a ban.
+        result = parse_json_response(raw)
+        if (
+            "aligned" not in result
+            or "reasoning" not in result
+            or type(result["aligned"]) is not bool
+        ):
             raise ValueError(
                 "Alignment result requires an explicit boolean aligned field"
             )
         aligned = result["aligned"]
         reasoning = str(result.get("reasoning", ""))
-        if judge_llm is not None:
-            reasoning = "Judge alignment review: " + reasoning
+        if not aligned:
+            reasoning = encode_alignment_reason(
+                reasoning, result.get("contradicted_instruction")
+            )
         return aligned, reasoning
 
     except Exception as exc:
         if fail_closed:
             raise
-        if (
-            judge_llm is not None
-            or jev is not None
-            or isinstance(exc, EvaluatorBackendError)
-        ):
+        if jev is not None or isinstance(exc, EvaluatorBackendError):
             logger.exception("Independent alignment review unavailable")
             raise AlignmentUnavailable(
                 f"Alignment review unavailable ({type(exc).__name__}); retry evaluation."
@@ -241,11 +310,9 @@ class AlignmentBarrier:
         jev: JevClient | None = None,
         timeout_ms: int = _DEFAULT_ALIGNMENT_TIMEOUT_MS,
         evaluator_backend: EvaluatorBackend | None = None,
-        judge_llm: LLMClient | None = None,
     ) -> None:
         self._db = db
         self._llm = llm
-        self._judge_llm = judge_llm
         self._backend = evaluator_backend or EvaluatorBackend.fixed(jev)
         self._timeout = timeout_ms / 1000.0
         self._event_bus: Any | None = None
@@ -348,7 +415,6 @@ class AlignmentBarrier:
         """
         return check_intention_alignment(
             llm=self._llm,
-            judge_llm=self._judge_llm,
             evaluator_backend=self._backend,
             parent_intention=parent["intention"],
             child_intention=child["intention"],

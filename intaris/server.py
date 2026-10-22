@@ -901,7 +901,6 @@ async def lifespan(app):
         app.state.alignment_barrier = AlignmentBarrier(
             db=_get_db(),
             llm=analysis_llm,
-            judge_llm=judge_llm,
             evaluator_backend=evaluator_backend,
             timeout_ms=alignment_timeout_ms,
         )
@@ -949,6 +948,11 @@ async def lifespan(app):
 
         event_store.set_audit_store(EventAuditStore(_get_db()))
         event_store.set_session_store(SessionStore(_get_db()))
+        try:
+            await asyncio.to_thread(event_store.recover_spool)
+        except BaseException:
+            event_store.close()
+            raise
         app.state.event_store = event_store
         app.state.event_reconciliation_task = None
         if app.state.intention_barrier is not None:
@@ -1200,6 +1204,7 @@ async def lifespan(app):
                     timeout=30.0,
                 )
                 logger.info("Event store flushed")
+                app.state.event_store.close()
             except asyncio.TimeoutError:
                 logger.error("Event store shutdown flush timed out after 30s")
             except asyncio.CancelledError:

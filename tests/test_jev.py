@@ -575,7 +575,7 @@ def test_split_low_medium_risk_resolves_to_medium_and_explicit_grant_approves(
     assert field["abstention_fallback"] == {
         "from": "unknown",
         "to": "medium",
-        "rule": "low_medium_split_high_and_critical_below_0.2",
+        "rule": "low_medium_majority_hazard_below_0.2_unknown_below_0.5",
         "probabilities": SPLIT,
     }
     assert field["probabilities"] == SPLIT
@@ -736,17 +736,35 @@ _RISK_OPTIONS = ("low", "medium", "high", "critical", "unknown")
             None,
             "unknown",
         ),
-        # Mass mostly on low still resolves to medium, never low.
+        # Diffuse low/medium uncertainty with no hazard mass is label ambiguity,
+        # not an evidence gap: it resolves to medium for effect-based review.
         (
             {"low": 0.55, "medium": 0.1, "high": 0.1, "critical": 0.0, "unknown": 0.25},
             None,
             "medium",
         ),
-        # A choice mismatch abstains and still falls back.
+        (
+            {"low": 0.4, "medium": 0.2, "high": 0.0, "critical": 0.0, "unknown": 0.4},
+            None,
+            "medium",
+        ),
+        # Dominant unknown mass is a genuine evidence gap and stays unknown.
+        (
+            {"low": 0.3, "medium": 0.15, "high": 0.0, "critical": 0.0, "unknown": 0.55},
+            None,
+            "unknown",
+        ),
+        # Hazard mass at the floor keeps the abstention regardless of the split.
+        (
+            {"low": 0.5, "medium": 0.25, "high": 0.2, "critical": 0.0, "unknown": 0.05},
+            None,
+            "unknown",
+        ),
+        # A provider choice mismatch must not be recovered.
         (
             {"low": 0.5, "medium": 0.4, "high": 0.05, "critical": 0.05, "unknown": 0},
             "high",
-            "medium",
+            "unknown",
         ),
         # Neither low nor medium reaches the floor: stays unknown.
         (

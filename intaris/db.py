@@ -393,14 +393,14 @@ class Database:
             with self.connection() as conn:
                 cur = conn.cursor()
                 try:
-                    cur.execute(_SCHEMA_SQL_PG)
+                    cur.execute(_SCHEMA_SQL_PG + _EVENT_SPOOL_SCHEMA)
                 finally:
                     cur.close()
                 self._migrate_pg(conn)
             logger.info("Database tables ensured (PostgreSQL)")
         else:
             with self.connection() as conn:
-                conn.executescript(_SCHEMA_SQL_SQLITE)
+                conn.executescript(_SCHEMA_SQL_SQLITE + _EVENT_SPOOL_SCHEMA)
                 self._migrate_sqlite(conn)
             logger.info("Database tables ensured at %s", self._path)
 
@@ -480,6 +480,10 @@ class Database:
         if not self._sqlite_column_exists(conn, "audit_log", "profile_version"):
             conn.execute("ALTER TABLE audit_log ADD COLUMN profile_version INTEGER")
             logger.info("Migration: added profile_version column to audit_log")
+
+        for table in ("session_summaries", "behavioral_analyses"):
+            if not self._sqlite_column_exists(conn, table, "evidence_metadata"):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN evidence_metadata TEXT")
 
         if not self._sqlite_column_exists(conn, "audit_log", "intention"):
             conn.execute("ALTER TABLE audit_log ADD COLUMN intention TEXT")
@@ -1045,6 +1049,8 @@ class Database:
                 ("sessions", "last_alignment", "TEXT"),
                 ("audit_log", "injection_detected", "BOOLEAN DEFAULT FALSE"),
                 ("behavioral_analyses", "agent_id", "TEXT"),
+                ("behavioral_analyses", "evidence_metadata", "TEXT"),
+                ("session_summaries", "evidence_metadata", "TEXT"),
                 ("behavioral_profiles", "agent_id", "TEXT NOT NULL DEFAULT ''"),
                 ("session_summaries", "summary_type", "TEXT NOT NULL DEFAULT 'window'"),
                 ("audit_log", "resolved_by", "TEXT"),
@@ -1287,6 +1293,26 @@ class Database:
         return column in columns
 
 
+# Shared SQLite/PostgreSQL metadata; payloads stay in the filesystem spool.
+_EVENT_SPOOL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_spool_reservations (
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    spool_id TEXT NOT NULL,
+    event_ts TEXT NOT NULL,
+    first_seq BIGINT NOT NULL,
+    last_seq BIGINT NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, session_id, batch_id),
+    FOREIGN KEY (user_id, session_id) REFERENCES sessions(user_id, session_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_event_spool_pending
+    ON event_spool_reservations(archived, spool_id);
+"""
+
 # ── SQLite Schema ─────────────────────────────────────────────────────
 
 _SCHEMA_SQL_SQLITE = """
@@ -1341,6 +1367,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_user_id
     ON audit_log(user_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_user_timestamp_id
+    ON audit_log(user_id, timestamp DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_audit_session
     ON audit_log(user_id, session_id, timestamp);
@@ -1651,6 +1680,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_user_id
     ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_user_timestamp_id
+    ON audit_log(user_id, timestamp DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_session
     ON audit_log(user_id, session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_decision

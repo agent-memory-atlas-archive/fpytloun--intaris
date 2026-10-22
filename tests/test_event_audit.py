@@ -240,6 +240,7 @@ def test_reconciles_historical_durable_events(tmp_path):
         source="cognis",
     )
     original.flush_all()
+    original.close()
 
     audit = EventAuditStore(db)
     restarted = EventStore(config)
@@ -281,7 +282,10 @@ def test_projection_failure_is_repaired_from_durable_events(tmp_path):
         source="cognis",
     )
     store.flush_session("alice", "sess-1")
-    assert len(EventStore(config).read("alice", "sess-1")) == 1
+    # Read the archive directly without starting a competing spool writer.
+    from intaris.events.backend import FilesystemEventBackend
+
+    assert len(FilesystemEventBackend(config).read("alice", "sess-1")) == 1
 
     audit = EventAuditStore(db)
     store.set_audit_store(audit)

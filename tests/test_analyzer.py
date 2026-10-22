@@ -344,8 +344,8 @@ class TestRunAnalysis:
                 (TEST_USER,),
             )
             row = cur.fetchone()
-        assert row["risk_level"] == 2
-        assert row["profile_version"] == 1
+        # Legacy summary coverage is unknown, not a basis for a clean profile.
+        assert row is None
 
     def test_skips_when_no_llm(self, db, session_store, audit_store):
         self._setup(db, session_store, audit_store)
@@ -366,7 +366,7 @@ class TestRunAnalysis:
         result = run_analysis(db, llm, task)
         assert result["status"] == "skipped"
 
-    def test_filters_root_sessions_only(self, db, session_store, audit_store):
+    def test_includes_direct_child_actor_sessions(self, db, session_store, audit_store):
         _create_session(session_store, "sess-parent")
         _insert_tool_calls(audit_store, "sess-parent", count=5)
         _insert_summary(db, "sess-parent")
@@ -382,7 +382,7 @@ class TestRunAnalysis:
 
         task = {"user_id": TEST_USER, "payload": {"lookback_days": 30}}
         result = run_analysis(db, llm, task)
-        assert result["sessions_analyzed"] == 2
+        assert result["sessions_analyzed"] == 3
 
     def test_filters_blank_agent_scope_only(self, db, session_store, audit_store):
         _create_session(session_store, "sess-blank-1", agent_id="")
@@ -569,7 +569,7 @@ class TestGetSessionSummariesForAnalysis:
         assert "sess-with" in result
         assert "sess-without" not in result
 
-    def test_filters_root_sessions_only(self, db, session_store):
+    def test_includes_child_actor_sessions(self, db, session_store):
         _create_session(session_store, "sess-root")
         _insert_summary(db, "sess-root")
         _create_session(session_store, "sess-child-x", parent_session_id="sess-root")
@@ -578,9 +578,9 @@ class TestGetSessionSummariesForAnalysis:
 
         result = _get_session_summaries_for_analysis(db, TEST_USER, None, 30)
         assert "sess-root" in result
-        assert "sess-child-x" not in result
+        assert "sess-child-x" in result
 
-    def test_prefers_compacted_over_window(self, db, session_store):
+    def test_legacy_compaction_cannot_hide_windows(self, db, session_store):
         _create_session(session_store, "sess-pref")
         _insert_summary(db, "sess-pref", summary_type="window")
         _insert_summary(db, "sess-pref", summary_type="compacted")
@@ -588,7 +588,7 @@ class TestGetSessionSummariesForAnalysis:
 
         result = _get_session_summaries_for_analysis(db, TEST_USER, None, 30)
         assert len(result["sess-pref"]["summaries"]) == 1
-        assert result["sess-pref"]["summaries"][0]["summary_type"] == "compacted"
+        assert result["sess-pref"]["summaries"][0]["summary_type"] == "window"
 
     def test_respects_lookback_window(self, db, session_store):
         _create_session(session_store, "sess-old")
@@ -648,11 +648,10 @@ class TestHelpers:
 
         assert _worst_alignment(["aligned", "partially_aligned"]) == "partially_aligned"
 
-    def test_worst_alignment_empty_raises(self):
+    def test_worst_alignment_empty_is_unknown(self):
         from intaris.analyzer import _worst_alignment
 
-        with pytest.raises(ValueError):
-            _worst_alignment([])
+        assert _worst_alignment([]) == "unclear"
 
     def test_get_window_start_no_prior(self, db, session_store):
         _create_session(session_store)
@@ -816,7 +815,7 @@ class TestHelpers:
             "args_redacted": {"command": "rg pattern /opt/homebrew/file"},
         }
         result = _format_tool_call(tc)
-        assert "escalate→user:approve" in result
+        assert "escalate→unknown:approve" in result
         assert "bash" in result
 
     def test_format_tool_call_with_user_note(self):
@@ -834,7 +833,10 @@ class TestHelpers:
             "args_redacted": {"command": "rg pattern /outside"},
         }
         result = _format_tool_call(tc)
-        assert '[user: "Let it explore opencode source code"]' in result
+        assert (
+            '[resolution note (unknown): "Let it explore opencode source code"]'
+            in result
+        )
 
     def test_format_tool_call_user_note_newlines_collapsed(self):
         """Newlines in user_note collapsed to spaces."""
@@ -1443,7 +1445,7 @@ class TestHierarchicalSummary:
         ]
         assert (
             _collect_child_data(db, TEST_USER, children)[0]["summary_source"]
-            == "compacted"
+            == "compaction_and_uncovered_windows"
         )
 
     def test_child_data_window_fallback(self, db, session_store):
@@ -1467,12 +1469,11 @@ class TestHierarchicalSummary:
         ]
         assert (
             _collect_child_data(db, TEST_USER, children)[0]["summary_source"]
-            == "window"
+            == "compaction_and_uncovered_windows"
         )
 
-    def test_child_without_summary_excluded(self, db, session_store):
-        """Children without summaries are excluded entirely — no raw
-        metadata fallback."""
+    def test_child_without_summary_reports_gap(self, db, session_store):
+        """Missing child summaries must remain visible as coverage gaps."""
         _create_session(session_store, "sess-p3")
         _create_session(session_store, "sess-c3", parent_session_id="sess-p3")
         from intaris.analyzer import _collect_child_data
@@ -1491,7 +1492,10 @@ class TestHierarchicalSummary:
             }
         ]
         result = _collect_child_data(db, TEST_USER, children)
-        assert len(result) == 0, "Children without summaries should be excluded"
+        assert len(result) == 1
+        assert result[0]["coverage_gap"] is True
+        assert result[0]["summary"] == ""
+        assert result[0]["intent_alignment"] == "unclear"
 
 
 # ── TestCompaction ────────────────────────────────────────────────────

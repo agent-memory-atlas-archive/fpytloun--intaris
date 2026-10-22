@@ -12,7 +12,7 @@ from openai import OpenAI
 from intaris import model_retry
 from intaris.config import LLMConfig
 from intaris.input_budget import CapacityCache, ContextInsufficientError
-from intaris.llm import LLMClient
+from intaris.llm import LLMClient, LLMTemporaryError
 
 
 def transport(*, unavailable=False, input_limit=131072, output_limit=65536, reply=None):
@@ -111,17 +111,22 @@ def test_unknown_capacity_rejection_refreshes_once_before_inference(
 
 
 @pytest.mark.parametrize("unavailable,input_limit", [(True, 131072), (False, 12000)])
-def test_failed_refresh_or_actual_small_capacity_never_sends_request(
+def test_failed_refresh_or_small_capacity_sends_explicit_partial_view(
     unavailable, input_limit
 ):
     client, gets, posts = transport(unavailable=unavailable, input_limit=input_limit)
     try:
-        with pytest.raises(ContextInsufficientError) as error:
-            client.generate(protected_packet(), max_tokens=16000, single_attempt=True)
+        original = protected_packet()
+        saved = copy.deepcopy(original)
+        client.generate(original, max_tokens=16000, single_attempt=True)
         assert gets == [0.2, 2.0]
-        assert posts == []
-        assert error.value.diagnostics == client.input_view
-        assert error.value.diagnostics["overflow"]
+        assert len(posts) == 1
+        assert original == saved
+        assert client.input_view["trimmed"]
+        assert client.input_view["source_coverage"] == "partial"
+        assert not client.input_view["overflow"]
+        assert "OMITTED MIDDLE" in json.dumps(posts[0])
+        assert client.input_view["capacity_recovered"] is not unavailable
     finally:
         client.close()
 
@@ -154,7 +159,7 @@ def test_exhausted_deadline_cannot_probe_or_send():
     client, gets, posts = transport()
     try:
         with model_retry.evaluation_deadline(0):
-            with pytest.raises(ContextInsufficientError):
+            with pytest.raises(LLMTemporaryError):
                 client.generate(protected_packet(), max_tokens=16000)
         assert gets == posts == []
     finally:
@@ -166,10 +171,31 @@ def test_confirmed_input_limit_does_not_trigger_recovery():
     try:
         client.input_capacity()  # First metadata attempt fails.
         client.input_capacity(refresh=True)  # Confirm the small actual limit.
-        with pytest.raises(ContextInsufficientError):
-            client.generate(protected_packet(), max_tokens=16000)
+        client.generate(protected_packet(), max_tokens=16000)
+        assert gets == [0.2, 2.0]
+        assert len(posts) == 1
+        assert client.input_view["trimmed"]
+        assert client.input_view["source_coverage"] == "partial"
+        assert not client.input_view["overflow"]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("unavailable,input_limit", [(True, 131072), (False, 12000)])
+def test_protected_system_overhead_never_trimmed_or_dispatched(
+    unavailable, input_limit
+):
+    client, gets, posts = transport(unavailable=unavailable, input_limit=input_limit)
+    packet = [{"role": "system", "content": "Trusted system instruction. " * 8000}]
+    original = copy.deepcopy(packet)
+    try:
+        with pytest.raises(ContextInsufficientError) as error:
+            client.generate(packet, max_tokens=16000, single_attempt=True)
         assert gets == [0.2, 2.0]
         assert posts == []
+        assert packet == original
+        assert error.value.diagnostics == client.input_view
+        assert error.value.diagnostics["overflow"]
     finally:
         client.close()
 

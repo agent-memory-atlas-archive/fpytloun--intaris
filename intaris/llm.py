@@ -88,6 +88,12 @@ class LLMClient:
             max_retries=0,
         )
         self._model = config.model
+        from intaris.inference import managed_endpoint
+
+        endpoint = managed_endpoint()
+        self._managed_inference = bool(
+            endpoint and str(self._client.base_url).rstrip("/") == endpoint.rstrip("/")
+        )
         self._temperature = config.temperature
         self._reasoning_effort = config.reasoning_effort
         self._timeout_ms = config.timeout_ms
@@ -466,29 +472,32 @@ class LLMClient:
             )
             if capacity.max_output_tokens and type(params.get(output_key)) is int:
                 params[output_key] = min(params[output_key], capacity.max_output_tokens)
-            from intaris.input_budget import ContextInsufficientError, fit
+            from intaris.input_budget import (
+                ContextInsufficientError,
+                fit,
+                measure,
+                redact_scalars,
+            )
 
-            try:
-                fitted, view = fit(params, capacity)
-            except ContextInsufficientError as exc:
-                self._input_view.set(exc.diagnostics)
-                if exc.diagnostics["input_ceiling_tokens"] is not None:
-                    raise
-                # An unknown-capacity byte fallback is not a known model limit.
-                # Retry metadata, never inference; refit the unmodified request.
+            initial = measure(redact_scalars(params), capacity)
+            refresh = initial["overflow"] and initial["input_ceiling_tokens"] is None
+            if refresh:
+                # Recover metadata before a partial view can hide the overflow.
+                # Always fit the original request against the recovered limits.
                 capacity = self.input_capacity(refresh=True)
                 if capacity.max_output_tokens and type(params.get(output_key)) is int:
                     params[output_key] = min(
                         params[output_key], capacity.max_output_tokens
                     )
-                try:
-                    fitted, view = fit(params, capacity)
-                except ContextInsufficientError as recovered:
-                    self._input_view.set(recovered.diagnostics)
-                    raise
-                view["capacity_recovered"] = True
+            try:
+                fitted, view = fit(params, capacity)
+            except ContextInsufficientError as exc:
+                self._input_view.set(exc.diagnostics)
+                raise
+            if refresh:
+                view["capacity_recovered"] = view["input_ceiling_tokens"] is not None
                 logger.info(
-                    "Model input capacity recovered before inference "
+                    "Model input capacity refreshed before inference "
                     "(bytes=%s, input_ceiling_tokens=%s)",
                     view["bytes"],
                     view["input_ceiling_tokens"],
@@ -514,7 +523,12 @@ class LLMClient:
                     if operation == "embedding"
                     else client.chat.completions.create
                 )
-                response = call(**params)
+                from intaris.inference_attribution import attribution_headers
+
+                headers = attribution_headers() if self._managed_inference else {}
+                response = call(
+                    **params, **({"extra_headers": headers} if headers else {})
+                )
                 self._record_output_format(params)
                 return response
             except BadRequestError as exc:

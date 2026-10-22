@@ -177,7 +177,7 @@ def _build_credential_deploy_steps() -> list[ScriptedStep]:
                 ),
             },
             reasoning="Verifying the admin endpoint responds correctly after deployment.",
-            fake_response='[{"id":1,"email":"admin@xyz.com","role":"admin"},{"id":2,"email":"svc@xyz.com","role":"service"}]',
+            fake_response='[{"id":1,"email":"admin@xyz.example.com","role":"admin"},{"id":2,"email":"svc@xyz.example.com","role":"service"}]',
         ),
         ScriptedStep(
             tool="execute_sql",

@@ -70,52 +70,51 @@ def test_small_input_is_unchanged_and_unbounded_system_instructions_fail_closed(
 
 
 @pytest.mark.parametrize("aligned", [True, False])
-def test_judge_is_final_alignment_reviewer_of_negative_first_level(aligned):
+def test_analysis_classifies_alignment_without_judge_wiring(aligned):
     jev = Mock()
     jev.check_alignment.return_value = (False, "Review is not implementation.")
     analysis = Mock()
-    judge = Mock()
-    judge.generate.return_value = json.dumps(
+    analysis.generate.return_value = json.dumps(
         {"aligned": aligned, "reasoning": "Reviewed original scope."}
     )
     result = check_intention_alignment(
         llm=analysis,
         jev=jev,
-        judge_llm=judge,
         parent_intention="Fix and review the parser.",
         child_intention="Review the parser implementation.",
         parent_assignment="Fix the parser. Do not publish or deploy.",
         child_assignment="Review only. Do not change files.",
     )
-    assert result == (aligned, "Judge alignment review: Reviewed original scope.")
-    analysis.generate.assert_not_called()
-    prompt = judge.generate.call_args.args[0][1]["content"]
+    assert result == (aligned, "Reviewed original scope.")
+    analysis.generate.assert_called_once()
+    prompt = analysis.generate.call_args.args[0][1]["content"]
     assert "Do not publish or deploy." in prompt and "Do not change files." in prompt
 
 
-def test_unavailable_judge_alignment_does_not_turn_into_permission():
-    judge = Mock()
-    judge.generate.side_effect = TimeoutError("offline")
+def test_unavailable_analysis_alignment_does_not_turn_into_permission():
+    analysis = Mock()
+    analysis.generate.side_effect = TimeoutError("offline")
+    jev = Mock()
+    jev.check_alignment.return_value = (False, "Requires contextual classification")
     with pytest.raises(AlignmentUnavailable):
         check_intention_alignment(
-            llm=Mock(),
-            judge_llm=judge,
+            llm=analysis,
+            jev=jev,
             parent_intention="Read only",
             child_intention="Deploy changes",
         )
 
 
-def test_positive_first_level_does_not_need_extra_judge_call():
-    jev, judge = Mock(), Mock()
+def test_positive_first_level_does_not_need_extra_analysis_call():
+    jev, analysis = Mock(), Mock()
     jev.check_alignment.return_value = (True, "Supporting work")
     assert check_intention_alignment(
-        llm=Mock(),
+        llm=analysis,
         jev=jev,
-        judge_llm=judge,
         parent_intention="Fix parser",
         child_intention="Review parser",
     ) == (True, "Supporting work")
-    judge.generate.assert_not_called()
+    analysis.generate.assert_not_called()
 
 
 @pytest.mark.parametrize(

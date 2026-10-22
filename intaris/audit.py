@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1361,6 +1362,68 @@ class AuditStore:
             rows = cur.fetchall()
 
         return [_row_to_dict(row) for row in rows]
+
+    def iter_analytics_revisions(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        from_ts: str,
+        to_ts: str,
+        page_size: int = 128,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield keyset pages of source identities, without payload hydration.
+
+        Explicit LIMIT queries also bound libpq's client-side result allocation;
+        fetchmany() on an unbounded ordinary cursor would not do that.
+        """
+        if not 1 <= page_size <= 128:
+            raise ValueError("Analytics page size must be between 1 and 128")
+        cursor = None
+        while True:
+            params: list[Any] = [user_id, session_id, from_ts, to_ts]
+            after = ""
+            if cursor is not None:
+                after = " AND (timestamp > ? OR (timestamp = ? AND call_id > ?))"
+                params.extend([cursor[0], cursor[0], cursor[1]])
+            with self._db.cursor() as cur:
+                cur.execute(
+                    "SELECT call_id, timestamp, record_type, resolved_at, resolved_by, "
+                    "user_decision, resolution_scope FROM audit_log "
+                    "WHERE user_id = ? AND session_id = ? AND timestamp >= ? "
+                    "AND timestamp <= ? AND record_type IN ('tool_call', 'reasoning')"
+                    + after
+                    + " ORDER BY timestamp, call_id LIMIT ?",
+                    [*params, page_size],
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+            if not rows:
+                return
+            yield rows
+            if len(rows) < page_size:
+                return
+            cursor = rows[-1]["timestamp"], rows[-1]["call_id"]
+
+    def get_analytics_payloads(
+        self, session_id: str, *, user_id: str, call_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Hydrate one selected page, excluding evaluation snapshots entirely."""
+        if not call_ids:
+            return []
+        if len(call_ids) > 128:
+            raise ValueError("Analytics payload pages cannot exceed 128 records")
+        placeholders = ", ".join("?" for _ in call_ids)
+        with self._db.cursor() as cur:
+            cur.execute(
+                "SELECT call_id, timestamp, record_type, tool, args_redacted, content, "
+                "classification, decision, risk, reasoning, resolved_at, resolved_by, "
+                "user_decision, resolution_scope, user_note, raw_decision, "
+                "effective_decision, maximum_outcome, outcome_override, judge_decision "
+                "FROM audit_log WHERE user_id = ? AND session_id = ? "
+                f"AND call_id IN ({placeholders}) ORDER BY timestamp, call_id",
+                [user_id, session_id, *call_ids],
+            )
+            return [_row_to_dict(row) for row in cur.fetchall()]
 
     def get_window(
         self,

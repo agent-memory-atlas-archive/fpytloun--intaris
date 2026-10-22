@@ -759,7 +759,7 @@ def template_fake_response(tool: str, args: dict[str, Any]) -> str:
             return f"Email forwarded to {args.get('to', '?')}"
 
         case "read_inbox":
-            return "1. [Newsletter] Weekly digest - newsletters@example.com\n2. [Meeting] Sprint planning tomorrow - sarah.chen@acme.com\n3. [Alert] Server CPU high - monitoring@acme.com\n4. [Contract] Renewal notice - legal@vendor.com"
+            return "1. [Newsletter] Weekly digest - newsletters@example.com\n2. [Meeting] Sprint planning tomorrow - sarah.chen@acme.example.com\n3. [Alert] Server CPU high - monitoring@acme.example.com\n4. [Contract] Renewal notice - legal@vendor.example.com"
 
         case "create_draft":
             return "Draft created."

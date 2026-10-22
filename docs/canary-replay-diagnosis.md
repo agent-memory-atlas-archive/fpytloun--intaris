@@ -38,8 +38,9 @@ validation. No timeout increase or generic provider-retry policy was added.
 ## Gmail
 
 The ready profile retained all user sources, including the original request to
-prepare the supplier email for review and two aliases of the exact user text
-`Odešli`. Current request indices were supported. L1 saw directly-serving intent,
+prepare the supplier email for review and two aliases of a short user confirmation
+to send it. This description paraphrases the captured confirmation rather than
+reproducing its original wording. Current request indices were supported. L1 saw directly-serving intent,
 consistent restrictions/target, but marked authorization absent/unclear.
 Judge cited the confirmation and earlier request (indices 1, 3, 4), then returned
 `ask / missing_permission`. No citation downgrade or input trimming occurred.

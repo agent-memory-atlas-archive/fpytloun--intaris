@@ -26,10 +26,15 @@ logger = logging.getLogger(__name__)
 
 _RISK_LEVELS = ("low", "medium", "high", "critical")
 _DECISIONS = ("approve", "deny", "escalate")
-# An abstained hybrid risk label resolves to medium only when its mass sits on
-# low/medium: high and critical both stay below this posterior and low or
-# medium reaches it. Every other abstention stays unknown.
+# An abstained hybrid risk label resolves to medium only when the posterior is
+# a low/medium split: hazardous (high+critical) mass stays below this floor and
+# low+medium together hold a majority. Diffuse uncertainty between low and
+# medium is label ambiguity, not evidence of harm; it is relabelled medium so
+# policy reviews it on observed effects. The fallback refuses when hazardous
+# mass reaches the floor or when unknown mass itself dominates, because that
+# describes a genuine evidence gap rather than a split between safe labels.
 _RISK_FALLBACK_FLOOR = 0.2
+_RISK_FALLBACK_MAJORITY = 0.5
 
 
 def _conservative_risk(
@@ -38,13 +43,13 @@ def _conservative_risk(
     """Return medium for a low/medium split posterior, or None."""
     if "medium" not in allowed:
         return None
-    if any(
-        probabilities.get(level, 0.0) >= _RISK_FALLBACK_FLOOR
-        for level in ("high", "critical")
-    ):
+    hazardous = sum(probabilities.get(level, 0.0) for level in ("high", "critical"))
+    if hazardous >= _RISK_FALLBACK_FLOOR:
         return None
-    if max(probabilities.get("low", 0.0), probabilities.get("medium", 0.0)) < (
-        _RISK_FALLBACK_FLOOR
+    if probabilities.get("unknown", 0.0) >= _RISK_FALLBACK_MAJORITY:
+        return None
+    if sum(probabilities.get(level, 0.0) for level in ("low", "medium")) < (
+        _RISK_FALLBACK_MAJORITY
     ):
         return None
     return "medium"
@@ -466,14 +471,17 @@ class JevClient:
                         ),
                         options[key][0],
                     )
-                if key == "risk" and choice == "unknown":
+                # A provider choice that disagrees with its own distribution is
+                # not a usable label; it stays an abstention and is never recovered.
+                if key == "risk" and choice == "unknown" and not choice_mismatch:
                     fallback = _conservative_risk(probabilities, options[key])
                     if fallback is not None:
                         distributions[key]["abstention_fallback"] = {
                             "from": "unknown",
                             "to": fallback,
-                            "rule": "low_medium_split_high_and_critical_below_"
-                            f"{_RISK_FALLBACK_FLOOR}",
+                            "rule": "low_medium_majority_hazard_below_"
+                            f"{_RISK_FALLBACK_FLOOR}_unknown_below_"
+                            f"{_RISK_FALLBACK_MAJORITY}",
                             "probabilities": dict(probabilities),
                         }
                         choice = fallback
