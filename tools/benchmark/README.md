@@ -15,6 +15,8 @@ only targets independently authorized for the experiment:
   `INTARIS_BENCHMARK_COGNIS_POD` and `INTARIS_BENCHMARK_DEPLOYMENT` for the
   authorized namespace, controller pod and guardrails bridge deployment.
   Pod UID, endpoint and model-binding verification still apply.
+  Recovery also requires `INTARIS_BENCHMARK_OWNER_EMAIL` for the explicitly
+  authorized routing owner; the read-only query binds it as a SQL parameter.
 - `tools/paid_write_replay.py`: optional token refresh requires
   `REPLAY_TOKEN_NAMESPACE` together with `REPLAY_TOKEN_POD` and
   `REPLAY_TOKEN_PATH`; the local destination remains

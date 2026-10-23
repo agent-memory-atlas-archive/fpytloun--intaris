@@ -591,6 +591,62 @@ def test_misalignment_is_reviewed_by_judge_not_hard_stopped():
     assert "alignment.compatibility" not in obligation_ids(settled)
 
 
+SAFE_READ = {
+    "tool": "read",
+    "command": None,
+    "paths": ["/workspace/project/src/app.py"],
+    "paths_complete": True,
+    "effects": ["read"],
+    "mutation": "read_only",
+    "static_read": True,
+}
+
+
+@pytest.mark.parametrize(
+    "profile,grounded,exempt",
+    [
+        ("balanced", False, True),
+        ("balanced", True, False),
+        ("bounded_autonomy", False, True),
+        ("bounded_autonomy", True, True),
+        ("strict", False, False),
+        ("strict", True, False),
+    ],
+)
+def test_safe_read_alignment_exemption_is_profile_bound(profile, grounded, exempt):
+    alignment = {
+        "state": "incompatible",
+        "reason": "unrelated",
+        "grounded": grounded,
+        "overridden": False,
+    }
+    result = evaluate_policy(
+        [], evidence(parent_alignment=alignment, **SAFE_READ), profile, assessed=True
+    )
+    assert ("alignment.compatibility" not in obligation_ids(result)) is exempt
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"static_read": False},  # sensitive path or secret location
+        {"mutation": "mutating", "effects": ["write"]},
+        {"effects": ["read", "transmit"]},
+        {"secret_argument": True},
+    ],
+)
+def test_alignment_exemption_never_covers_unsafe_reads(override):
+    alignment = {
+        "state": "incompatible",
+        "reason": "unrelated",
+        "grounded": False,
+        "overridden": False,
+    }
+    state = evidence(parent_alignment=alignment, **{**SAFE_READ, **override})
+    result = evaluate_policy([], state, "balanced", assessed=True)
+    assert "alignment.compatibility" in obligation_ids(result)
+
+
 def test_judge_approval_discharges_alignment_review_and_refusal_denies():
     incompatible = {
         "state": "incompatible",

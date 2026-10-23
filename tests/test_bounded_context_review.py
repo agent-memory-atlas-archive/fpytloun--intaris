@@ -191,3 +191,25 @@ def test_judge_cannot_approve_explicit_grant_from_partial_model_view(
     assert vote.user_would != "approve"
     assert q["grant_citable"] == []
     assert q["citable"] == original_ids
+
+
+def test_single_oversized_jev_prompt_is_cut_only_as_much_as_budget_requires():
+    """One long Jev prompt keeps most of its middle, not a fixed 8k excerpt."""
+    head = "## Session Intention\nFix the cache bug.\n"
+    tail = "\n## Current Tool Call\nbash: git status\nLATEST USER: merge and push"
+    middle = "".join(f"history row {i}: read file module_{i}.py\n" for i in range(2400))
+    payload = {
+        "state": {"prompt": head + middle + tail, "evaluation_rules": "Rules."},
+        "model": "jev",
+        "questions": {"risk": {"type": "choice", "choices": ["low", "high"]}},
+    }
+    capacity = Capacity(max_input_tokens=32000, status="known")
+    original = len(payload["state"]["prompt"])
+    assert measure(payload, capacity, jev=True)["overflow"]
+    bounded, view = fit(payload, capacity, jev=True)
+    prompt = bounded["state"]["prompt"]
+    assert not measure(bounded, capacity, jev=True)["overflow"]
+    assert prompt.startswith(head) and prompt.endswith(tail)
+    assert view["middle_truncations"]
+    # Budget-sized cut: far more than a fixed 8192-character excerpt survives.
+    assert len(prompt) > 0.8 * original

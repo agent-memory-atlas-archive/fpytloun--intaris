@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-23
+
+### Fixed
+
+- **Input budgeting** -- Preserve the largest fitting excerpt of oversized
+  evaluation inputs rather than collapsing them to a fixed short view. Partial
+  views remain marked and cannot establish affirmative grants.
+- **Alignment recovery** -- Recheck misaligned children when the parent's
+  intention changes. Relaxed profiles avoid unnecessary alignment reviews for
+  controller-proven non-sensitive reads; restrictions and write checks remain.
+- **Shell effect classification** -- Parse curl option values and separate
+  transfers, GET query parameters, multiline commands, subshells and groups more
+  accurately while retaining conservative handling of unsupported syntax.
+  GET negation is applied in option order for each transfer.
+- **Judge review** -- Present original sources chronologically and mark the
+  latest user message. Balanced and bounded-autonomy profiles may resolve
+  routine low-risk deferrals without a human, but not consequential actions,
+  restriction conflicts, or plan/read-only turns. Failed restriction-quote
+  repair retains citable instructions and cannot remove a real prohibition.
+- **Executed script context** -- Include bounded, redacted script text from
+  successful client-recorded writes earlier in the same session. The text is
+  explicitly unverified context, never permission or proof of file integrity.
+- **Benchmark portability** -- Require an explicitly configured routing owner
+  for read-only transport recovery; remove deployment associations from
+  historical reports and use reserved domains in command examples. Historical
+  model measurements were not rerun for these content changes.
+
 ## [0.14.0] - 2026-10-22
 
 ### Added

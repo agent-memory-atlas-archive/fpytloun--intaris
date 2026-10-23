@@ -388,8 +388,39 @@ def test_synchronous_retry_uses_same_analysis_reviewer_after_async_failure(
         "ready" if review is True else "misaligned" if review is False else "error"
     )
     if result:
-        assert result["decision"] == ("approve" if review is True else "escalate")
+        # A controller-proven read is exempt from an ungrounded misalignment in
+        # balanced policy; the classified fact is still recorded for review.
+        assert result["decision"] == "approve"
         if review is False:
             fact = result["evaluation_metadata"]["policy_evidence"]["parent_alignment"]
             assert fact["reason"] == "Review completed"
             assert fact["state"] == "incompatible"
+
+
+def test_parent_intention_update_rechecks_only_misaligned_children(tmp_path):
+    db = Database(DBConfig(path=str(tmp_path / "recheck.db")))
+    store = SessionStore(db)
+    policy = {"evaluation_policy_version": "hybrid_v1"}
+    store.create(
+        user_id="t", session_id="parent", intention="Investigate", policy=policy
+    )
+    for child in ("stale", "fine", "acknowledged", "other-parent"):
+        store.create(
+            user_id="t",
+            session_id=child,
+            intention="Review the fix diff",
+            parent_session_id="parent" if child != "other-parent" else None,
+            policy=policy,
+        )
+    store.set_alignment_state("stale", user_id="t", state="misaligned")
+    store.set_alignment_state("acknowledged", user_id="t", state="misaligned")
+    store.set_alignment_overridden("acknowledged", user_id="t", overridden=True)
+    barrier = AlignmentBarrier(db=db, llm=MagicMock(), jev=MagicMock())
+    triggered = []
+
+    async def trigger(user_id, session_id):
+        triggered.append(session_id)
+
+    barrier.trigger = trigger
+    count = asyncio.run(barrier.recheck_children("t", "parent"))
+    assert triggered == ["stale"] and count == 1

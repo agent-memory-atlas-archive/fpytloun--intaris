@@ -1903,6 +1903,7 @@ class JudgeReviewer:
                     record.get("maximum_outcome")
                 ),
                 analytics_evidence=behavioral_context,
+                chat_mode=(metadata.get("overlay") or {}).get("chat_mode"),
             )
 
             def classify_with_attribution():

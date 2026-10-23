@@ -156,14 +156,17 @@ def test_child_alignment_without_analysis_and_human_acknowledgment(stores, align
         args={"file_path": "/repo/test.py"},
     )
     result = evaluator.evaluate(**request)
-    assert result["decision"] == ("approve" if aligned else "escalate")
+    # Balanced exempts a controller-proven read from an ungrounded misalignment;
+    # the classification is still recorded and binds the child's writes
+    # (alignment obligations: tests/test_fact_first_policy.py).
+    assert result["decision"] == "approve"
+    metadata = result["evaluation_metadata"]
+    assert "alignment.compatibility" not in [
+        o["id"] for o in metadata["outstanding_obligations"]
+    ]
     if not aligned:
-        assert "alignment.compatibility" in [
-            o["id"] for o in result["evaluation_metadata"]["outstanding_obligations"]
-        ]
-        audit.resolve_escalation(result["call_id"], "approve", user_id="owner")
-        assert evaluator.evaluate(**request)["decision"] == "approve"
-    # Exact action approval does not grant permanent compatibility to the child.
+        assert metadata["parent_alignment"]["state"] == "incompatible"
+    # Approving a read does not grant permanent compatibility to the child.
     assert sessions.get("child", user_id="owner")["alignment_state"] == (
         "ready" if aligned else "misaligned"
     )
@@ -453,9 +456,8 @@ async def test_alignment_strict_boolean_on_sync_and_async_paths(stores, payload)
         args={"path": "/repo/test"},
     )
     if valid:
-        assert evaluator.evaluate(**request)["decision"] == (
-            "approve" if payload["aligned"] else "escalate"
-        )
+        # A balanced static read is exempt from an ungrounded misalignment.
+        assert evaluator.evaluate(**request)["decision"] == "approve"
     else:
         with pytest.raises(HybridError) as failure:
             evaluator.evaluate(**request)

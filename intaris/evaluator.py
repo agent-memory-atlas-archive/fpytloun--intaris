@@ -635,6 +635,11 @@ class Evaluator:
             {"user_id": user_id, "session_id": session_id},
             context.get("recent_outcomes"),
         )
+        from intaris.session_scripts import attach as attach_session_script
+
+        attach_session_script(
+            context, self.event_store, user_id, session_id, tool, args
+        )
         call_id = str(uuid.uuid4())
         clamp_outcome("approve", minimum_outcome)
         if minimum_outcome is not None:

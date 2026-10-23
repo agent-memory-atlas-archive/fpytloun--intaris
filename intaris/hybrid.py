@@ -676,9 +676,26 @@ def evaluate_policy(
     if state.assessment_failed and not state.human_approved:
         need("assessment.invalid_response", [], kind="human", protected=True)
     alignment = state.parent_alignment or {}
+    # A controller-proven read of non-sensitive targets cannot advance an
+    # incompatible child task; parent compatibility is reviewed where the child
+    # acts. Sensitive paths and secret operands never count as a static read.
+    safe_read = bool(
+        values.get("static_read")
+        and mutation == "read_only"
+        and not values.get("secret_argument")
+        and set(state.value("effects", ["unknown"])) <= {"read"}
+    )
+    alignment_read_exempt = safe_read and (
+        profile == "bounded_autonomy"
+        or (
+            profile == "balanced"
+            and grounding.get("alignment_conflict") == "ungrounded"
+        )
+    )
     if (
         alignment.get("state") in {"incompatible", "unavailable"}
         and not alignment.get("overridden")
+        and not alignment_read_exempt
         and opinion_blocks("alignment_conflict")
     ):
         # Parent/child compatibility is a classification like any other: it

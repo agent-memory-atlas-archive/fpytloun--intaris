@@ -347,7 +347,8 @@ def test_real_balanced_review_distinguishes_task_support_from_human_choice(
             "unverified_ask": "escalate",
         }[first_vote]
     )
-    # One contextual Judge, with no citation/authorization follow-up.
+    # Citable original instructions retain the restriction option even if its
+    # quote repair fails; validation failure is not a permission judgment.
     assert llm.generate.call_count == (2 if unverified else 1)
     if first_vote == "approve":
         emit.assert_not_awaited()

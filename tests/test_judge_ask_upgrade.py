@@ -1,4 +1,7 @@
-"""Judge deferral stays deferral even with a low-risk supporting-work basis."""
+"""Relaxed profiles treat a routine low-risk Judge deferral as an approval.
+
+The upgrade never crosses a consequential boundary or a restriction conflict.
+"""
 
 import json
 from unittest.mock import Mock
@@ -20,7 +23,10 @@ WRITE = {"tool": "bash", "effects": ["write"], "mutation": "mutating"}
 
 
 def question_for(
-    profile, outcomes=frozenset({"approve", "escalate", "deny"}), facts=WRITE
+    profile,
+    outcomes=frozenset({"approve", "escalate", "deny"}),
+    facts=WRITE,
+    chat_mode=None,
 ):
     state = from_observations(facts)
     return judge_simulator.request(
@@ -30,6 +36,7 @@ def question_for(
         evaluate_policy([], state, profile),
         {"originals": [], "items": []},
         outcomes=outcomes,
+        chat_mode=chat_mode,
     )
 
 
@@ -63,13 +70,68 @@ CAPPED = frozenset({"approve", "escalate"})
     ],
 )
 @pytest.mark.parametrize("basis", ["routine_within_task", "explicit_request"])
-def test_common_assessor_preserves_vote_without_basis_upgrade(profile, outcomes, basis):
+def test_relaxed_routine_low_risk_ask_is_approve(profile, outcomes, basis):
     question = question_for(profile, *([outcomes] if outcomes else []))
     answer, diagnostics = judged(question, basis=basis)
-    assert answer.user_would == "ask"
-    assert answer.question == "Proceed?"
-    assert diagnostics["upgrade_reason"] is None
+    assert answer.user_would == "approve"
+    assert answer.question == ""
+    assert diagnostics["upgrade_reason"] == "ask_with_approving_basis"
+    # The model's own vote stays auditable.
     assert diagnostics["model_answer"]["user_would"] == "ask"
+
+
+def test_upgrade_never_covers_a_classified_restriction_conflict():
+    state = from_observations(WRITE).model_copy(
+        update={"assessment": {"contextual_restrictions": "conflicts"}}
+    )
+    question = judge_simulator.request(
+        {"tool": "bash", "args_redacted": {}},
+        {"policy": {"profile": "balanced"}, "intention": "Operate homelab alerts"},
+        state,
+        evaluate_policy([], state, "balanced"),
+        {"originals": [], "items": []},
+    )
+    answer, diagnostics = judged(question)
+    assert answer.user_would == "ask"
+    assert diagnostics["upgrade_reason"] is None
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {**WRITE, "effects": ["write", "delete"]},
+        {**WRITE, "effects": ["disclose"]},
+        {**WRITE, "reversibility": "irreversible"},
+        {**WRITE, "environment": "production"},
+    ],
+)
+def test_upgrade_never_crosses_a_consequential_boundary(facts):
+    answer, diagnostics = judged(question_for("balanced", CAPPED, facts))
+    assert answer.user_would == "ask"
+    assert diagnostics["upgrade_reason"] is None
+
+
+def test_upgrade_never_applies_in_a_plan_mode_turn():
+    answer, diagnostics = judged(
+        question_for("balanced", CAPPED, WRITE, chat_mode="plan")
+    )
+    assert answer.user_would == "ask"
+    assert diagnostics["upgrade_reason"] is None
+
+
+def test_upgraded_routine_approval_satisfies_balanced_policy():
+    state = from_observations(WRITE).model_copy(
+        update={"assessment": {"relationship": "supports_intent", "risk": "unknown"}}
+    )
+    pending = evaluate_policy([], state, "balanced", assessed=True)
+    assert pending.outcome == "escalate"
+    answer, _ = judged(question_for("balanced", CAPPED))
+    reviewed = state.model_copy(
+        update={"review": judge_simulator.receipt(state, pending, answer)}
+    )
+    assert evaluate_policy([], reviewed, "balanced", assessed=True).outcome == (
+        "approve"
+    )
 
 
 def test_bounded_external_ask_with_approving_basis_is_approve():
@@ -97,6 +159,7 @@ def test_strict_ask_is_unchanged():
         {"basis": "outside_task"},
         {"basis": "restriction_conflict"},
         {"basis": "irreversible_unclear"},
+        {"restriction_quote": "Do not run this yet."},
     ],
 )
 def test_ask_with_other_basis_or_higher_risk_still_asks(answer):

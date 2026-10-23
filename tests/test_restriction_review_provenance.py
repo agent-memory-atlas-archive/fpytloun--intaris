@@ -187,6 +187,100 @@ def test_repeated_unsupported_restriction_after_retry_is_a_safe_failure(build):
     ]
 
 
+def local_packet(profile="balanced", text=None):
+    """Citable text, but a non-consequential local write."""
+    s = state(tool="bash", effects=["write"], operation="unknown", reversibility=None)
+    assert not packet_consequential(s)
+    c = {
+        "originals": [
+            {
+                "ref": "message:one",
+                "origin": "client_user_claim",
+                "content": text
+                or "Run the focused tests. Previous diagnostic holds are retired.",
+                "truncated": False,
+            }
+        ],
+        "items": [],
+    }
+    return request(
+        {"tool": "bash", "args_redacted": {"command": "vitest run"}},
+        {"policy": {"profile": profile}},
+        s,
+        evaluate_policy([], s, profile, assessed=True),
+        c,
+    )
+
+
+def packet_consequential(s):
+    from intaris.effect_scope import requires_explicit_grant
+
+    return requires_explicit_grant(s)
+
+
+@pytest.mark.parametrize("profile", ["balanced", "bounded_autonomy"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Run the focused tests. Previous diagnostic holds are retired.",
+        "Do not run tests. Inspect the source only.",
+    ],
+)
+def test_failed_quote_repair_preserves_citable_restriction_evidence(profile, text):
+    q = local_packet(profile, text=text)
+    assert q["restriction_evidence_available"] and not q["consequential"]
+    index = next(iter(q["restriction_citable"]))
+    invalid = response(q, quote="A prior guard prohibited this.", cites=[index])
+    decided = invalid.model_copy(
+        update={
+            "user_would": "approve",
+            "basis": "routine_within_task",
+            "restriction_quote": "",
+            "cites": [],
+            "explanation": "The command runs the requested tests.",
+        }
+    )
+    llm = Mock(judge_response_mode="json_schema", input_view=None)
+    llm.generate.side_effect = [
+        invalid.model_dump_json(),
+        invalid.model_dump_json(),
+        decided.model_dump_json(),
+    ]
+    answer, diagnostics = classify(llm, q)
+    assert answer.user_would == "ask"
+    assert answer.basis == REVIEW_UNAVAILABLE
+    assert diagnostics["response_origin"] == "unverified_restriction"
+    assert llm.generate.call_count == 2
+    schemas = [c.kwargs["json_schema"] for c in llm.generate.call_args_list]
+    bases = [s["schema"]["properties"]["basis"]["enum"] for s in schemas]
+    assert all("restriction_conflict" in choices for choices in bases)
+
+
+def test_strict_keeps_the_safe_failure_after_a_failed_quote_repair():
+    q = local_packet("strict")
+    index = next(iter(q["restriction_citable"]))
+    invalid = response(q, quote="A prior guard prohibited this.", cites=[index])
+    llm = Mock(judge_response_mode="json_schema", input_view=None)
+    llm.generate.return_value = invalid.model_dump_json()
+    answer, diagnostics = classify(llm, q)
+    assert answer.basis == REVIEW_UNAVAILABLE
+    assert diagnostics["response_origin"] == "unverified_restriction"
+    assert llm.generate.call_count == 2
+
+
+def test_repeated_claim_with_citable_text_stays_a_safe_failure():
+    q = local_packet()
+    index = next(iter(q["restriction_citable"]))
+    invalid = response(q, quote="A prior guard prohibited this.", cites=[index])
+    llm = Mock(judge_response_mode="json_schema", input_view=None)
+    llm.generate.return_value = invalid.model_dump_json()
+    answer, diagnostics = classify(llm, q)
+    assert answer.user_would == "ask"
+    assert answer.basis == REVIEW_UNAVAILABLE
+    assert diagnostics["response_origin"] == "unverified_restriction"
+    assert llm.generate.call_count == 2
+
+
 def test_citable_text_keeps_option_and_retry_names_the_quote_failure():
     """With citable text the option stays; the retry says exactly what failed."""
     q = packet()
@@ -371,3 +465,42 @@ def test_partial_view_cannot_verify_words_outside_the_visible_source():
     assert not verified_restriction_quote(
         q, response(q, quote="A hidden prohibition.", cites=[index])
     )
+
+
+def test_originals_are_chronological_and_mark_the_latest_user_message():
+    s = state(tool="bash", effects=["write"], operation="unknown", reversibility=None)
+    c = {
+        "originals": [
+            {
+                "ref": "message:new",
+                "origin": "client_user_claim",
+                "content": "ok merge and push origin",
+                "truncated": False,
+                "chronology": "2026-01-02T10:00:00+00:00",
+            },
+            {
+                "ref": "message:old",
+                "origin": "client_user_claim",
+                "content": "Show me previews before you push.",
+                "truncated": False,
+                "chronology": "2026-01-01T10:00:00+00:00",
+            },
+        ],
+        "items": [],
+    }
+    q = request(
+        {"tool": "bash", "args_redacted": {"command": "git push origin main"}},
+        {},
+        s,
+        evaluate_policy([], s, "balanced", assessed=True),
+        c,
+    )
+    presented = json.loads(q["messages"][1]["content"])["originals"]
+    old, new = presented[0], presented[1]
+    assert "Show me previews" in old and "LATEST" not in old
+    assert "2026-01-01T10:00:00" in old
+    assert "ok merge and push origin" in new
+    assert "LATEST user message" in new and "2026-01-02T10:00:00" in new
+    # Citation text stays the exact source text for quote verification.
+    texts = [row["text"] for row in q["citation_sources"]]
+    assert "ok merge and push origin" in texts

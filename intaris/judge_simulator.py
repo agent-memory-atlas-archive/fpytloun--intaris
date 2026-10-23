@@ -347,6 +347,16 @@ def agent_proposed(message, record) -> bool:
     return bool(terms(message) & anchors)
 
 
+def _chronology_label(row, latest_ref):
+    """Inline time and recency marker for a presented original source."""
+    parts = []
+    if row.get("chronology"):
+        parts.append(f"at {row['chronology']}")
+    if latest_ref is not None and row["ref"] == latest_ref:
+        parts.append("LATEST user message; it supersedes earlier instructions")
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
 def request(
     record,
     session,
@@ -361,6 +371,7 @@ def request(
     human_decisions=None,
     analytics_evidence=None,
     outcomes=frozenset({"approve", "escalate", "deny"}),
+    chat_mode=None,
 ):
     profile = (session.get("policy") or {}).get("profile", "strict")
     from intaris.evaluation_context import source_view, without_attached_context
@@ -429,6 +440,8 @@ def request(
         key=lambda row: (
             row["origin"] not in {"client_user_claim", "human_resolution"},
             row["ref"] not in referenced,
+            # Oldest first within each group so later instructions read last.
+            str(row.get("chronology") or ""),
         )
     )
     latest_user = next(
@@ -498,6 +511,9 @@ def request(
             "recent_outcomes"
         ),
         "shell_target": (state.value("runtime_context") or {}).get("shell_target"),
+        "executed_script": (state.value("runtime_context") or {}).get(
+            "executed_script"
+        ),
         "loaded_skills": (state.value("runtime_context") or {}).get("loaded_skills"),
         "question": "Is this action something you asked for or allowed, given your messages?",
         "controller_facts": {
@@ -587,6 +603,20 @@ def request(
         for row in originals
         if row.get("chronology") is not None
     }
+    # The newest user instruction decides between earlier and later requests
+    # (for example an earlier "ask first" and a later "merge and push").
+    user_rows = [
+        row
+        for row in originals
+        if row["origin"] == "client_user_claim" and row.get("chronology")
+    ]
+    latest_original = (
+        latest_ref
+        if any(row["ref"] == latest_ref for row in originals)
+        else max(user_rows, key=lambda row: str(row["chronology"]))["ref"]
+        if user_rows
+        else None
+    )
     trimmed = []
 
     def serialize():
@@ -635,7 +665,8 @@ def request(
             ],
         }
         presented["originals"] = [
-            f"[{numbers[r['ref']]}] {r['text']}" for r in originals
+            f"[{numbers[r['ref']]}]{_chronology_label(r, latest_original)} {r['text']}"
+            for r in originals
         ]
         # The independent reviewer sees original evidence, not the extracted
         # "current restriction" labels that caused L1's disputed assessment.
@@ -731,6 +762,18 @@ def request(
     output["low_risk_no_conflict"] = (
         state.value("risk") == "low"
         and state.assessment.get("contextual_restrictions") != "conflicts"
+    )
+    from intaris.effect_scope import requires_explicit_grant
+
+    # Controller facts for the relaxed ask handling in classify(): a
+    # consequential boundary (external/irreversible, delete/disclose,
+    # production mutation), a classified restriction conflict, or a
+    # plan/read-only turn keeps a deferral with the human.
+    output["consequential"] = requires_explicit_grant(state)
+    output["ask_upgrade_blocked"] = (
+        state.assessment.get("contextual_restrictions") == "conflicts"
+        or state.read_only_required
+        or chat_mode == "plan"
     )
     if "ask" not in answers and "refuse" not in answers:
         answers.append("ask")  # A disagreement must stay expressible.
@@ -971,10 +1014,8 @@ def classify(llm, question):
                     and not restriction_repaired
                     and not question.get("restriction_evidence_available", True)
                 ):
-                    # No citable prohibition exists, so the claim cannot be
-                    # corrected into a valid one: narrow the contract instead of
-                    # re-prompting for it. When a genuine restriction does exist,
-                    # the generic repair below lets the model fix its quote.
+                    # Narrow only when no citable original instruction exists.
+                    # Failed quote repair cannot erase a real prohibition.
                     restriction_repaired = True
                     response_schema = _without_restriction_basis(response_schema)
                     properties = response_schema.get("schema", {}).get("properties", {})
@@ -1054,6 +1095,27 @@ def classify(llm, question):
             update={"basis": REVIEW_UNAVAILABLE}
         )
     upgrade_reason = None
+    if (
+        response_origin == "model"
+        and question.get("profile") in {"balanced", "bounded_autonomy"}
+        and answer.user_would == "ask"
+        and answer.risk == "low"
+        and (
+            answer.basis == "routine_within_task"
+            or (
+                answer.basis == "explicit_request"
+                and actual_view.get("affirmative_grants_eligible") is not False
+            )
+        )
+        and not (answer.restriction_quote or "").strip()
+        and not question.get("consequential", True)
+        and not question.get("ask_upgrade_blocked", True)
+    ):
+        # The reviewer's own reasons say routine, low-risk work within the
+        # task; its "ask" only reflects the absence of a per-step approval.
+        # Consequential boundaries and restriction conflicts still defer.
+        upgrade_reason = "ask_with_approving_basis"
+        answer = answer.model_copy(update={"user_would": "approve"})
     valid = bool(answer.cites) and all(r in question["citable"] for r in answer.cites)
     # The validated decision adjudicates reviewed model-derived scope. Factual
     # authorization corrections still require cited typed user evidence.

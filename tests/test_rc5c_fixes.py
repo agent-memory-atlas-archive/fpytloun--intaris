@@ -190,11 +190,11 @@ def test_ordinary_commands_stay_static(command):
 # ── Explicit user confirmation ─────────────────────────────────────────
 
 PROPOSAL = (
-    "Here is the draft:\n\n**To:** alena@example.gov\n**Subject:** Změna termínu\n"
+    "Here is the draft:\n\n**To:** alena@example.org\n**Subject:** Změna termínu\n"
     "Dobrý den, ... S pozdravem. Mám ho odeslat?"
 )
 GMAIL = "mcp_googleworkspace__send_gmail_message"
-GMAIL_ARGS = {"to": "alena@example.gov", "subject": "Změna termínu", "body": "x"}
+GMAIL_ARGS = {"to": "alena@example.org", "subject": "Změna termínu", "body": "x"}
 
 
 def confirm(audit, session_id, reply="Odešli", proposal=PROPOSAL):

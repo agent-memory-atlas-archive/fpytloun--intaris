@@ -1004,6 +1004,7 @@ class SessionStore:
         self,
         *,
         user_id: str | None = None,
+        parent_session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get active child sessions that need alignment re-checking.
 
@@ -1027,16 +1028,23 @@ class SessionStore:
         if user_id is not None:
             conditions.append("user_id = ?")
             params.append(user_id)
+        if parent_session_id is not None:
+            conditions.append("parent_session_id = ?")
+            params.append(parent_session_id)
 
         where = " AND ".join(conditions)
         with self._db.cursor() as cur:
             cur.execute(
-                f"SELECT user_id, session_id FROM sessions WHERE {where}",
+                "SELECT user_id, session_id, alignment_state FROM sessions "
+                f"WHERE {where}",
                 params,
             )
             rows = cur.fetchall()
 
-        return [{"user_id": row[0], "session_id": row[1]} for row in rows]
+        return [
+            {"user_id": row[0], "session_id": row[1], "alignment_state": row[2]}
+            for row in rows
+        ]
 
     # Allowed sort columns — maps API name to SQL expression.
     _SORT_COLUMNS: dict[str, str] = {

@@ -177,7 +177,11 @@ def test_judge_preserves_complete_captured_multilingual_authority(stores):
         for n, source_ref in payload["reference_ids"]["sources"].items()
         if source_ref == ref
     )
-    assert f"[{number}] {text}" in payload["originals"]
+    # Presented sources carry a chronology label between index and text.
+    assert any(
+        row.startswith(f"[{number}]") and row.endswith(f") {text}")
+        for row in payload["originals"]
+    )
     assert "intention_items" not in payload  # Do not duplicate extracted evidence.
 
 

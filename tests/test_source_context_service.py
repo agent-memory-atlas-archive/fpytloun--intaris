@@ -1056,7 +1056,8 @@ def test_supported_request_indices_reach_actual_l1_and_judge(service):
             for number in simulator["current_request_sources"]:
                 assert str(number) in simulator["reference_ids"]["sources"]
                 assert any(
-                    text == f"[{number}] User message: Update README only."
+                    text.startswith(f"[{number}]")
+                    and text.endswith(") User message: Update README only.")
                     for text in simulator["originals"]
                 ), (simulator["current_request_sources"], simulator["originals"])
                 reference = simulator["reference_ids"]["sources"][str(number)]

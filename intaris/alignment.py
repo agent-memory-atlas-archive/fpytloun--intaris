@@ -555,6 +555,29 @@ class AlignmentBarrier:
 
     # ── Barrier pattern (async) ───────────────────────────────────────
 
+    async def recheck_children(self, user_id: str, parent_session_id: str) -> int:
+        """Re-check misaligned children after the parent's intention changed.
+
+        A child was compared with the parent's intention at that time; a later
+        user update can make it compatible. Only children currently classified
+        as misaligned (durably or in memory) are re-checked, and acknowledged
+        overrides are left untouched. A new classification never relaxes a
+        restriction: it is the same alignment check with fresher parent text.
+        """
+        rows = SessionStore(self._db).get_active_child_sessions(
+            user_id=user_id, parent_session_id=parent_session_id
+        )
+        children = []
+        for row in rows:
+            key = (user_id, row["session_id"])
+            with self._lock:
+                misaligned = key in self._misaligned and key not in self._overridden
+            if row["alignment_state"] == "misaligned" or misaligned:
+                children.append(row["session_id"])
+        for child_id in children:
+            await self.trigger(user_id, child_id)
+        return len(children)
+
     async def trigger(self, user_id: str, session_id: str) -> None:
         """Start an async alignment check. Non-blocking.
 

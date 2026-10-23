@@ -6,8 +6,8 @@ Deployment status is separate from local implementation and validation.
 
 Prior incident evidence:
 [balanced human-only escalation](human-only-escalation-2026-10.md).
-The citation-repair runtime `3ebe664` was deployed during the subsequent incident
-response. The broader release qualification remains distinct and incomplete.
+The subsequent incident response included a citation-repair attempt.
+The broader release qualification remains distinct and incomplete.
 
 Historical qualification: [final candidate verification](final-candidate-verification-2026-10.md).
 The final offline suite passes and both complete 225-observation primary runs
@@ -28,27 +28,26 @@ unauthorized push approvals and history coverage gaps. It supersedes the
 fallback-only coverage status below; these earlier attempts remain historical.
 Fresh 20B comparison remains unavailable. No release has been published.
 
-## Verified deployed configuration
+## Historical qualification settings
 
-The configuration was read from the deployed services during release preparation,
-not inferred from old benchmark commands:
+The following model and policy settings were recorded during qualification.
+They describe the historical evidence context, not a current installation or
+deployment topology:
 
 | Component | Configuration |
 |---|---|
-| Intaris runtime | `da6fe3a634f581e8b89e27e509156eced878d10c` |
 | Assessment route | OpenRouter `typesafe/jev-1.13` |
 | Intention/analysis route | Groq `openai/gpt-oss-120b`, low reasoning |
 | Judge route | Groq `openai/gpt-oss-120b`, medium reasoning |
 | Judge mode | `advisory` |
 | Source context | `source_context`, single generation |
 
-The deployment environment still specifies `EVALUATION_POLICY_VERSION=legacy`.
-Cognis sessions can select the hybrid policy mode individually. A benchmark must
-therefore record its effective session mode/profile, not label every request
-"production" merely because its model names match.
+Policy selection may differ between defaults and per-session overrides. A
+benchmark must record its effective session mode/profile, not infer it from
+model names or label a request "production" merely because those names match.
 
-The current deployment is the release candidate to measure, not evidence of
-superiority. Recent live investigations still exposed unnecessary escalations
+The candidate must be measured; its configuration is not evidence of
+superiority. Historical investigations exposed unnecessary escalations
 and incorrect interpretation of task restrictions. Structural fixes and unit
 tests do not establish model quality.
 

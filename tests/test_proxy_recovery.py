@@ -68,11 +68,17 @@ def test_non_transient_errors_are_not_retried(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "setting", ["INTARIS_BENCHMARK_NAMESPACE", "INTARIS_BENCHMARK_COGNIS_POD"]
+    "setting",
+    [
+        "INTARIS_BENCHMARK_NAMESPACE",
+        "INTARIS_BENCHMARK_COGNIS_POD",
+        "INTARIS_BENCHMARK_OWNER_EMAIL",
+    ],
 )
 def test_recovery_requires_configuration_before_discovery(monkeypatch, setting):
     monkeypatch.setenv("INTARIS_BENCHMARK_NAMESPACE", "example-app")
     monkeypatch.setenv("INTARIS_BENCHMARK_COGNIS_POD", "controller-0")
+    monkeypatch.setenv("INTARIS_BENCHMARK_OWNER_EMAIL", "owner@example.com")
     monkeypatch.delenv(setting)
     discovery = Mock()
     monkeypatch.setattr(
@@ -83,9 +89,23 @@ def test_recovery_requires_configuration_before_discovery(monkeypatch, setting):
     discovery.assert_not_called()
 
 
+def test_recovery_rejects_blank_owner_before_discovery(monkeypatch):
+    monkeypatch.setenv("INTARIS_BENCHMARK_NAMESPACE", "example-app")
+    monkeypatch.setenv("INTARIS_BENCHMARK_COGNIS_POD", "controller-0")
+    monkeypatch.setenv("INTARIS_BENCHMARK_OWNER_EMAIL", "   ")
+    discovery = Mock()
+    monkeypatch.setattr(
+        "tools.benchmark.proxy_recovery.subprocess.check_output", discovery
+    )
+    with pytest.raises(ValueError, match="must not be blank"):
+        discover_unchanged_binding({})
+    discovery.assert_not_called()
+
+
 def test_discovery_rejects_reasoning_change_before_using_credentials(monkeypatch):
     monkeypatch.setenv("INTARIS_BENCHMARK_NAMESPACE", "example-app")
     monkeypatch.setenv("INTARIS_BENCHMARK_COGNIS_POD", "controller-0")
+    monkeypatch.setenv("INTARIS_BENCHMARK_OWNER_EMAIL", "owner@example.com")
     pod = {
         "metadata": {"uid": "replacement"},
         "status": {
@@ -102,9 +122,10 @@ def test_discovery_rejects_reasoning_change_before_using_credentials(monkeypatch
             "reasoning_effort": "high",
         }
     ]
+    discovery = Mock(side_effect=[json.dumps(pod), json.dumps(rows)])
     monkeypatch.setattr(
         "tools.benchmark.proxy_recovery.subprocess.check_output",
-        Mock(side_effect=[json.dumps(pod), json.dumps(rows)]),
+        discovery,
     )
     with pytest.raises(BindingChanged):
         discover_unchanged_binding(
@@ -116,6 +137,16 @@ def test_discovery_rejects_reasoning_change_before_using_credentials(monkeypatch
                 }
             }
         )
+    command = discovery.call_args_list[1].args[0]
+    assert command[command.index("--") + 1 : command.index("python")] == [
+        "env",
+        "INTARIS_BENCHMARK_OWNER_EMAIL=owner@example.com",
+    ]
+    query = command[-1]
+    assert "SET TRANSACTION READ ONLY" in query
+    assert "owner_email=:owner_email" in query
+    assert "os.environ['INTARIS_BENCHMARK_OWNER_EMAIL']" in query
+    assert "owner@example.com" not in query
 
 
 @pytest.mark.parametrize(

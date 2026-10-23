@@ -447,13 +447,17 @@ def _bounded_model_view(payload, capacity, *, jev):
             ]
         return value
 
-    for limit, sequence_limit in (
-        (8192, 256),
-        (4096, 128),
-        (2048, 64),
-        (1024, 32),
-        (512, 16),
-    ):
+    def longest(value):
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, dict):
+            return max((longest(child) for child in value.values()), default=0)
+        if isinstance(value, list):
+            return max((longest(child) for child in value), default=0)
+        return 0
+
+    def project(limit, sequence_limit):
+        nonlocal omitted
         result = copy.deepcopy(original)
         omitted = []
         if jev:
@@ -480,15 +484,41 @@ def _bounded_model_view(payload, capacity, *, jev):
                         ("messages", index, "content"),
                         sequence_limit,
                     )
-        view = measure(result, capacity, jev=jev)
+        return result, measure(result, capacity, jev=jev)
+
+    def accepted(result, view):
+        return result, {
+            **view,
+            "trimmed": bool(omitted),
+            "affirmative_grants_eligible": False,
+            "source_coverage": "partial",
+            "middle_truncations": omitted,
+        }
+
+    # Cut only as much as the budget requires: search the largest per-string
+    # limit that fits, so one oversized prompt keeps most of its middle instead
+    # of collapsing to a fixed excerpt. The fixed ladder stays the fallback when
+    # many small items, not one long string, cause the overflow.
+    low, high, best = 8192, longest(original), None
+    while low <= high:
+        middle = (low + high) // 2
+        _, view = project(middle, 256)
+        if view["overflow"]:
+            high = middle - 1
+        else:
+            best, low = middle, middle + 1
+    if best is not None:
+        return accepted(*project(best, 256))
+    for limit, sequence_limit in (
+        (8192, 256),
+        (4096, 128),
+        (2048, 64),
+        (1024, 32),
+        (512, 16),
+    ):
+        result, view = project(limit, sequence_limit)
         if not view["overflow"]:
-            return result, {
-                **view,
-                "trimmed": bool(omitted),
-                "affirmative_grants_eligible": False,
-                "source_coverage": "partial",
-                "middle_truncations": omitted,
-            }
+            return accepted(result, view)
     raise ContextInsufficientError({**view, "middle_truncations": omitted})
 
 

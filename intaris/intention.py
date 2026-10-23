@@ -1266,6 +1266,18 @@ class IntentionBarrier:
                     if session.get("parent_session_id"):
                         self._alignment_barrier.clear_override(user_id, session_id)
                         await self._alignment_barrier.trigger(user_id, session_id)
+                    # Children were compared with this session's previous
+                    # intention; re-check only those currently misaligned.
+                    try:
+                        await self._alignment_barrier.recheck_children(
+                            user_id, session_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Child alignment re-check failed for user=%s session=%s",
+                            user_id,
+                            session_id,
+                        )
             else:
                 logger.info(
                     "Intention not updated for user=%s session=%s "

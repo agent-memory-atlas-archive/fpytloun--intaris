@@ -19,9 +19,9 @@ async def main():
         await connection.execute(text('SET TRANSACTION READ ONLY'))
         rows=await connection.execute(text(
             "SELECT task_type,provider_id,model,config->>'reasoning_effort' AS reasoning_effort "
-            "FROM model_routing WHERE owner_email='system@cognis.local' "
+            "FROM model_routing WHERE owner_email=:owner_email "
             "AND task_type IN ('intaris_evaluation','intaris_analysis','intaris_judge')"
-        ))
+        ), {'owner_email': os.environ['INTARIS_BENCHMARK_OWNER_EMAIL']})
         print(json.dumps([dict(row) for row in rows.mappings()]))
     await engine.dispose()
 asyncio.run(main())
@@ -32,6 +32,9 @@ def discover_unchanged_binding(expected):
     """Only the fixed authorized pod can supply a replacement credential target."""
     namespace = os.environ["INTARIS_BENCHMARK_NAMESPACE"]
     pod_name = os.environ["INTARIS_BENCHMARK_COGNIS_POD"]
+    owner_email = os.environ["INTARIS_BENCHMARK_OWNER_EMAIL"]
+    if not owner_email.strip():
+        raise ValueError("INTARIS_BENCHMARK_OWNER_EMAIL must not be blank")
     pod = json.loads(
         subprocess.check_output(
             ["kubectl", "-n", namespace, "get", "pod", pod_name, "-o", "json"],
@@ -58,6 +61,8 @@ def discover_unchanged_binding(expected):
                 "exec",
                 pod_name,
                 "--",
+                "env",
+                f"INTARIS_BENCHMARK_OWNER_EMAIL={owner_email}",
                 "python",
                 "-c",
                 ROUTES_QUERY,

@@ -50,7 +50,95 @@ _WRAPPER_VALUE_OPTIONS = {
     "nice": {"-n"},
     "nohup": set(),
 }
-_CURL_WRITE = re.compile(r"-X\s*(?:POST|PUT|PATCH|DELETE)|--data|-d\s", re.I)
+_CURL_METHOD_WRITE = re.compile(
+    r"(?:-X\s*|--request[\s=]+)(?:POST|PUT|PATCH|DELETE)\b", re.I
+)
+# Text fallback for unparsed commands: any body option or mutating method is a
+# write. -G is not honored here because option values cannot be told apart.
+_CURL_BODY_TEXT = re.compile(
+    r"(?:^|\s)(?:--data(?:-[a-z]+)?|--json|--form|--upload-file|-[A-Za-z]*[dFT])(?=[\s=]|$)"
+)
+_CURL_BODY_LONG = {
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "--data-ascii",
+    "--json",
+    "--form",
+    "--form-string",
+    "--upload-file",
+}
+_CURL_BODY_SHORT = set("dFT")
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _curl_writes_text(text: str) -> bool:
+    """Conservative write check for text that could not be tokenized."""
+    return bool(_CURL_METHOD_WRITE.search(text) or _CURL_BODY_TEXT.search(text))
+
+
+def _curl_writes(tokens: list[str]) -> bool:
+    """Whether curl options request a mutating method or send a body.
+
+    Options are parsed with their values, so option-like data (``--data
+    '--get'``) is a value, not a flag. ``-G``/``--get`` turns body data into a
+    query string of a GET request; an explicit mutating method still writes.
+    Each ``--next``/``-:`` transfer is judged on its own options.
+    """
+    body = get = method_write = False
+    expect = None  # what the next token is the value of
+    for token in tokens[1:]:
+        if expect is not None:
+            if expect == "method" and token.upper() in _MUTATING_METHODS:
+                method_write = True
+            expect = None
+            continue
+        if token == "--":
+            break
+        if token in {"--next", "-:"}:
+            if method_write or (body and not get):
+                return True
+            body = get = method_write = False
+            continue
+        if token.startswith("--"):
+            name, eq, value = token.partition("=")
+            if name == "--get":
+                get = True
+            elif name == "--no-get":
+                get = False
+            elif name == "--request":
+                if eq:
+                    method_write |= value.upper() in _MUTATING_METHODS
+                else:
+                    expect = "method"
+            elif name in _CURL_BODY_LONG:
+                body = True
+                expect = None if eq else "value"
+            elif name in _CURL_VALUE_LONG and not eq:
+                expect = "value"
+            continue
+        if token.startswith("-") and len(token) > 1:
+            for index, letter in enumerate(token[1:], start=1):
+                rest = token[index + 1 :]
+                if letter == "G":
+                    get = True
+                    continue
+                if letter == "X":
+                    if rest:
+                        method_write |= rest.upper() in _MUTATING_METHODS
+                    else:
+                        expect = "method"
+                    break
+                if letter in _CURL_BODY_SHORT:
+                    body = True
+                if letter in _CURL_VALUE_SHORT:
+                    if not rest:
+                        expect = "value"
+                    break
+    return method_write or (body and not get)
+
+
 # curl options whose separate value is not a request target.
 _CURL_VALUE_SHORT = set("dHoXuAebcwmFTErCDY")
 _CURL_VALUE_LONG = {
@@ -167,16 +255,30 @@ def _bash_external(command: str) -> bool:
     if any(_bash_external(inner) for inner in nested):
         return True
     if "\n" in command:
-        return any(_bash_external(line) for line in command.splitlines())
-    segments = _simple_shell_segments(command)
+        # Multi-line scripts without heredocs are tokenized as one command
+        # list, so quoted multi-line arguments stay intact; otherwise each
+        # line is checked on its own.
+        segments = _multiline_segments(command)
+        if segments is None:
+            return any(_bash_external(line) for line in command.splitlines())
+    else:
+        segments = _simple_shell_segments(command)
     if not segments and command.strip():
-        # Unsupported single-line syntax: conservative scan outside quotes.
+        # Unsupported syntax: conservative scan outside quotes.
         stripped = _strip_quoted_strings(command)
         return bool(
             re.search(r"(?<![-\w])(?:rm|rmdir|passwd)\s|git\s+push", stripped)
-            or (re.search(r"\bcurl\b", stripped) and _CURL_WRITE.search(stripped))
+            or (re.search(r"\bcurl\b", stripped) and _curl_writes_text(stripped))
         )
     for segment in segments:
+        # Subshells and groups run their contents: "(git push)", "{ rm x; }".
+        segment = list(segment)
+        while segment and segment[0] in {"(", "{", "!"}:
+            segment = segment[1:]
+        if segment and segment[0].startswith("(") and len(segment[0]) > 1:
+            segment[0] = segment[0].lstrip("(")
+        if not segment:
+            continue
         tokens = _unwrap_read_command(segment)
         # Wrappers that execute their operand (sudo rm, xargs rm, timeout 5 rm).
         while tokens and tokens[0] in _WRAPPER_VALUE_OPTIONS:
@@ -187,16 +289,75 @@ def _bash_external(command: str) -> bool:
                 tokens = tokens[2:] if tokens[0] in valued else tokens[1:]
         if not tokens:
             continue
-        head = " ".join([tokens[0].rsplit("/", 1)[-1], *tokens[1:2]])
+        head = " ".join(
+            token.rstrip(")") for token in [tokens[0].rsplit("/", 1)[-1], *tokens[1:2]]
+        )
         if _EXTERNAL_HEAD.match(head):
             return True
         if (
             head.startswith("curl")
-            and _CURL_WRITE.search(" ".join(tokens) + " ")
+            and _curl_writes(tokens)
             and not _curl_local_only(tokens)
         ):
             return True
     return False
+
+
+def _multiline_segments(command: str) -> list[list[str]] | None:
+    """Tokenize a multi-line command list; None when it cannot be done safely.
+
+    Unquoted newlines separate commands; quoted newlines stay inside their
+    argument. Heredocs and unbalanced quotes are not supported.
+    """
+    import shlex
+
+    if "<<" in command:
+        return None
+    output: list[str] = []
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\" and index + 1 < len(command):
+            if command[index + 1] == "\n":  # line continuation
+                index += 2
+                continue
+            output.append(command[index : index + 2])
+            index += 2
+            continue
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (not output or output[-1][-1:] in " \t\n;|&("):
+            while index < len(command) and command[index] != "\n":
+                index += 1
+            continue
+        elif char == "\n":
+            output.append(";")
+            index += 1
+            continue
+        output.append(char)
+        index += 1
+    if quote is not None:
+        return None
+    try:
+        lexer = shlex.shlex("".join(output), posix=True, punctuation_chars="|;&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        segments: list[list[str]] = [[]]
+        for token in lexer:
+            if token and all(char in "|;&" for char in token):
+                segments.append([])
+            else:
+                segments[-1].append(token)
+    except ValueError:
+        return None
+    return [segment for segment in segments if segment]
 
 
 _URL_HOST = re.compile(

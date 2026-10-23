@@ -1,9 +1,9 @@
 # Read-only capture acceptance evidence
 
-Source: authenticated tenant/session-scoped production audit and event reads,
-without replay, model calls or production mutations. The deployed Intaris base
-was RC6 `806ce0b3b275151901a29dc15d7c4f0f2e8307cb`. Investigation and
-production record identifiers are retained privately.
+Source: sanitized cases reconstructed from authenticated tenant/session-scoped
+audit and event reads, without replay, model calls or service mutations.
+Deployment associations, investigation identifiers and record identifiers
+are retained privately.
 
 Both evaluations belong to the same captured session.
 The event read reported a contiguous history without a gap.
